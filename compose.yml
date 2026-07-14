@@ -1,0 +1,76 @@
+# Local / self-hosted deploy of reproit-cloud + Postgres.
+#
+# `docker compose up --build` brings up a working single-node self-host: one
+# Postgres stores installation data and evidence is written to a local volume
+# (no R2 needed). The API is OPEN in this default (REPROIT_DEV_OPEN=1) for local
+# use, set a real REPROIT_API_KEY and drop REPROIT_DEV_OPEN before exposing it.
+#
+# Production may use any PostgreSQL and S3-compatible object store. This compose
+# is the supported single-node starting point.
+#
+# The pg service listens on 5432 inside the compose network (the app reaches it at
+# host `pg:5432`); the published 5433:5432 is only for host tooling (psql from the
+# host). The published 8080:8080 is the API + dashboard.
+#
+# Bring up:  docker compose up --build
+services:
+  pg:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: reproit
+      POSTGRES_PASSWORD: reproit
+      POSTGRES_DB: reproit
+    volumes:
+      - reproit-pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U reproit"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  cloud:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      pg:
+        condition: service_healthy
+    environment:
+      # One Postgres serves the installation.
+      DATABASE_URL: postgres://reproit:reproit@pg:5432/reproit
+      # LOCAL ONLY: opens the API and allows any-origin CORS. Remove this line and
+      # set a real REPROIT_API_KEY for anything exposed beyond localhost.
+      REPROIT_DEV_OPEN: "1"
+      # Ops/admin key (header X-Reproit-Tenant). Unset under REPROIT_DEV_OPEN above;
+      # set a real key (and drop REPROIT_DEV_OPEN) before exposing this.
+      REPROIT_API_KEY: ${REPROIT_API_KEY:-}
+      # Evidence (repro mp4/gif/screenshots) storage. With no R2_* set, the
+      # local-fs backend writes here (persisted by the reproit-artifacts volume).
+      REPROIT_ARTIFACT_DIR: /data/artifacts
+      # Public origin used by CSRF and cookie policy.
+      REPROIT_PUBLIC_URL: ${REPROIT_PUBLIC_URL:-http://localhost:8080}
+      # Uncomment to auto-create the admin user + first project key on first boot.
+      # (Equivalent to running `reproit-cloud init --email ... --password ...`.)
+      # REPROIT_BOOTSTRAP_EMAIL: admin@example.com
+      # REPROIT_BOOTSTRAP_PASSWORD: change-me-now
+      # REPROIT_BOOTSTRAP_PROJECT: Default
+      # Configure an S3-compatible artifact store instead of the local volume.
+      # R2_ACCOUNT_ID: ${R2_ACCOUNT_ID:-}
+      # R2_ACCESS_KEY_ID: ${R2_ACCESS_KEY_ID:-}
+      # R2_SECRET_ACCESS_KEY: ${R2_SECRET_ACCESS_KEY:-}
+      # R2_BUCKET: ${R2_BUCKET:-}
+      # Set R2_ENDPOINT to point the same path at a local MinIO / R2-compatible
+      # store (used verbatim, path-style addressing, R2_ACCOUNT_ID optional).
+      # Unset uses the account-derived R2-compatible endpoint.
+      # R2_ENDPOINT: ${R2_ENDPOINT:-}
+      RUST_LOG: info
+    volumes:
+      # Persist local-fs evidence across container recreation. (R2 deploys don't
+      # need this; the bytes live in the bucket.)
+      - reproit-artifacts:/data/artifacts
+    ports:
+      - "127.0.0.1:8080:8080"
+
+volumes:
+  reproit-pg:
+  reproit-artifacts:

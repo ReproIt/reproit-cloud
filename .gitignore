@@ -1,0 +1,8 @@
+/target
+*.log
+.DS_Store
+# Local-fs artifact storage (evidence bytes) when running outside Docker.
+/data
+.env
+# Local scratch: throwaway demo apps + compose overrides for manual replay runs.
+/experiments

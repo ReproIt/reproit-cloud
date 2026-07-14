@@ -1,0 +1,47 @@
+# Reproit hosted reproduction: runs in YOUR CI, on YOUR checkout.
+#
+# The Reproit cloud never has your source or simulators. When you (or the
+# dashboard) trigger POST /v1/apps/<app>/buckets/<bucket>/reproduce, the cloud
+# fires a repository_dispatch at this repo with {app, bucket, runId}; this
+# workflow reproduces the bug against your code and posts the verdict (and the
+# recording) back with `reproit cloud reproduce ... --run`.
+#
+# Easiest setup: `reproit cloud setup --app <app>` writes this file, binds the
+# repo, and prints the secret command. To wire it by hand instead:
+#   1. Copy this file to .github/workflows/reproit-repro.yml in the app repo.
+#   2. Add your sk_live_ project key as the REPROIT_CLOUD_KEY repo secret (this
+#      is the name the CLI reads; a secret under any other name is ignored and
+#      the reproduce step 401s).
+#   3. Bind the repo on the Reproit side:
+#        PUT /v1/apps/<app>/integrations
+#        { "dispatchRepo": "<owner>/<repo>", "dispatchToken": "<fine-grained PAT>" }
+#      The PAT needs Contents read/write on this one repo only (that is the
+#      scope GitHub requires to deliver repository_dispatch events).
+
+name: reproit-repro
+
+on:
+  repository_dispatch:
+    types: [reproit-repro]
+
+jobs:
+  reproduce:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install reproit
+        run: curl -fsSL https://reproit.com/install.sh | sh
+
+      - name: Reproduce the bucket deterministically
+        env:
+          # The CLI reads REPROIT_CLOUD_KEY; the repo secret holds your sk_live_ key.
+          REPROIT_CLOUD_KEY: ${{ secrets.REPROIT_CLOUD_KEY }}
+        run: |
+          ~/.local/bin/reproit cloud reproduce \
+            --app "${{ github.event.client_payload.app }}" \
+            --bucket "${{ github.event.client_payload.bucket }}" \
+            --as "${{ github.event.client_payload.bucket }}" \
+            --run \
+            --run-id "${{ github.event.client_payload.runId }}"

@@ -1,0 +1,41 @@
+name: Writing style
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  punctuation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Reject en dashes and em dashes
+        shell: python
+        run: |
+          import pathlib
+          import subprocess
+          import sys
+
+          forbidden = {chr(0x2013): "en dash", chr(0x2014): "em dash"}
+          files = subprocess.check_output(["git", "ls-files", "-z"]).decode().split("\0")
+          failures = []
+
+          for name in filter(None, files):
+              path = pathlib.Path(name)
+              try:
+                  text = path.read_text(encoding="utf-8")
+              except (UnicodeDecodeError, OSError):
+                  continue
+              for line_number, line in enumerate(text.splitlines(), 1):
+                  found = sorted({label for mark, label in forbidden.items() if mark in line})
+                  if found:
+                      failures.append(f"{name}:{line_number}: {', '.join(found)}")
+
+          if failures:
+              print("Disallowed punctuation found:")
+              print("\n".join(failures))
+              sys.exit(1)

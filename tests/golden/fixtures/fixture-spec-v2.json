@@ -1,0 +1,21 @@
+{
+  "locale": "tr",
+  "inputs": [
+    {
+      "field": "name",
+      "generate": {
+        "minLen": 18,
+        "minBytes": 90,
+        "minGraphemes": 24,
+        "charset": "unicode",
+        "scripts": ["Latin", "Arabic"],
+        "emoji": true,
+        "rtl": true,
+        "combining": true,
+        "zeroWidth": true,
+        "newline": true,
+        "edgeWhitespace": true
+      }
+    }
+  ]
+}

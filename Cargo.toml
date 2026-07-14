@@ -1,0 +1,73 @@
+[package]
+name = "reproit-cloud"
+version = "0.1.0"
+edition = "2021"
+license = "Elastic-2.0"
+description = "Self-hosted Reproit control plane for reproducible production bugs"
+
+[[bin]]
+name = "reproit-cloud"
+path = "src/main.rs"
+
+[dependencies]
+# These four were workspace-inherited in the monorepo; pinned explicitly here so
+# this crate builds standalone (same versions/features as the workspace had).
+anyhow = "1"
+reproit-backend = { path = "experimental/reproit-backend" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = [
+    "macros", "rt-multi-thread", "process", "time", "io-util", "fs", "sync", "signal",
+] }
+
+axum = { version = "0.7", features = ["multipart"] }
+clap = { version = "4", features = ["derive", "env"] }
+uuid = { version = "1", features = ["v4"] }
+chrono = "0.4"
+# Auth: argon2id password hashing + a CSPRNG for salts and session/API tokens.
+argon2 = "0.5"
+rand = "0.8"
+# HTTP integrations and structural-signature hashing.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+# AEAD for encrypting tenant DB connection strings at rest in the control plane
+# (ChaCha20-Poly1305; 32-byte key from REPROIT_CONN_ENC_KEY, fresh per-write nonce).
+chacha20poly1305 = "0.10"
+# Durable persistence: Postgres via sqlx (runtime queries, no compile-time DB).
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio", "tls-rustls", "postgres", "json", "uuid", "chrono",
+] }
+# CORS for the dashboard + request body size limits (multipart/JSON DoS guard).
+tower-http = { version = "0.6", features = ["cors", "limit"] }
+# Rate limiting (GCRA) on auth + ingest. In-memory per-instance.
+tower_governor = "0.4"
+# Stream adapter (mpsc channel -> HTTP body) for the NDJSON tenant export, so
+# an export streams page by page instead of materializing in memory.
+tokio-stream = "0.1"
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.16", default-features = false, features = ["http-listener"] }
+# Ops: structured logging.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# rustls 0.23 (used by sqlx Postgres TLS and rust-s3) needs a process-wide
+# default CryptoProvider installed before any TLS handshake. We install `ring`
+# explicitly in main(); pin it here so the provider is unambiguous.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+# R2 / S3-compatible artifact storage (videos, screenshots, reports). Optional:
+# the default build uses local-filesystem artifacts; enable `r2` for production.
+rust-s3 = { version = "0.35", default-features = false, features = [
+    "tokio-rustls-tls",
+], optional = true }
+
+[features]
+default = []
+# R2 / S3-compatible per-tenant blob storage (the default build uses local-fs).
+r2 = ["dep:rust-s3"]
+
+# Small, fast release binary for distribution.
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true

@@ -1,0 +1,48 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      pg:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: reproit
+          POSTGRES_PASSWORD: reproit
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U reproit"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: self-hosted boundary audit
+        run: ./scripts/audit-boundary.sh
+      - name: fmt
+        run: cargo fmt --all --check
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: test (with Postgres-backed tenancy suite)
+        env:
+          TEST_DATABASE_URL: postgres://reproit:reproit@localhost:5433/postgres
+        run: |
+          cargo test 2>&1 | tee test.log
+          # The tenancy integration tests skip silently without a DB; a skip
+          # here means the service wiring broke, so fail loudly instead.
+          if grep -q "SKIP" test.log; then
+            echo "integration tests skipped; Postgres service not reachable"
+            exit 1
+          fi
+      - name: check full feature set (Docker build parity)
+        run: cargo check --features r2

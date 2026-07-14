@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Sign in · repro·it</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><rect width='64' height='64' rx='14' fill='%234ade80'/><g transform='translate(9 9) scale(1.917)' fill='none' stroke='%230a0b0d' stroke-linecap='round' stroke-linejoin='round'><g stroke-width='1.5'><path d='M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8'/><path d='M21 3v5h-5'/></g><g transform='translate(12 12) scale(0.4) translate(-12 -12)' stroke-width='4.4'><path d='m8 2 1.88 1.88'/><path d='M14.12 3.88 16 2'/><path d='M9 7.13v-1a3.003 3.003 0 1 1 6 0v1'/><path d='M12 20c-3.3 0-6-2.7-6-6v-3a4 4 0 0 1 4-4h4a4 4 0 0 1 4 4v3c0 3.3-2.7 6-6 6'/><path d='M12 20v-9'/><path d='M6.53 9C4.6 8.8 3 7.1 3 5'/><path d='M6 13H2'/><path d='M3 21c0-2.1 1.7-3.9 3.8-4'/><path d='M20.97 5c0 2.1-1.6 3.8-3.5 4'/><path d='M22 13h-4'/><path d='M17.2 17c2.1.1 3.8 1.9 3.8 4'/></g></g></svg>" type="image/svg+xml" />
+<link href="https://fonts.googleapis.com/css2?family=Archivo+Expanded:wght@600;700;800&family=Archivo:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet" />
+<style>
+  :root{ --bg:#0a0b0d; --panel:#111417; --line:rgba(255,255,255,0.09);
+    --ink:#e9ebec; --ink-2:#aab0b5; --muted:#6b7177; --green:#4ade80; --green-dim:#2f9e5c;
+    --green-glow:rgba(74,222,128,0.18); --red:#f4625a;
+    --mono:"JetBrains Mono",ui-monospace,Menlo,monospace; --disp:"Archivo Expanded",system-ui,sans-serif; --body:"Archivo",system-ui,sans-serif; }
+  *{box-sizing:border-box;} body{margin:0;min-height:100vh;background:var(--bg);color:var(--ink);font-family:var(--body);
+    display:flex;align-items:center;justify-content:center;padding:32px;-webkit-font-smoothing:antialiased;}
+  .grid-bg{position:fixed;inset:0;z-index:0;pointer-events:none;background-image:linear-gradient(rgba(255,255,255,.05) 1px,transparent 1px),linear-gradient(90deg,rgba(255,255,255,.05) 1px,transparent 1px);background-size:56px 56px;mask-image:radial-gradient(ellipse 70% 60% at 50% 0%,#000 30%,transparent 80%);-webkit-mask-image:radial-gradient(ellipse 70% 60% at 50% 0%,#000 30%,transparent 80%);}
+  .card{position:relative;z-index:2;width:100%;max-width:400px;}
+  .brand{display:flex;align-items:center;gap:9px;font-family:var(--mono);font-weight:700;font-size:21px;letter-spacing:-.03em;margin-bottom:26px;justify-content:center;}
+  .brand svg{display:block;}
+  .brand .dot{color:var(--muted);}
+  .brand .it{color:var(--green);}
+  .panel{position:relative;background:linear-gradient(180deg,var(--panel),#0d0f12);border:1px solid var(--line);border-radius:14px;padding:28px 26px;}
+  .panel::before,.panel::after{content:"";position:absolute;width:11px;height:11px;border:1.5px solid var(--green-dim);}
+  .panel::before{top:-5px;left:-5px;border-right:0;border-bottom:0;} .panel::after{bottom:-5px;right:-5px;border-left:0;border-top:0;}
+  h1{font-family:var(--disp);font-weight:800;font-size:23px;margin:0 0 5px;letter-spacing:-.01em;}
+  .sub{color:var(--ink-2);font-size:14px;margin:0 0 22px;}
+  label{display:block;font-family:var(--mono);font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin:0 0 7px;}
+  input{width:100%;background:#0c0e11;border:1px solid var(--line);border-radius:9px;padding:12px 13px;color:var(--ink);font-family:var(--mono);font-size:14px;margin-bottom:16px;outline:none;transition:border-color .15s;}
+  input:focus{border-color:var(--green-dim);}
+  .btn{width:100%;background:var(--green);color:#06140c;border:0;border-radius:9px;padding:13px;font-family:var(--mono);font-weight:700;font-size:14px;cursor:pointer;transition:transform .12s,box-shadow .2s;}
+  .btn:hover{transform:translateY(-1px);box-shadow:0 10px 30px var(--green-glow);}
+  .btn:disabled{opacity:.6;cursor:default;transform:none;box-shadow:none;}
+  .msg{font-family:var(--mono);font-size:12.5px;margin-top:14px;min-height:18px;}
+  .msg.err{color:var(--red);} .msg.ok{color:var(--green);}
+  .alt{text-align:center;margin-top:20px;font-size:13.5px;color:var(--ink-2);}
+  .alt a{color:var(--green);text-decoration:none;}
+  .divider{display:flex;align-items:center;gap:12px;margin:18px 0;color:var(--muted);font-family:var(--mono);font-size:11px;}
+  .divider::before,.divider::after{content:"";flex:1;height:1px;background:var(--line);}
+  .gbtn{display:flex;align-items:center;justify-content:center;gap:10px;width:100%;background:#fff;color:#1f1f1f;border-radius:9px;padding:12px;font-family:var(--body);font-weight:600;font-size:14px;text-decoration:none;transition:background .15s;}
+  .gbtn:hover{background:#eee;}
+  .gbtn svg{width:18px;height:18px;}
+  .ssobtn{display:flex;align-items:center;justify-content:center;gap:10px;width:100%;background:#0c0e11;color:var(--ink);border:1px solid var(--line);border-radius:9px;padding:12px;font-family:var(--body);font-weight:600;font-size:14px;cursor:pointer;margin-top:10px;transition:border-color .15s;}
+  .ssobtn:hover{border-color:var(--green-dim);}
+  .sso-note{text-align:center;margin-top:16px;font-family:var(--mono);font-size:11px;color:var(--muted);}
+  .sso-note a{color:var(--ink-2);}
+</style>
+</head>
+<body>
+<div class="grid-bg"></div>
+<div class="card">
+  <div class="brand"><svg width="26" height="26" viewBox="0 0 24 24" fill="none" aria-hidden="true"><g stroke="#4ade80" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-9-9c2.52 0 4.93 1 6.74 2.74L21 8"/><path d="M21 3v5h-5"/></g><g transform="translate(12 12) scale(0.40) translate(-12 -12)" stroke="#4ade80" stroke-width="4.4" stroke-linecap="round" stroke-linejoin="round"><path d="m8 2 1.88 1.88"/><path d="M14.12 3.88 16 2"/><path d="M9 7.13v-1a3.003 3.003 0 1 1 6 0v1"/><path d="M12 20c-3.3 0-6-2.7-6-6v-3a4 4 0 0 1 4-4h4a4 4 0 0 1 4 4v3c0 3.3-2.7 6-6 6"/><path d="M12 20v-9"/><path d="M6.53 9C4.6 8.8 3 7.1 3 5"/><path d="M6 13H2"/><path d="M3 21c0-2.1 1.7-3.9 3.8-4"/><path d="M20.97 5c0 2.1-1.6 3.8-3.5 4"/><path d="M22 13h-4"/><path d="M17.2 17c2.1.1 3.8 1.9 3.8 4"/></g></svg>repro<span class="dot">·</span><span class="it">it</span></div>
+  <div class="panel">
+    <h1>Sign in</h1>
+    <p class="sub">Welcome back.</p>
+    <form id="form" autocomplete="on">
+      <label for="email">Email</label>
+      <input id="email" name="email" type="email" required placeholder="you@company.com" />
+      <label for="password">Password</label>
+      <input id="password" name="password" type="password" required placeholder="your password" />
+      <button class="btn" id="submit" type="submit">Sign in →</button>
+      <div class="msg" id="msg"></div>
+    </form>
+    <div class="alt">New here? <a href="/signup">Create an account</a></div>
+  </div>
+</div>
+<script src="/login.js?v=4"></script>
+</body>
+</html>
