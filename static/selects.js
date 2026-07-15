@@ -101,7 +101,23 @@
     const optionCount = menu.querySelectorAll(".custom-select-option").length;
     const rect = wrap.getBoundingClientRect();
     const expectedHeight = Math.min(optionCount * 36 + 12, 260);
-    wrap.classList.toggle("open-up", rect.bottom + expectedHeight + 8 > window.innerHeight && rect.top > expectedHeight);
+    const gap = 6;
+    const viewportPad = 8;
+    const roomBelow = window.innerHeight - rect.bottom - gap - viewportPad;
+    const roomAbove = rect.top - gap - viewportPad;
+    const openUp = roomBelow < expectedHeight && roomAbove > roomBelow;
+    const room = Math.max(72, openUp ? roomAbove : roomBelow);
+    const menuHeight = Math.min(expectedHeight, room);
+    const width = Math.min(rect.width, window.innerWidth - viewportPad * 2);
+    const left = Math.max(viewportPad, Math.min(rect.left, window.innerWidth - width - viewportPad));
+    const top = openUp
+      ? Math.max(viewportPad, rect.top - gap - menuHeight)
+      : Math.min(window.innerHeight - viewportPad - menuHeight, rect.bottom + gap);
+    wrap.style.setProperty("--select-menu-left", `${left}px`);
+    wrap.style.setProperty("--select-menu-top", `${top}px`);
+    wrap.style.setProperty("--select-menu-width", `${width}px`);
+    wrap.style.setProperty("--select-menu-height", `${menuHeight}px`);
+    wrap.classList.toggle("open-up", openUp);
     wrap.classList.add("open");
     wrap.querySelector(".custom-select-button").setAttribute("aria-expanded", "true");
     const selected = menu.querySelector('[aria-selected="true"]');
@@ -164,6 +180,9 @@
     }
   });
 
+  window.addEventListener("resize", () => closeAll());
+  document.addEventListener("scroll", () => closeAll(), true);
+
   function start() {
     enhanceAll();
     new MutationObserver((mutations) => {
@@ -177,4 +196,3 @@
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", start, { once: true });
   else start();
 })();
-
