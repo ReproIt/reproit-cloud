@@ -2,49 +2,54 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>NimbusShop | reproit demo</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <meta name="theme-color" content="#0b1020" />
+    <title>NimbusShop | ReproIt sample</title>
     <link rel="icon" href="/favicon.svg?v=20260715-1" type="image/svg+xml" />
-    <link rel="stylesheet" href="/demo/styles.css" />
+    <link rel="stylesheet" href="/demo/styles.css?v=20260715-2" />
   </head>
   <body>
-    <!-- Onboarding banner: tells the person what to do to see the loop close.
-         This app has the reproit SDK wired to YOUR cloud; interacting with it is
-         exactly what a real user in production does. Populated by app.js once it
-         reads the project from the query string. -->
     <div id="demo-banner" class="demo-banner" hidden>
+      <strong>ReproIt sample</strong>
       <span id="demo-banner-text"></span>
     </div>
 
     <header class="topbar">
-      <a class="brand" href="#/" data-testid="brand">
-        <img src="data:image/svg+xml;utf8,&lt;svg xmlns='http://www.w3.org/2000/svg' width='22' height='22'&gt;&lt;circle cx='11' cy='11' r='9' fill='%234f7cff'/&gt;&lt;/svg&gt;" alt="NimbusShop" />
+      <a class="brand" href="#/" data-testid="brand" aria-label="NimbusShop home">
+        <svg class="brand-mark" viewBox="0 0 36 36" aria-hidden="true">
+          <defs><linearGradient id="cloud-gradient" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#75a7ff"/><stop offset="1" stop-color="#6d5dfc"/></linearGradient></defs>
+          <rect width="36" height="36" rx="11" fill="url(#cloud-gradient)"/>
+          <path d="M10.5 22.5h15a4 4 0 0 0 .2-8 7.5 7.5 0 0 0-14.3-1.7 5 5 0 0 0-.9 9.7Z" fill="none" stroke="white" stroke-width="2.2" stroke-linecap="round"/>
+        </svg>
         <span>NimbusShop</span>
       </a>
-      <nav class="nav">
-        <a href="#/" data-testid="nav-home">Home</a>
-        <a href="#/cart" data-testid="nav-cart">Cart</a>
-        <a href="#/profile" data-testid="nav-profile">Profile</a>
-        <button data-testid="nav-help" class="linkish" data-nav="#/help">Help</button>
+      <nav class="nav" aria-label="Main navigation">
+        <a href="#/" data-route="/" data-testid="nav-home">Shop</a>
+        <a href="#/profile" data-route="/profile" data-testid="nav-profile">Profile</a>
+        <a href="#/help" data-route="/help" data-testid="nav-help">Help</a>
       </nav>
-      <!-- BUG (a11y): no aria-label / no text, just an icon. Unnameable control. -->
-      <button class="cart-icon" data-testid="cart-icon" data-nav="#/cart">
-        <svg width="22" height="22" viewBox="0 0 24 24" aria-hidden="true">
-          <path d="M7 18a2 2 0 1 0 0 4 2 2 0 0 0 0-4zm10 0a2 2 0 1 0 0 4 2 2 0 0 0 0-4zM5 6h16l-2 9H7L5 6zm0 0L4 3H1" fill="none" stroke="currentColor" stroke-width="2"/>
+      <button class="cart-button" data-testid="cart-icon" data-nav="#/cart" aria-label="Cart, 0 items">
+        <svg width="20" height="20" viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M7 18a2 2 0 1 0 0 4 2 2 0 0 0 0-4Zm10 0a2 2 0 1 0 0 4 2 2 0 0 0 0-4ZM5 6h16l-2 9H7L5 6 4 3H1" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
         </svg>
+        <span>Cart</span>
+        <b id="cart-count" aria-hidden="true">0</b>
       </button>
     </header>
 
     <main id="view" class="view"></main>
 
     <footer class="footer">
-      <!-- BUG (broken-route): this path is not served -> 404 -> broken-route oracle. -->
-      <a href="/docs/getting-started" data-testid="footer-docs">Docs</a>
-      <a href="#/" data-testid="footer-home">Home</a>
       <span>© NimbusShop</span>
+      <nav aria-label="Footer navigation">
+        <a href="#/">Shop</a>
+        <a href="#/help">Support</a>
+      </nav>
+      <span class="powered">Sample store powered by ReproIt</span>
     </footer>
 
+    <div id="cart-status" class="toast" role="status" aria-live="polite" hidden></div>
     <script src="/demo/reproit-web.js"></script>
-    <script src="/demo/app.js"></script>
+    <script src="/demo/app.js?v=20260715-2"></script>
   </body>
 </html>

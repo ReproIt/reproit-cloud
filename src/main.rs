@@ -742,8 +742,8 @@ async fn main() -> anyhow::Result<()> {
                 )
             }),
         )
-        // The bundled NimbusShop demo: a tiny storefront with planted bugs and
-        // the web SDK wired to THIS cloud. Onboarding opens it with the new
+        // The bundled NimbusShop sample: a polished storefront with one planted
+        // checkout crash and the web SDK wired to THIS cloud. Onboarding opens it with the new
         // project's ?appId=&key= so a first-run user watches a real crash flow
         // into their dashboard before pointing the SDK at their own app. Served
         // same-origin so the SDK's /v1/events POST needs no CORS.
