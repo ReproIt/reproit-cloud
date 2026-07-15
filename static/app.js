@@ -1331,9 +1331,29 @@ function renderTrackerSettings(project) {
   </div>`;
 }
 
+function renderInviteSettings(account) {
+  const invitations = account.invitations || [];
+  const pendingRows = invitations.map((invite) => {
+    const expires = new Date(invite.expiresAt);
+    const expiry = Number.isNaN(expires.getTime()) ? "" : `Expires ${expires.toLocaleDateString()}`;
+    return `<div class="pending-invite"><div class="pending-identity"><b>${esc(invite.email)}</b><span>${esc(invite.role)}${expiry ? ` · ${esc(expiry)}` : ""}</span></div><div class="invite-actions"><button class="linkbtn" type="button" data-invite-resend="${Number(invite.id)}" ${S.inviteBusy ? "disabled" : ""}>Resend</button><button class="linkbtn danger-link" type="button" data-invite-revoke="${Number(invite.id)}" ${S.inviteBusy ? "disabled" : ""}>Revoke</button></div></div>`;
+  }).join("");
+  return `<div class="card invite-card">
+    <div class="hd">Invite member <span class="tag">${invitations.length} pending</span></div>
+    <div class="bd">
+      <form id="invite-form" class="invite-form">
+        <label class="fld-lbl" for="invite-email">Email address</label>
+        <input class="invite-email" id="invite-email" type="email" value="${esc(S.inviteEmail)}" placeholder="teammate@company.com" autocomplete="email" required />
+        <div class="invite-controls"><div class="invite-role-field"><label class="fld-lbl" for="invite-role">Access level</label><div class="selwrap invite-role-wrap"><select id="invite-role"><option value="member"${S.inviteRole === "member" ? " selected" : ""}>Member</option><option value="admin"${S.inviteRole === "admin" ? " selected" : ""}>Admin</option></select></div></div><button class="primary-sm invite-submit" type="submit" ${S.inviteBusy ? "disabled" : ""}>${S.inviteBusy === "send" ? "Sending..." : "Send invite"}</button></div>
+        <div class="muted">The invitation expires in 7 days.</div>
+      </form>
+      ${pendingRows ? `<div class="pending-invites"><div class="pending-title">Pending invitations</div>${pendingRows}</div>` : ""}
+    </div>
+  </div>`;
+}
+
 function renderTeamSettings(account, org) {
   const members = account.members || [];
-  const invitations = account.invitations || [];
   const q = S.teamSearch.trim().toLowerCase();
   const roleValue = (m) => S.roleDraft[m.userId] || m.role || "none";
   const changed = members.some((m) => roleValue(m) !== (m.role || "none"));
@@ -1356,11 +1376,9 @@ function renderTeamSettings(account, org) {
       <td class="m-role">${roleSelect(m)}</td>
     </tr>`;
   }).join("");
-  const pendingRows = invitations.map((invite) => `<tr><td class="m-email">${esc(invite.email)} <span class="tag">pending</span></td><td class="m-role invite-actions"><span class="muted">${esc(invite.role)}</span><button class="linkbtn" type="button" data-invite-resend="${Number(invite.id)}" ${S.inviteBusy ? "disabled" : ""}>Resend</button><button class="linkbtn danger-link" type="button" data-invite-revoke="${Number(invite.id)}" ${S.inviteBusy ? "disabled" : ""}>Revoke</button></td></tr>`).join("");
   return `<div class="card team-card">
-    <div class="hd">Team access</div>
+    <div class="hd">Team access <span class="tag">${members.filter((m) => m.seat === true).length} active</span></div>
     <div class="bd">
-      ${canManageOrg() ? `<form id="invite-form" class="invite-form"><label class="fld-lbl" for="invite-email">Invite member</label><div class="invite-row"><input id="invite-email" type="email" value="${esc(S.inviteEmail)}" placeholder="teammate@company.com" autocomplete="email" required /><div class="selwrap"><select id="invite-role"><option value="member"${S.inviteRole === "member" ? " selected" : ""}>member</option><option value="admin"${S.inviteRole === "admin" ? " selected" : ""}>admin</option></select></div><button class="primary-sm" type="submit" ${S.inviteBusy ? "disabled" : ""}>${S.inviteBusy === "send" ? "Sending..." : "Send invite"}</button></div><div class="muted">The invitation expires in 7 days.</div></form>` : ""}
       <div class="team-tools">
         <input id="team-search" value="${esc(S.teamSearch)}" placeholder="Search users" autocomplete="off" />
         <button class="primary-sm" id="team-save" type="button" ${!changed || S.roleSaving ? "disabled" : ""}>${S.roleSaving ? "Saving..." : "Save changes"}</button>
@@ -1371,7 +1389,7 @@ function renderTeamSettings(account, org) {
           <col class="role-col">
         </colgroup>
         <thead><tr><th>User</th><th>Role</th></tr></thead>
-        <tbody>${rows || `<tr><td colspan="2" class="muted">${members.length ? "No users match your search." : "No users loaded."}</td></tr>`}${q ? "" : pendingRows}</tbody>
+        <tbody>${rows || `<tr><td colspan="2" class="muted">${members.length ? "No users match your search." : "No users loaded."}</td></tr>`}</tbody>
       </table>
     </div>
   </div>`;
@@ -1445,7 +1463,7 @@ function renderAccountView() {
         ${renderTrackerSettings(project)}
       </div>
       <div>
-        ${canManage ? renderTeamSettings(a, org) : `<div class="card"><div class="hd">Team access</div><div class="bd"><div class="muted">Owners and admins manage team access.</div></div></div>`}
+        ${canManage ? `${renderInviteSettings(a)}${renderTeamSettings(a, org)}` : `<div class="card"><div class="hd">Team access</div><div class="bd"><div class="muted">Owners and admins manage team access.</div></div></div>`}
       </div>
     </div>
   </section></div>`;
