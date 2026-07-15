@@ -704,6 +704,15 @@ async fn main() -> anyhow::Result<()> {
                 )
             }),
         )
+        .route(
+            "/selects.js",
+            get(|| async {
+                (
+                    [(CONTENT_TYPE, "application/javascript; charset=utf-8")],
+                    include_str!("../static/selects.js"),
+                )
+            }),
+        )
         // The per-seat triage product's view module (bug list + grab-a-bug +
         // triage controls + seat management). Loaded by app.html after app.js.
         .route(
@@ -721,6 +730,15 @@ async fn main() -> anyhow::Result<()> {
                 (
                     [(CONTENT_TYPE, "text/css; charset=utf-8")],
                     include_str!("../static/styles.css"),
+                )
+            }),
+        )
+        .route(
+            "/favicon.svg",
+            get(|| async {
+                (
+                    [(CONTENT_TYPE, "image/svg+xml")],
+                    include_str!("../static/favicon.svg"),
                 )
             }),
         )
