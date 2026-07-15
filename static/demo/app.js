@@ -212,6 +212,7 @@ if (window.ReproIt && appId && key) {
     key,
     endpoint: location.origin + "/v1/events",
     flushMs: 1500,
+    context: { reproitSample: "nimbus-shop" },
   });
   bannerText.textContent = "Add any item, open your cart, then check out. The captured crash will appear in your dashboard.";
   banner.hidden = false;

@@ -684,6 +684,80 @@ impl TenantStore {
             .collect())
     }
 
+    /// Remove verified sample occurrences and, once the bucket is empty, its
+    /// derived metadata. The caller supplies only occurrence ids it has already
+    /// classified as sample data. A concurrent real occurrence is preserved and
+    /// keeps the bucket metadata alive.
+    pub async fn delete_sample_bucket_data(
+        &self,
+        app_id: &str,
+        bucket_id: &str,
+        error_ids: &[i64],
+    ) -> anyhow::Result<(u64, Vec<String>)> {
+        if error_ids.is_empty() {
+            return Ok((0, Vec::new()));
+        }
+        let mut tx = self.pool.begin().await?;
+        let evidence =
+            sqlx::query("SELECT storage_key FROM evidence WHERE app_id=$1 AND error_id = ANY($2)")
+                .bind(app_id)
+                .bind(error_ids)
+                .fetch_all(&mut *tx)
+                .await?;
+        let keys = evidence
+            .iter()
+            .map(|row| row.get::<String, _>("storage_key"))
+            .collect();
+        let deleted =
+            sqlx::query("DELETE FROM errors WHERE app_id=$1 AND bucket_id=$2 AND id = ANY($3)")
+                .bind(app_id)
+                .bind(bucket_id)
+                .bind(error_ids)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+        let remaining: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM errors WHERE app_id=$1 AND bucket_id=$2")
+                .bind(app_id)
+                .bind(bucket_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if remaining == 0 {
+            sqlx::query("DELETE FROM replay_results WHERE app_id=$1 AND bucket_id=$2")
+                .bind(app_id)
+                .bind(bucket_id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("DELETE FROM bucket_tickets WHERE app_id=$1 AND bucket_id=$2")
+                .bind(app_id)
+                .bind(bucket_id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("DELETE FROM bucket_triage WHERE app_id=$1 AND bucket_id=$2")
+                .bind(app_id)
+                .bind(bucket_id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("DELETE FROM bucket_resolution_status WHERE app_id=$1 AND bucket_id=$2")
+                .bind(app_id)
+                .bind(bucket_id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("DELETE FROM bucket_resolution_events WHERE app_id=$1 AND bucket_id=$2")
+                .bind(app_id)
+                .bind(bucket_id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("DELETE FROM cloud_runs WHERE app_id=$1 AND bucket_id=$2")
+                .bind(app_id)
+                .bind(bucket_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok((deleted, keys))
+    }
+
     /// The newest `limit` occurrences app-wide, returned OLDEST-FIRST: the
     /// bounded sample that stands in for "the whole app history" wherever a
     /// baseline/denominator is needed (discriminators, build ordering, post-fix

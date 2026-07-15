@@ -134,6 +134,28 @@ pub struct ErrorRec {
     pub context: Map<String, Value>,
 }
 
+pub(crate) const NIMBUS_SAMPLE: &str = "nimbus-shop";
+
+/// Identify Cloud's bundled NimbusShop checkout sample. New demo events carry an
+/// explicit context marker. The narrow structural fallback recognizes sample
+/// occurrences created before that marker shipped, so existing workspaces can
+/// clean up their onboarding data too.
+pub(crate) fn sample_kind(rec: &ErrorRec) -> Option<&'static str> {
+    if rec.context.get("reproitSample").and_then(Value::as_str) == Some(NIMBUS_SAMPLE) {
+        return Some(NIMBUS_SAMPLE);
+    }
+    let message = rec.message.to_ascii_lowercase();
+    let known_null_total = (message.contains("order is null")
+        || message.contains("cannot read properties of null"))
+        && message.contains("total");
+    let checkout = rec
+        .path
+        .iter()
+        .any(|step| step.action == "tap:key:testid:cart-checkout");
+    let crash = rec.context.get("oracle").and_then(Value::as_str) == Some("crash");
+    (known_null_total && checkout && crash).then_some(NIMBUS_SAMPLE)
+}
+
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Step {
     pub sig: String,
@@ -1233,10 +1255,15 @@ pub(crate) async fn bucket_list_for_tenant(tenant: &Tenant, app_id: &str) -> any
         };
         let scored = impact::impact_score(&signals, &now);
 
+        let sample = idxs
+            .iter()
+            .all(|&i| sample_kind(&occ[i].2) == Some(NIMBUS_SAMPLE))
+            .then_some(NIMBUS_SAMPLE);
         let item = json!({
             "bucketId": bid,
             "bugId": buckets::bug_id(newest),
             "findingIdentity": buckets::finding_identity(newest),
+            "sample": sample,
             "count": idxs.len(),
             "message": newest.message,
             "crashSig": newest.sig,
@@ -2237,5 +2264,34 @@ mod tests {
         assert_eq!(agg.edge_counts.get("a|tap|b"), Some(&2));
         assert!(agg.error_recs.is_empty());
         assert_eq!(agg.dropped_untagged, 1);
+    }
+
+    #[test]
+    fn sample_identity_is_explicit_and_legacy_fallback_is_narrow() {
+        let mut tagged = ErrorRec {
+            sig: "s".into(),
+            message: "anything".into(),
+            path: vec![],
+            context: Map::new(),
+        };
+        tagged
+            .context
+            .insert("reproitSample".into(), json!(NIMBUS_SAMPLE));
+        assert_eq!(sample_kind(&tagged), Some(NIMBUS_SAMPLE));
+
+        let mut legacy = ErrorRec {
+            sig: "s".into(),
+            message: "TypeError: can't access property \"total\", order is null".into(),
+            path: vec![Step {
+                sig: "cart".into(),
+                action: "tap:key:testid:cart-checkout".into(),
+                label: Some("Checkout".into()),
+            }],
+            context: Map::new(),
+        };
+        legacy.context.insert("oracle".into(), json!("crash"));
+        assert_eq!(sample_kind(&legacy), Some(NIMBUS_SAMPLE));
+        legacy.path[0].action = "tap:key:testid:pay".into();
+        assert_eq!(sample_kind(&legacy), None);
     }
 }

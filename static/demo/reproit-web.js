@@ -56,6 +56,7 @@
     debounceMs: 350, // settle window after an interaction before snapshotting
     valueNodes: [], // Layer-3 opt-in selectors marking EXTRA value-bearing nodes
     build: null, // developer-provided { version, commit }; stamped as context.build
+    context: null, // optional bounded, PII-safe session context stamped on every event
   };
 
   // Keep only the provided string fields of a developer-supplied build identity
@@ -1161,9 +1162,15 @@
     _flush: function (useBeacon) {
       if (!this._buf.length) return;
       var batch = { appId: this._cfg.appId, sentAt: Date.now(), events: this._buf };
+      if (this._cfg.context && typeof this._cfg.context === "object" && !Array.isArray(this._cfg.context)) {
+        batch.ctx = Object.assign({}, this._cfg.context);
+      }
       // Stamp the developer-provided build identity as context.build (only the
       // provided fields); omitted entirely when no build was supplied.
-      if (this._build) batch.ctx = { build: this._build };
+      if (this._build) {
+        batch.ctx = batch.ctx || {};
+        batch.ctx.build = this._build;
+      }
       this._buf = [];
       var cfg = this._cfg;
       if (!cfg.endpoint) {

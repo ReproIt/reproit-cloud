@@ -152,6 +152,7 @@ pub fn bucket_detail(
     bucket_id: &str,
     newest: &crate::ingest::ErrorRec,
     oldest: &crate::ingest::ErrorRec,
+    sample: Option<&str>,
     count: usize,
     discriminators: Vec<Value>,
     cohorts: Vec<Value>,
@@ -169,6 +170,7 @@ pub fn bucket_detail(
         "bucketId": bucket_id,
         "bugId": buckets::bug_id(newest),
         "findingIdentity": buckets::finding_identity(newest),
+        "sample": sample,
         "appId": app_id,
         "count": count,
         "crashSummary": buckets::crash_summary(newest),
@@ -591,6 +593,10 @@ pub async fn get_bucket_detail(
     }
     let oldest = rows.first().unwrap().2.clone();
     let newest = rows.last().unwrap().2.clone();
+    let sample = rows
+        .iter()
+        .all(|(_, _, rec)| crate::ingest::sample_kind(rec) == Some(crate::ingest::NIMBUS_SAMPLE))
+        .then_some(crate::ingest::NIMBUS_SAMPLE);
     let count = rows.len();
     let baseline: Vec<serde_json::Map<String, Value>> = tenant
         .store
@@ -633,6 +639,7 @@ pub async fn get_bucket_detail(
         &bucket,
         &newest,
         &oldest,
+        sample,
         count,
         discriminators,
         cohorts,
@@ -641,6 +648,74 @@ pub async fn get_bucket_detail(
         triage.as_ref(),
         &resolution,
     ))
+    .into_response()
+}
+
+/// DELETE /v1/apps/:app/buckets/:bucket/sample clears only the bundled
+/// NimbusShop onboarding finding. This is intentionally not a generic bug
+/// deletion API: every occurrence must carry the sample identity (or match the
+/// narrow legacy sample signature), and only an org owner/admin may call it.
+pub async fn delete_sample_bucket(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Path((app_id, bucket)): Path<(String, String)>,
+) -> Response {
+    let (_user, org) = match crate::auth::user_and_org(&app, &headers).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    if !crate::auth::can_manage(&org.role) {
+        return err(StatusCode::FORBIDDEN, "owner or admin required");
+    }
+    let (tenant, _) = match resolve_owning(&app, org.id, &app_id).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    let rows = match tenant
+        .store
+        .errors_for_bucket(&app_id, &bucket, i64::MAX)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!("sample bucket read failed for {app_id}/{bucket}: {e}");
+            return err(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
+        }
+    };
+    if rows.is_empty() {
+        return err(StatusCode::NOT_FOUND, "not found");
+    }
+    if rows
+        .iter()
+        .any(|(_, _, rec)| crate::ingest::sample_kind(rec) != Some(crate::ingest::NIMBUS_SAMPLE))
+    {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "only NimbusShop sample data can be cleared here",
+        );
+    }
+    let ids: Vec<i64> = rows.iter().map(|(id, _, _)| *id).collect();
+    let (deleted, evidence_keys) = match tenant
+        .store
+        .delete_sample_bucket_data(&app_id, &bucket, &ids)
+        .await
+    {
+        Ok(result) => result,
+        Err(e) => {
+            tracing::error!("sample bucket delete failed for {app_id}/{bucket}: {e}");
+            return err(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
+        }
+    };
+    for key in evidence_keys {
+        if let Err(e) = tenant.blobs.delete(&key).await {
+            tracing::warn!("sample evidence blob cleanup failed for {app_id}/{bucket}: {e}");
+        }
+    }
+    Json(json!({
+        "cleared": true,
+        "sample": crate::ingest::NIMBUS_SAMPLE,
+        "occurrences": deleted,
+    }))
     .into_response()
 }
 
@@ -918,6 +993,7 @@ mod tests {
             bid,
             &newest,
             &oldest,
+            None,
             3,
             discs.clone(),
             cohorts.clone(),
@@ -968,6 +1044,7 @@ mod tests {
             "bkt_x",
             &r,
             &r,
+            None,
             1,
             Vec::new(),
             Vec::new(),

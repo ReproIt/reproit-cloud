@@ -627,6 +627,10 @@ async fn main() -> anyhow::Result<()> {
             "/v1/apps/:app/buckets/:bucket/detail",
             get(triage::get_bucket_detail),
         )
+        .route(
+            "/v1/apps/:app/buckets/:bucket/sample",
+            axum::routing::delete(triage::delete_sample_bucket),
+        )
         // The per-bucket occurrence time-series (segmented by build) the dashboard
         // graphs, plus the computed prod-evidence resolution.
         .route(

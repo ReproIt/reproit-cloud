@@ -385,12 +385,19 @@ kbd{background:var(--panel2);border:1px solid var(--line);border-bottom-width:2p
 .ghostbtn-sm[disabled]{opacity:.6;cursor:default}
 .ghostbtn-sm.danger{color:var(--red);border-color:rgba(244,98,90,.26)}
 .ghostbtn-sm.danger:hover{background:rgba(244,98,90,.08);border-color:rgba(244,98,90,.42);color:var(--red)}
+.b-sample{color:#8fc7ff;border-color:rgba(91,169,255,.35);background:rgba(91,169,255,.08)}
+.sample-cleanup{margin-top:14px;border-color:rgba(91,169,255,.18)}
+.sample-cleanup p{max-width:720px;margin:0 0 13px;color:var(--mut);font-size:12px;line-height:1.55}
+.sample-confirm{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:12px;border:1px solid rgba(244,98,90,.22);border-radius:9px;background:rgba(244,98,90,.045);color:var(--mut);font-size:11.5px;line-height:1.5}
+.sample-actions{display:flex;align-items:center;gap:8px;flex:none}
+.sample-rerun{margin-top:22px;padding-top:16px;border-top:1px solid var(--line)}
 
 @media(max-width:620px){
   .account-hero{align-items:stretch;flex-direction:column;padding:16px}
   .account-actions{justify-content:stretch}
   .danger-btn{width:100%}
   .invite-controls{grid-template-columns:1fr}.invite-submit{width:100%}
+  .sample-confirm{align-items:stretch;flex-direction:column}.sample-actions{justify-content:flex-end}
   .header-picker{width:100px}
 }
 

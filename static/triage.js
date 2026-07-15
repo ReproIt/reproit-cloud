@@ -72,6 +72,8 @@
     detailStatus: "idle", // idle | loading | ready | error
     detailErr: null,
     savingTriage: false,
+    confirmingSampleClear: false,
+    clearingSample: false,
 
     // timeline (spike-drops graph on the detail)
     timeline: null,       // {series, total, windowSecs, resolution}
@@ -447,6 +449,7 @@
   async function loadDetail(bucket, doRenderList) {
     T.selBucket = bucket;
     T.detail = null; T.detailStatus = "loading"; T.detailErr = null;
+    T.confirmingSampleClear = false; T.clearingSample = false;
     if (doRenderList !== false) renderTriage();
     else paintDetailOnly();
     const r = await cookieReq(appPath("/" + encodeURIComponent(bucket) + "/detail"));
@@ -482,6 +485,33 @@
     loadEvents();        // a fix may surface a fresh transition in the strip
     renderListColumn();  // reflect new status chip in the list
     setBugCountConn();
+  }
+
+  const sampleClearedKey = () => `reproit:sample-cleared:${cfg().app || ""}`;
+  const sampleWasCleared = () => {
+    try { return localStorage.getItem(sampleClearedKey()) === "1"; } catch { return false; }
+  };
+
+  async function clearSample(bucket) {
+    T.clearingSample = true;
+    paintDetailOnly();
+    const r = await cookieReq(appPath("/" + encodeURIComponent(bucket) + "/sample"), "DELETE");
+    T.clearingSample = false;
+    if (!r.ok) {
+      A.setBanner((r.data && r.data.error) || ("Could not clear demo data (HTTP " + r.status + ")"), "warn");
+      paintDetailOnly();
+      return;
+    }
+    try { localStorage.setItem(sampleClearedKey(), "1"); } catch { /* storage disabled */ }
+    A.setBanner("");
+    T.confirmingSampleClear = false;
+    T.selBucket = null;
+    T.detail = null;
+    T.detailStatus = "idle";
+    T.timeline = null;
+    T.timelineFor = null;
+    T.timelineStatus = "idle";
+    await loadBuckets({ quiet: false });
   }
 
   // ---- seats: data ----------------------------------------------------------
@@ -719,7 +749,15 @@
         const app = cfg().app;
         const key = app && A.pubKeyForApp ? A.pubKeyForApp(app) : null;
         const launcher = key && A.renderDemoLauncher ? A.renderDemoLauncher(app, key, "bugs") : "";
-        rows = launcher
+        const cleared = sampleWasCleared();
+        rows = cleared
+          ? `<div class="empty"><div style="max-width:560px">
+              <div class="ico" aria-hidden="true">[ ]</div>
+              <div class="big">No production bugs</div>
+              <div class="sub">Connect this project to your app. Real production bugs will appear here with a local reproduction command.</div>
+              ${launcher ? `<div class="sample-rerun"><div class="muted">Want to test the flow again?</div>${launcher}</div>` : ""}
+            </div></div>`
+          : launcher
           ? `<div class="empty"><div style="max-width:560px">
               <div class="ico" aria-hidden="true">[ ]</div>
               <div class="big">Test your new project</div>
@@ -750,6 +788,7 @@
             ${severityChip(sev)}
             ${resolutionChip(res)}
             ${statusPill(bucketTriageStatus(b))}
+            ${b.sample ? `<span class="badge b-sample">sample</span>` : ""}
           </div>
           <div class="bug-id">${esc(b.bucketId)}</div>
           <div class="ttl">${esc(A.titleFromMessage(b.message))}</div>
@@ -947,6 +986,7 @@
         ${severityChip(sev)}
         ${resolutionChip(resStatus)}
         ${statusPill(tr.status)}
+        ${d.sample ? `<span class="badge b-sample">Sample bug</span>` : ""}
         ${rp ? `<span class="repro ${rp.cls}" title="${esc(rp.detail)}">${esc(rp.label)}</span>` : ""}
         ${autoFixed ? `<span class="badge b-rep">&#10003; fix verified by replay</span>` : ""}
       </div>
@@ -964,6 +1004,22 @@
           </div>
         </div>
       </div>
+
+      ${d.sample ? `<div class="card sample-cleanup">
+        <div class="hd">Demo data</div>
+        <div class="bd">
+          <p>This bug came from NimbusShop during onboarding. Clear it when you are ready to use this project for your own app.</p>
+          ${T.confirmingSampleClear
+            ? `<div class="sample-confirm">
+                <span>Remove this sample bug and its occurrences? Real bugs are not affected.</span>
+                <div class="sample-actions">
+                  <button class="ghostbtn-sm" id="t-clear-sample-cancel" type="button" ${T.clearingSample ? "disabled" : ""}>Cancel</button>
+                  <button class="danger-btn" id="t-clear-sample-confirm" type="button" ${T.clearingSample ? "disabled" : ""}>${T.clearingSample ? "Clearing…" : "Clear demo data"}</button>
+                </div>
+              </div>`
+            : `<button class="danger-btn" id="t-clear-sample-start" type="button">Clear demo data</button>`}
+        </div>
+      </div>` : ""}
 
       <div class="grid">
         <div>
@@ -1087,6 +1143,9 @@
     if (t.id === "t-refresh") { loadBuckets({ quiet: true }); return; }
     if (t.id === "t-refresh2") { loadBuckets({ quiet: true }); return; }
     if (t.id === "t-seats-retry") { loadMe(); return; }
+    if (t.id === "t-clear-sample-start") { T.confirmingSampleClear = true; paintDetailOnly(); return; }
+    if (t.id === "t-clear-sample-cancel") { T.confirmingSampleClear = false; paintDetailOnly(); return; }
+    if (t.id === "t-clear-sample-confirm") { clearSample(T.selBucket); return; }
 
     const goto = t.closest("[data-goto]");
     if (goto) { ev.preventDefault(); switchView(goto.dataset.goto); return; }
@@ -1134,6 +1193,8 @@
     T.selBucket = null;
     T.detail = null;
     T.detailStatus = "idle";
+    T.confirmingSampleClear = false;
+    T.clearingSample = false;
     T.timeline = null;
     T.timelineFor = null;
     T.timelineStatus = "idle";
