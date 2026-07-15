@@ -62,7 +62,7 @@
     // bug list (impact-sorted by the API; carries impact + resolution per item)
     buckets: null,        // [{bucketId, count, message, crashSig, repro, lineage, impact, resolution, ...}]
     triageByBucket: {},   // bucketId -> {status, updatedAt}
-    listStatus: "idle",   // idle | loading | ready | error | needkey | unauth | noseat
+    listStatus: "idle",   // idle | loading | ready | error | noproject | needkey | unauth | noseat
     listErr: null,
     statusFilter: "all",  // all | active | resolving | resolved | regressed (prod-truth resolution)
     selBucket: null,
@@ -309,6 +309,16 @@
     const quiet = opts && opts.quiet;
     const before = bucketListFingerprint(T.buckets || []);
     T.listErr = null;
+    const c = cfg();
+    if (!c.app) {
+      T.buckets = [];
+      T.triageByBucket = {};
+      T.selBucket = null;
+      T.listStatus = "noproject";
+      A.setConn("no projects", "var(--muted)");
+      quiet ? paintListBodyOnly() : renderTriage();
+      return;
+    }
     if (!quiet) {
       T.listStatus = "loading";
       A.setConn("loading buckets", "var(--amber)");
@@ -316,7 +326,6 @@
     } else {
       A.setConn("refreshing bugs", "var(--amber)");
     }
-    const c = cfg();
     let r = await cookieReq(`/v1/apps/${encodeURIComponent(c.app)}/dashboard/buckets`);
     if (r.status === 401 && c.key) r = await apiKeyGet(appPath(""));
     if (r.status === 401) {
@@ -612,6 +621,14 @@
   }
 
   function renderListBodyHTML() {
+    if (T.listStatus === "noproject") {
+      return `<div class="empty"><div>
+          <div class="ico" aria-hidden="true">[ ]</div>
+          <div class="big">Create a project</div>
+          <div class="sub">Projects hold SDK keys, production bugs, and replay evidence.</div>
+          <button class="ghostbtn" id="go-account" type="button">Open account</button>
+        </div></div>`;
+    }
     if (T.listStatus === "needkey") {
       return `<div class="empty"><div>
           <div class="ico" aria-hidden="true">[ ]</div>

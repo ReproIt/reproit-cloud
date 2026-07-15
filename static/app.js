@@ -4,7 +4,7 @@
 // Served same-origin from the cloud (see reproit-cloud), so the API base
 // defaults to this origin (empty string = relative fetches, no CORS). The
 // config overlay / `?api=&app=&key=` still let you point it at another cloud.
-const DEFAULTS = { api: "", app: "bugzoo", key: "" };
+const DEFAULTS = { api: "", app: "", key: "" };
 
 function loadConfig() {
   const qs = new URLSearchParams(location.search);
@@ -173,6 +173,12 @@ async function loadAccount() {
     const appId = (!EXPLICIT.app || !ownsConfiguredApp) ? projects[0].appId : CFG.app;
     CFG = { ...CFG, app: appId, key: keyForApp(appId) };
     saveConfig(CFG);
+  } else {
+    // A new workspace has no active project. Clear any stale project kept in
+    // this browser so the dashboard renders onboarding instead of requesting a
+    // project that does not exist and misreporting its 404 as a load failure.
+    CFG = { ...CFG, app: "", key: "" };
+    saveConfig(CFG);
   }
   const email = S.account.email || "";
   const avatar = document.querySelector(".avatar");
@@ -202,7 +208,7 @@ function paintProjectSwitch() {
     ).join("");
     sel.disabled = false;
   } else {
-    sel.innerHTML = `<option value="${esc(CFG.app)}">${esc(CFG.app || "No apps")}</option>`;
+    sel.innerHTML = `<option value="">No projects</option>`;
     sel.disabled = true;
   }
 }
