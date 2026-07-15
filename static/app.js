@@ -234,7 +234,7 @@ function paintProjectSwitch() {
 function paintOrgSwitch() {
   const orgs = (S.account && S.account.organizations) || [];
   const activeId = S.account && S.account.org && Number(S.account.org.id);
-  paintHeaderPicker("org", orgs.map((org) => ({ value: Number(org.id), label: org.name, meta: org.role })), activeId, "Organization", S.orgBusy);
+  paintHeaderPicker("org", orgs.map((org) => ({ value: Number(org.id), label: org.name, meta: org.role })), activeId, "Workspace", S.orgBusy);
 }
 function redirectToLogin() {
   const next = location.pathname + location.search + location.hash;
@@ -1309,10 +1309,13 @@ function renderDispatchSettings(project) {
 function renderTrackerSettings(project) {
   const suffix = project ? String(project.appId || "").toUpperCase().replace(/[^A-Z0-9]/g, "_") : "APP_ID";
   const appId = project ? project.appId : "your-app";
+  const loginCommand = location.hostname === "cloud.reproit.com"
+    ? `reproit login --app ${appId}`
+    : `reproit login --cloud ${location.origin} --app ${appId}`;
   return `<div class="card">
     <div class="hd">Issue tracker</div>
     <div class="bd">
-      <div class="muted">Set one provider for this project. Reproit files a ticket when a new bucket appears and links it back to the bug.</div>
+      <div class="muted">Set one provider for this project. ReproIt files a ticket when a new bucket appears and links it back to the bug.</div>
       <div class="setup-list" style="margin-top:14px">
         <div class="setup-row">
           <b>GitHub</b>
@@ -1339,7 +1342,7 @@ function renderTrackerSettings(project) {
           <code>REPROIT_SHORTCUT_TOKEN__${esc(suffix)}=...</code>
         </div>
       </div>
-      <div class="keybox" style="margin-top:14px"><span>reproit cloud login --host ${location.origin} --app ${esc(appId)}</span></div>
+      <div class="keybox" style="margin-top:14px"><span>${esc(loginCommand)}</span></div>
     </div>
   </div>`;
 }
@@ -1410,7 +1413,7 @@ function renderTeamSettings(account, org) {
 
 function renderOrganizationSettings(account, org) {
   const name = S.orgNameDraft == null ? (org.name || "") : S.orgNameDraft;
-  return `<div class="card org-card"><div class="hd">Organization</div><div class="bd">${canManageOrg() ? `<form id="org-name-form" class="inline-form"><label class="fld-lbl" for="org-name">Organization name</label><div class="inline-row"><input id="org-name" value="${esc(name)}" maxlength="80" required /><button class="primary-sm" type="submit" ${S.orgBusy ? "disabled" : ""}>Save</button></div></form>` : `<div class="muted">${esc(org.name || "Organization")}</div>`}</div></div>`;
+  return `<div class="card org-card"><div class="hd">Workspace</div><div class="bd">${canManageOrg() ? `<form id="org-name-form" class="inline-form"><label class="fld-lbl" for="org-name">Workspace name</label><div class="inline-row"><input id="org-name" value="${esc(name)}" maxlength="80" required /><button class="primary-sm" type="submit" ${S.orgBusy ? "disabled" : ""}>Rename</button></div></form>` : `<div class="muted">${esc(org.name || "Workspace")}</div>`}</div></div>`;
 }
 
 function renderAccountView() {
@@ -1534,7 +1537,7 @@ async function saveTeamAccess() {
 async function switchOrganization(orgId){if(!orgId||S.orgBusy)return;S.orgBusy=true;paintOrgSwitch();const r=await accountReq("/account/orgs/active","POST",{orgId:Number(orgId)});if(!r.ok){S.orgBusy=false;setBanner((r.data&&r.data.error)||"Could not switch organization","warn");paintOrgSwitch();return}try{localStorage.setItem("reproit.activeOrg",String(orgId))}catch{}CFG={...CFG,app:"",key:""};saveConfig(CFG);S.orgBusy=false;S.orgNameDraft=null;S.roleDraft={};S.teamSearch="";resetAppData();if(window.ReproitTriage&&window.ReproitTriage.resetForApp)window.ReproitTriage.resetForApp();await loadAccount();syncProjectUrl(true);setBanner("");if(S.view==="scans")loadScans();else render()}
 async function sendInvitation(){const email=S.inviteEmail.trim();if(!email||S.inviteBusy)return;S.inviteBusy="send";render();const r=await accountReq("/account/invitations","POST",{email,role:S.inviteRole});S.inviteBusy="";if(!r.ok){setBanner((r.data&&r.data.error)||"Could not send invitation","warn");render();return}S.inviteEmail="";setBanner(`Invitation sent to ${email}.`);await loadAccount();render()}
 async function invitationAction(action,id){if(S.inviteBusy)return;S.inviteBusy=action;render();const r=await accountReq(`/account/invitations/${action}`,"POST",{invitationId:Number(id)});S.inviteBusy="";if(!r.ok){setBanner((r.data&&r.data.error)||`Could not ${action} invitation`,"warn");render();return}setBanner(action==="resend"?"Invitation sent again.":"Invitation revoked.");await loadAccount();render()}
-async function saveOrganizationName(){const name=(S.orgNameDraft==null?(S.account&&S.account.org&&S.account.org.name):S.orgNameDraft||"").trim();if(!name||S.orgBusy)return;S.orgBusy=true;render();const r=await accountReq("/account/orgs/name","POST",{name});S.orgBusy=false;if(!r.ok){setBanner((r.data&&r.data.error)||"Could not rename organization","warn");render();return}S.orgNameDraft=null;setBanner("");await loadAccount();render()}
+async function saveOrganizationName(){const name=(S.orgNameDraft==null?(S.account&&S.account.org&&S.account.org.name):S.orgNameDraft||"").trim();if(!name||S.orgBusy)return;S.orgBusy=true;render();const r=await accountReq("/account/orgs/name","POST",{name});S.orgBusy=false;if(!r.ok){setBanner((r.data&&r.data.error)||"Could not rename workspace","warn");render();return}S.orgNameDraft=null;setBanner("");await loadAccount();render()}
 
 async function createProject(name) {
   const clean = String(name || "").trim();
