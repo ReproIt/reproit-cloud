@@ -14,6 +14,7 @@ mod db;
 mod ingest;
 mod integrations;
 mod jobs;
+mod mail;
 mod sweep;
 mod tenancy;
 mod triage;
@@ -583,6 +584,7 @@ async fn main() -> anyhow::Result<()> {
         .route(backend_contract::SIGNUP, post(auth::signup))
         .route("/auth/login", post(auth::login))
         .route("/auth/logout", post(auth::logout))
+        .route("/auth/invitations/preview", get(auth::invitation_preview))
         // Email flows: verification (the signup link) + password reset. All
         // token-bearing and unauthenticated, so they belong on the tight limiter.
         .route_layer(GovernorLayer { config: auth_rl });
@@ -597,6 +599,12 @@ async fn main() -> anyhow::Result<()> {
         .route("/account/me", get(auth::me))
         .route("/account/usage", get(auth::usage))
         .route(backend_contract::CREATE_PROJECT, post(auth::create_project))
+        .route("/account/orgs/active", post(auth::set_active_org))
+        .route("/account/orgs/name", post(auth::rename_org))
+        .route("/account/invitations", post(auth::invite_member))
+        .route("/account/invitations/accept", post(auth::accept_invitation))
+        .route("/account/invitations/resend", post(auth::resend_invitation))
+        .route("/account/invitations/revoke", post(auth::revoke_invitation))
         .route("/account/members", post(auth::add_member))
         .route("/account/members/remove", post(auth::remove_member))
         .route("/account/members/role", post(auth::set_member_role))
@@ -647,6 +655,10 @@ async fn main() -> anyhow::Result<()> {
             "/login",
             get(|| async { Html(include_str!("../static/login.html")) }),
         )
+        .route(
+            "/invite",
+            get(|| async { Html(include_str!("../static/invite.html")) }),
+        )
         // Auth-page scripts live in files (not inline) so the CSP can stay
         // `script-src 'self'` with no nonces.
         .route(
@@ -664,6 +676,15 @@ async fn main() -> anyhow::Result<()> {
                 (
                     [(axum::http::header::CONTENT_TYPE, "application/javascript")],
                     include_str!("../static/signup.js"),
+                )
+            }),
+        )
+        .route(
+            "/invite.js",
+            get(|| async {
+                (
+                    [(axum::http::header::CONTENT_TYPE, "application/javascript")],
+                    include_str!("../static/invite.js"),
                 )
             }),
         )
@@ -893,6 +914,9 @@ fn spawn_background_sweeps(app: App) {
             let hourly = ticks % 60 == 1;
             if let Err(e) = app.control.prune_sessions().await {
                 tracing::warn!("prune_sessions sweep: {e}");
+            }
+            if let Err(e) = app.control.prune_org_invitations().await {
+                tracing::warn!("prune_org_invitations sweep: {e}");
             }
             // Fan the requeue across every active tenant DB (per-tenant queues).
             match app.control.all_tenants().await {
@@ -1808,28 +1832,7 @@ async fn get_job(
 }
 
 async fn account_tenant(app: &App, headers: &HeaderMap) -> Result<Tenant, Response> {
-    let user = auth::current_user(app, headers).await.ok_or_else(|| {
-        (
-            StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({ "error": "not signed in" })),
-        )
-            .into_response()
-    })?;
-    let org = app
-        .control
-        .primary_org(user.id)
-        .await
-        .map_err(|e| {
-            tracing::error!("primary_org lookup failed: {e}");
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(server_error())).into_response()
-        })?
-        .ok_or_else(|| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": "no org for account" })),
-            )
-                .into_response()
-        })?;
+    let (_user, org) = auth::user_and_org(app, headers).await?;
     app.tenancy.resolve(org.id).await.map_err(|e| match e {
         ResolveError::NotProvisioned | ResolveError::NotActive(_) => {
             (StatusCode::NOT_FOUND, Json(not_found())).into_response()

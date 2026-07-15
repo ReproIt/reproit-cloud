@@ -13,7 +13,7 @@
 //! lives in the per-tenant database behind `tenants.db_conn`. See
 //! `crate::db::tenant::TenantStore`.
 
-use super::{Member, Org, TenantRecord, TenantStatus, User};
+use super::{Member, Org, OrgInvitation, OrgSummary, TenantRecord, TenantStatus, User};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 
@@ -34,9 +34,11 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE TABLE IF NOT EXISTS sessions (
   token      TEXT PRIMARY KEY,
   user_id    BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  active_org_id BIGINT,
   expires_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE sessions ADD COLUMN IF NOT EXISTS active_org_id BIGINT;
 CREATE INDEX IF NOT EXISTS sessions_user ON sessions(user_id);
 CREATE TABLE IF NOT EXISTS orgs (
   id              BIGSERIAL PRIMARY KEY,
@@ -55,6 +57,21 @@ CREATE TABLE IF NOT EXISTS org_members (
 );
 CREATE INDEX IF NOT EXISTS org_members_user ON org_members(user_id);
 CREATE INDEX IF NOT EXISTS org_members_seated ON org_members(org_id) WHERE seat;
+CREATE TABLE IF NOT EXISTS org_invitations (
+  id          BIGSERIAL PRIMARY KEY,
+  token_hash  TEXT UNIQUE NOT NULL,
+  org_id      BIGINT NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
+  email       TEXT NOT NULL,
+  role        TEXT NOT NULL DEFAULT 'member',
+  seat        BOOLEAN NOT NULL DEFAULT true,
+  invited_by  BIGINT REFERENCES users(id) ON DELETE SET NULL,
+  expires_at  TIMESTAMPTZ NOT NULL,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (org_id, email)
+);
+CREATE INDEX IF NOT EXISTS org_invitations_org ON org_invitations(org_id, id);
+CREATE INDEX IF NOT EXISTS org_invitations_expiry ON org_invitations(expires_at);
 -- API keys are the CLI/SDK ROUTING KEY: the presented key names its org, which the
 -- resolver maps to a tenant database. So the key MUST live in the control plane
 -- (it cannot live inside the tenant it routes to). `key` is the SHA-256 hash of
@@ -398,12 +415,19 @@ impl ControlStore {
         ttl_secs: i64,
     ) -> anyhow::Result<()> {
         let expires = chrono::Utc::now() + chrono::Duration::seconds(ttl_secs);
-        sqlx::query("INSERT INTO sessions (token, user_id, expires_at) VALUES ($1,$2,$3)")
-            .bind(super::key_hash(token))
-            .bind(user_id)
-            .bind(expires)
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            "INSERT INTO sessions (token, user_id, active_org_id, expires_at)
+             VALUES ($1,$2,(
+               SELECT o.id FROM org_members m JOIN orgs o ON o.id = m.org_id
+               WHERE m.user_id = $2
+               ORDER BY o.personal DESC, o.id ASC LIMIT 1
+             ),$3)",
+        )
+        .bind(super::key_hash(token))
+        .bind(user_id)
+        .bind(expires)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -420,6 +444,61 @@ impl ControlStore {
             id: r.get::<i64, _>("id"),
             email: r.get::<String, _>("email"),
         }))
+    }
+
+    pub async fn user_and_org_for_session(
+        &self,
+        token: &str,
+    ) -> anyhow::Result<Option<(User, Org)>> {
+        let row = sqlx::query(
+            "WITH live AS (
+               SELECT user_id, active_org_id FROM sessions
+               WHERE token = $1 AND (expires_at IS NULL OR expires_at > now())
+             )
+             SELECT u.id AS user_id, u.email, o.id, o.name, m.role
+             FROM live s
+             JOIN users u ON u.id = s.user_id
+             JOIN org_members m ON m.user_id = s.user_id
+             JOIN orgs o ON o.id = m.org_id
+             ORDER BY (o.id = s.active_org_id) DESC, o.personal DESC, o.id ASC
+             LIMIT 1",
+        )
+        .bind(super::key_hash(token))
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| {
+            (
+                User {
+                    id: r.get("user_id"),
+                    email: r.get("email"),
+                },
+                Org {
+                    id: r.get("id"),
+                    name: r.get("name"),
+                    role: r.get("role"),
+                },
+            )
+        }))
+    }
+
+    pub async fn set_session_org(
+        &self,
+        token: &str,
+        user_id: i64,
+        org_id: i64,
+    ) -> anyhow::Result<bool> {
+        let r = sqlx::query(
+            "UPDATE sessions s SET active_org_id = $3
+             WHERE s.token = $1 AND s.user_id = $2
+               AND (s.expires_at IS NULL OR s.expires_at > now())
+               AND EXISTS (SELECT 1 FROM org_members m WHERE m.org_id = $3 AND m.user_id = $2)",
+        )
+        .bind(super::key_hash(token))
+        .bind(user_id)
+        .bind(org_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected() == 1)
     }
 
     /// Append a security-audit row. Fire-and-forget by design: auditing must
@@ -510,17 +589,34 @@ impl ControlStore {
         Ok(())
     }
 
-    pub async fn primary_org(&self, user_id: i64) -> anyhow::Result<Option<Org>> {
-        let row = sqlx::query(
-            "SELECT o.id, o.name, m.role
+    pub async fn list_user_orgs(&self, user_id: i64) -> anyhow::Result<Vec<OrgSummary>> {
+        let rows = sqlx::query(
+            "SELECT o.id, o.name, o.plan, o.personal, m.role
              FROM org_members m JOIN orgs o ON o.id = m.org_id
-             WHERE m.user_id = $1
-             ORDER BY o.personal DESC, o.id ASC LIMIT 1",
+             WHERE m.user_id = $1 ORDER BY o.personal DESC, lower(o.name), o.id",
         )
         .bind(user_id)
-        .fetch_optional(&self.pool)
+        .fetch_all(&self.pool)
         .await?;
-        Ok(row.map(row_to_org))
+        Ok(rows
+            .into_iter()
+            .map(|r| OrgSummary {
+                id: r.get("id"),
+                name: r.get("name"),
+                plan: r.get("plan"),
+                role: r.get("role"),
+                personal: r.get("personal"),
+            })
+            .collect())
+    }
+
+    pub async fn rename_org(&self, org_id: i64, name: &str) -> anyhow::Result<bool> {
+        let r = sqlx::query("UPDATE orgs SET name = $2 WHERE id = $1")
+            .bind(org_id)
+            .bind(name)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected() == 1)
     }
 
     pub async fn org_role(&self, org_id: i64, user_id: i64) -> anyhow::Result<Option<String>> {
@@ -592,6 +688,160 @@ impl ControlStore {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn upsert_org_invitation(
+        &self,
+        org_id: i64,
+        email: &str,
+        role: &str,
+        seat: bool,
+        invited_by: i64,
+        raw_token: &str,
+        ttl_secs: i64,
+        seat_limit: Option<i64>,
+    ) -> anyhow::Result<Option<i64>> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT id FROM orgs WHERE id = $1 FOR UPDATE")
+            .bind(org_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        if seat {
+            if let Some(limit) = seat_limit {
+                let used: i64 = sqlx::query_scalar(
+                    "SELECT
+                       (SELECT count(*) FROM org_members WHERE org_id = $1 AND (seat OR role = 'owner'))
+                       +
+                       (SELECT count(*) FROM org_invitations
+                        WHERE org_id = $1 AND seat AND expires_at > now() AND email <> $2)",
+                ).bind(org_id).bind(email).fetch_one(&mut *tx).await?;
+                if used >= limit {
+                    tx.rollback().await?;
+                    return Ok(None);
+                }
+            }
+        }
+        let expires = chrono::Utc::now() + chrono::Duration::seconds(ttl_secs);
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO org_invitations
+               (token_hash, org_id, email, role, seat, invited_by, expires_at)
+             VALUES ($1,$2,$3,$4,$5,$6,$7)
+             ON CONFLICT (org_id, email) DO UPDATE SET
+               token_hash=EXCLUDED.token_hash, role=EXCLUDED.role, seat=EXCLUDED.seat,
+               invited_by=EXCLUDED.invited_by, expires_at=EXCLUDED.expires_at, updated_at=now()
+             RETURNING id",
+        )
+        .bind(super::key_hash(raw_token))
+        .bind(org_id)
+        .bind(email)
+        .bind(role)
+        .bind(seat)
+        .bind(invited_by)
+        .bind(expires)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(Some(id))
+    }
+
+    pub async fn list_org_invitations(&self, org_id: i64) -> anyhow::Result<Vec<OrgInvitation>> {
+        let rows = sqlx::query(
+            "SELECT i.id, o.name AS org_name, i.email, i.role, i.seat, i.expires_at
+             FROM org_invitations i JOIN orgs o ON o.id=i.org_id
+             WHERE i.org_id=$1 AND i.expires_at>now() ORDER BY lower(i.email)",
+        )
+        .bind(org_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(row_to_invitation).collect())
+    }
+
+    pub async fn org_invitation_by_token(
+        &self,
+        raw_token: &str,
+    ) -> anyhow::Result<Option<OrgInvitation>> {
+        let row = sqlx::query(
+            "SELECT i.id, o.name AS org_name, i.email, i.role, i.seat, i.expires_at
+             FROM org_invitations i JOIN orgs o ON o.id=i.org_id
+             WHERE i.token_hash=$1 AND i.expires_at>now()",
+        )
+        .bind(super::key_hash(raw_token))
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(row_to_invitation))
+    }
+
+    pub async fn refresh_org_invitation(
+        &self,
+        org_id: i64,
+        invitation_id: i64,
+        raw_token: &str,
+        ttl_secs: i64,
+    ) -> anyhow::Result<Option<OrgInvitation>> {
+        let expires = chrono::Utc::now() + chrono::Duration::seconds(ttl_secs);
+        let row = sqlx::query(
+            "UPDATE org_invitations i SET token_hash=$3, expires_at=$4, updated_at=now()
+             FROM orgs o WHERE i.id=$2 AND i.org_id=$1 AND o.id=i.org_id
+             RETURNING i.id, o.name AS org_name, i.email, i.role, i.seat, i.expires_at",
+        )
+        .bind(org_id)
+        .bind(invitation_id)
+        .bind(super::key_hash(raw_token))
+        .bind(expires)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(row_to_invitation))
+    }
+
+    pub async fn revoke_org_invitation(
+        &self,
+        org_id: i64,
+        invitation_id: i64,
+    ) -> anyhow::Result<bool> {
+        let r = sqlx::query("DELETE FROM org_invitations WHERE org_id=$1 AND id=$2")
+            .bind(org_id)
+            .bind(invitation_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected() == 1)
+    }
+
+    pub async fn accept_org_invitation(
+        &self,
+        raw_token: &str,
+        user_id: i64,
+        verified_email: &str,
+    ) -> anyhow::Result<Option<i64>> {
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(
+            "DELETE FROM org_invitations
+             WHERE token_hash=$1 AND email=$2 AND expires_at>now()
+             RETURNING org_id, role, seat",
+        )
+        .bind(super::key_hash(raw_token))
+        .bind(verified_email)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        let org_id: i64 = row.get("org_id");
+        sqlx::query(
+            "INSERT INTO org_members (org_id,user_id,role,seat) VALUES ($1,$2,$3,$4)
+             ON CONFLICT (org_id,user_id) DO UPDATE SET role=EXCLUDED.role, seat=org_members.seat OR EXCLUDED.seat",
+        ).bind(org_id).bind(user_id).bind(row.get::<String,_>("role")).bind(row.get::<bool,_>("seat"))
+            .execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(Some(org_id))
+    }
+
+    pub async fn prune_org_invitations(&self) -> anyhow::Result<u64> {
+        let r = sqlx::query("DELETE FROM org_invitations WHERE expires_at<now()")
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected())
     }
 
     pub async fn org_name(&self, org_id: i64) -> anyhow::Result<Option<String>> {
@@ -721,11 +971,16 @@ impl ControlStore {
     }
 }
 
-fn row_to_org(r: sqlx::postgres::PgRow) -> Org {
-    Org {
-        id: r.get::<i64, _>("id"),
-        name: r.get::<String, _>("name"),
-        role: r.get::<String, _>("role"),
+fn row_to_invitation(r: sqlx::postgres::PgRow) -> OrgInvitation {
+    OrgInvitation {
+        id: r.get("id"),
+        org_name: r.get("org_name"),
+        email: r.get("email"),
+        role: r.get("role"),
+        seat: r.get("seat"),
+        expires_at: r
+            .get::<chrono::DateTime<chrono::Utc>, _>("expires_at")
+            .to_rfc3339(),
     }
 }
 

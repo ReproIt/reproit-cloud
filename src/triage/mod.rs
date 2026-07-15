@@ -409,7 +409,10 @@ async fn seat_gate(
     let signed_in = user.is_some();
     let (user_id, org) = match &user {
         Some(u) => {
-            let org = app.control.primary_org(u.id).await.ok().flatten();
+            let org = crate::auth::user_and_org(app, headers)
+                .await
+                .ok()
+                .map(|(_, org)| org);
             (Some(u.id), org)
         }
         None => (None, None),

@@ -53,6 +53,27 @@ pub struct Member {
     pub seat: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct OrgSummary {
+    pub id: i64,
+    pub name: String,
+    pub plan: String,
+    pub role: String,
+    pub personal: bool,
+}
+
+/// Pending organization invitation. Only a digest of the raw invitation token
+/// is persisted; list APIs never expose it.
+#[derive(Debug, Clone)]
+pub struct OrgInvitation {
+    pub id: i64,
+    pub org_name: String,
+    pub email: String,
+    pub role: String,
+    pub seat: bool,
+    pub expires_at: String,
+}
+
 /// A persisted triage row for a bucket (tenant DB).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Triage {

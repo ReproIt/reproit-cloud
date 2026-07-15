@@ -7,7 +7,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Archivo+Expanded:wght@600;700;800&family=Archivo:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="styles.css?v=20260710-1">
+<link rel="stylesheet" href="styles.css?v=20260715-2">
 </head>
 <body>
 <a class="skiplink" href="#app-root">Skip to content</a>
@@ -28,8 +28,9 @@
     <a href="#" data-view="scans" role="link">Runs</a>
   </nav>
   <div class="org">
+    <select class="project-switch org-switch" id="org-switch" aria-label="Active organization"><option value="">Organization</option></select>
     <select class="project-switch" id="project-switch" aria-label="Active app">
-      <option value="bugzoo">bugzoo</option>
+      <option value="">No projects</option>
     </select>
     <button class="avatar" id="account-open" aria-label="Account settings">A</button>
   </div>
@@ -38,7 +39,7 @@
 <div id="banner-slot" role="status" aria-live="polite"></div>
 <main id="app-root"></main>
 
-<script src="app.js?v=20260715-1"></script>
+<script src="app.js?v=20260715-2"></script>
 <script src="triage.js?v=20260715-1"></script>
 </body>
 </html>

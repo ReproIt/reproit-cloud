@@ -23,6 +23,8 @@ use serde::Deserialize;
 use serde_json::json;
 use uuid::Uuid;
 
+#[cfg(test)]
+mod invitation_tests;
 mod keys;
 mod password;
 mod session;
@@ -47,7 +49,13 @@ use session::{cleared_cookie, with_cookie, COOKIE_NAME};
 pub struct Creds {
     pub email: String,
     pub password: String,
+    #[serde(default)]
+    pub invite: Option<String>,
+    #[serde(default, rename = "orgId")]
+    pub org_id: Option<i64>,
 }
+
+const INVITE_TTL_SECS: i64 = 7 * 24 * 60 * 60;
 
 // ---- helpers ---------------------------------------------------------------
 
@@ -69,12 +77,11 @@ pub(crate) async fn user_and_org(
     app: &App,
     headers: &HeaderMap,
 ) -> Result<(crate::db::User, crate::db::Org), Response> {
-    let user = current_user(app, headers)
-        .await
+    let token = cookie_value(headers, COOKIE_NAME)
         .ok_or_else(|| err(StatusCode::UNAUTHORIZED, "not signed in"))?;
-    let org = app
+    let (user, org) = app
         .control
-        .primary_org(user.id)
+        .user_and_org_for_session(token)
         .await
         .ok()
         .flatten()
@@ -108,8 +115,20 @@ pub async fn signup(State(app): State<App>, Json(c): Json<Creds>) -> Response {
     app.control
         .audit(&format!("user:{user_id}"), "auth.signup", None, json!({}))
         .await;
-    if let Some(r) = provision_personal_org(&app, user_id).await {
-        return r;
+    let joins_existing_org = match c.invite.as_deref() {
+        Some(invite) => app
+            .control
+            .org_invitation_by_token(invite)
+            .await
+            .ok()
+            .flatten()
+            .is_some_and(|i| i.email == email),
+        None => false,
+    };
+    if !joins_existing_org {
+        if let Some(r) = provision_personal_org(&app, user_id).await {
+            return r;
+        }
     }
     let token = new_session_token();
     if app
@@ -119,6 +138,9 @@ pub async fn signup(State(app): State<App>, Json(c): Json<Creds>) -> Response {
         .is_err()
     {
         return err(StatusCode::INTERNAL_SERVER_ERROR, "could not start session");
+    }
+    if let Some(org_id) = c.org_id {
+        let _ = app.control.set_session_org(&token, user_id, org_id).await;
     }
     with_cookie(
         session_cookie(&token),
@@ -184,6 +206,9 @@ pub async fn login(State(app): State<App>, Json(c): Json<Creds>) -> Response {
     {
         return err(StatusCode::INTERNAL_SERVER_ERROR, "could not start session");
     }
+    if let Some(org_id) = c.org_id {
+        let _ = app.control.set_session_org(&token, user_id, org_id).await;
+    }
     with_cookie(
         session_cookie(&token),
         StatusCode::OK,
@@ -216,8 +241,25 @@ pub async fn me(State(app): State<App>, headers: HeaderMap) -> Response {
     };
     let keys = app.control.list_api_keys(org.id).await.unwrap_or_default();
     let members = app.control.list_org_users(org.id).await.unwrap_or_default();
+    let organizations = app
+        .control
+        .list_user_orgs(user.id)
+        .await
+        .unwrap_or_default();
+    let invitations = if can_manage(&org.role) {
+        app.control
+            .list_org_invitations(org.id)
+            .await
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     Json(json!({
         "email": user.email,
+        "organizations": organizations.iter().map(|o| json!({
+            "id":o.id,"name":o.name,"plan":o.plan,"role":o.role,
+            "personal":o.personal,"active":o.id==org.id
+        })).collect::<Vec<_>>(),
         "org": {
             "id": org.id,
             "name": org.name,
@@ -230,6 +272,9 @@ pub async fn me(State(app): State<App>, headers: HeaderMap) -> Response {
         "apiKeys": keys,
         "members": members.iter().map(|m| json!({
             "userId": m.user_id, "email": m.email, "role": m.role, "seat": m.seat
+        })).collect::<Vec<_>>(),
+        "invitations": invitations.iter().map(|i| json!({
+            "id":i.id,"email":i.email,"role":i.role,"seat":i.seat,"expiresAt":i.expires_at
         })).collect::<Vec<_>>(),
     }))
     .into_response()
@@ -378,6 +423,351 @@ pub async fn create_project(
         })),
     )
         .into_response()
+}
+
+#[derive(Deserialize)]
+pub struct ActiveOrgReq {
+    #[serde(rename = "orgId")]
+    pub org_id: i64,
+}
+
+pub async fn set_active_org(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(req): Json<ActiveOrgReq>,
+) -> Response {
+    let user = match current_user(&app, &headers).await {
+        Some(u) => u,
+        None => return err(StatusCode::UNAUTHORIZED, "not signed in"),
+    };
+    let Some(token) = cookie_value(&headers, COOKIE_NAME) else {
+        return err(StatusCode::UNAUTHORIZED, "not signed in");
+    };
+    match app
+        .control
+        .set_session_org(token, user.id, req.org_id)
+        .await
+    {
+        Ok(true) => Json(json!({"ok":true,"orgId":req.org_id})).into_response(),
+        Ok(false) => err(StatusCode::NOT_FOUND, "organization not found"),
+        Err(_) => err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not switch organization",
+        ),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct OrgNameReq {
+    pub name: String,
+}
+
+pub async fn rename_org(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(req): Json<OrgNameReq>,
+) -> Response {
+    let (user, org) = match user_and_org(&app, &headers).await {
+        Ok(x) => x,
+        Err(r) => return r,
+    };
+    if !can_manage(&org.role) {
+        return err(
+            StatusCode::FORBIDDEN,
+            "only owners/admins can rename the organization",
+        );
+    }
+    let name = req.name.trim();
+    if name.is_empty() || name.len() > 80 {
+        return err(StatusCode::BAD_REQUEST, "organization name required");
+    }
+    if app.control.rename_org(org.id, name).await.ok() != Some(true) {
+        return err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not rename organization",
+        );
+    }
+    app.control
+        .audit(
+            &format!("user:{}", user.id),
+            "org.rename",
+            Some(org.id),
+            json!({"name":name}),
+        )
+        .await;
+    Json(json!({"ok":true,"name":name})).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct InviteReq {
+    pub email: String,
+    pub role: Option<String>,
+}
+#[derive(Deserialize)]
+pub struct InvitationIdReq {
+    #[serde(rename = "invitationId")]
+    pub invitation_id: i64,
+}
+#[derive(Deserialize)]
+pub struct InviteTokenReq {
+    pub token: String,
+}
+
+fn invite_role(role: Option<&str>) -> &'static str {
+    if role == Some("admin") {
+        "admin"
+    } else {
+        "member"
+    }
+}
+async fn deliver_invitation(i: &crate::db::OrgInvitation, token: &str) -> anyhow::Result<()> {
+    let link = format!("{}/invite?token={token}", crate::mail::public_base());
+    let (subject, body) = crate::mail::invitation_email(&i.org_name, &link);
+    crate::mail::send(&i.email, &subject, &body).await
+}
+
+pub async fn invite_member(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(req): Json<InviteReq>,
+) -> Response {
+    let (user, org) = match user_and_org(&app, &headers).await {
+        Ok(x) => x,
+        Err(r) => return r,
+    };
+    if !can_manage(&org.role) {
+        return err(
+            StatusCode::FORBIDDEN,
+            "only owners/admins can invite members",
+        );
+    }
+    let email = req.email.trim().to_lowercase();
+    if !email.contains('@') || email.len() > 254 {
+        return err(StatusCode::BAD_REQUEST, "enter a valid email");
+    }
+    if let Ok(Some(uid)) = app.control.find_user_id_by_email(&email).await {
+        if app
+            .control
+            .org_role(org.id, uid)
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            return err(StatusCode::CONFLICT, "that person is already a member");
+        }
+    }
+    let token = new_session_token();
+    let role = invite_role(req.role.as_deref());
+    let id = match app
+        .control
+        .upsert_org_invitation(
+            org.id,
+            &email,
+            role,
+            true,
+            user.id,
+            &token,
+            INVITE_TTL_SECS,
+            None,
+        )
+        .await
+    {
+        Ok(Some(id)) => id,
+        _ => {
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not create invitation",
+            )
+        }
+    };
+    let invitation = match app
+        .control
+        .org_invitation_by_token(&token)
+        .await
+        .ok()
+        .flatten()
+    {
+        Some(i) => i,
+        None => {
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not create invitation",
+            )
+        }
+    };
+    if deliver_invitation(&invitation, &token).await.is_err() {
+        return err(
+            StatusCode::BAD_GATEWAY,
+            "invitation saved, but the email could not be sent",
+        );
+    }
+    app.control
+        .audit(
+            &format!("user:{}", user.id),
+            "member.invite",
+            Some(org.id),
+            json!({"invitationId":id,"email":email,"role":role}),
+        )
+        .await;
+    (StatusCode::CREATED,Json(json!({"id":id,"email":invitation.email,"role":invitation.role,"seat":invitation.seat,"expiresAt":invitation.expires_at}))).into_response()
+}
+
+pub async fn resend_invitation(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(req): Json<InvitationIdReq>,
+) -> Response {
+    let (user, org) = match user_and_org(&app, &headers).await {
+        Ok(x) => x,
+        Err(r) => return r,
+    };
+    if !can_manage(&org.role) {
+        return err(
+            StatusCode::FORBIDDEN,
+            "only owners/admins can resend invitations",
+        );
+    }
+    let token = new_session_token();
+    let i = match app
+        .control
+        .refresh_org_invitation(org.id, req.invitation_id, &token, INVITE_TTL_SECS)
+        .await
+    {
+        Ok(Some(i)) => i,
+        Ok(None) => return err(StatusCode::NOT_FOUND, "invitation not found"),
+        Err(_) => {
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not refresh invitation",
+            )
+        }
+    };
+    if deliver_invitation(&i, &token).await.is_err() {
+        return err(
+            StatusCode::BAD_GATEWAY,
+            "invitation refreshed, but the email could not be sent",
+        );
+    }
+    app.control
+        .audit(
+            &format!("user:{}", user.id),
+            "member.invite_resend",
+            Some(org.id),
+            json!({"invitationId":i.id}),
+        )
+        .await;
+    Json(json!({"ok":true,"expiresAt":i.expires_at})).into_response()
+}
+
+pub async fn revoke_invitation(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(req): Json<InvitationIdReq>,
+) -> Response {
+    let (user, org) = match user_and_org(&app, &headers).await {
+        Ok(x) => x,
+        Err(r) => return r,
+    };
+    if !can_manage(&org.role) {
+        return err(
+            StatusCode::FORBIDDEN,
+            "only owners/admins can revoke invitations",
+        );
+    }
+    match app
+        .control
+        .revoke_org_invitation(org.id, req.invitation_id)
+        .await
+    {
+        Ok(true) => {
+            app.control
+                .audit(
+                    &format!("user:{}", user.id),
+                    "member.invite_revoke",
+                    Some(org.id),
+                    json!({"invitationId":req.invitation_id}),
+                )
+                .await;
+            Json(json!({"ok":true})).into_response()
+        }
+        Ok(false) => err(StatusCode::NOT_FOUND, "invitation not found"),
+        Err(_) => err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not revoke invitation",
+        ),
+    }
+}
+
+pub async fn invitation_preview(
+    State(app): State<App>,
+    axum::extract::Query(req): axum::extract::Query<InviteTokenReq>,
+) -> Response {
+    match app.control.org_invitation_by_token(&req.token).await{
+        Ok(Some(i))=>Json(json!({"organization":i.org_name,"email":i.email,"role":i.role,"expiresAt":i.expires_at})).into_response(),
+        _=>err(StatusCode::NOT_FOUND,"invitation is invalid or expired")}
+}
+
+pub async fn accept_invitation(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(req): Json<InviteTokenReq>,
+) -> Response {
+    let user = match current_user(&app, &headers).await {
+        Some(u) => u,
+        None => {
+            return err(
+                StatusCode::UNAUTHORIZED,
+                "sign in to accept this invitation",
+            )
+        }
+    };
+    let Some(session) = cookie_value(&headers, COOKIE_NAME) else {
+        return err(
+            StatusCode::UNAUTHORIZED,
+            "sign in to accept this invitation",
+        );
+    };
+    let org_id = match app
+        .control
+        .accept_org_invitation(&req.token, user.id, &user.email)
+        .await
+    {
+        Ok(Some(id)) => id,
+        Ok(None) => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                "invitation is invalid, expired, or belongs to another email",
+            )
+        }
+        Err(_) => {
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not accept invitation",
+            )
+        }
+    };
+    if app
+        .control
+        .set_session_org(session, user.id, org_id)
+        .await
+        .ok()
+        != Some(true)
+    {
+        return err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not open organization",
+        );
+    }
+    app.control
+        .audit(
+            &format!("user:{}", user.id),
+            "member.invite_accept",
+            Some(org_id),
+            json!({}),
+        )
+        .await;
+    Json(json!({"ok":true,"orgId":org_id})).into_response()
 }
 
 #[derive(Deserialize)]

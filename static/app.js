@@ -167,6 +167,8 @@ async function loadAccount() {
   }
   S.account = r.data;
   S.accountStatus = "ready";
+  const activeOrgId = S.account.org && Number(S.account.org.id);
+  if (activeOrgId) { try { localStorage.setItem("reproit.activeOrg", String(activeOrgId)); } catch {} }
   const projects = S.account.projects || [];
   const ownsConfiguredApp = projects.some((p) => p.appId === CFG.app);
   if (projects.length) {
@@ -184,6 +186,7 @@ async function loadAccount() {
   const avatar = document.querySelector(".avatar");
   if (avatar && email) avatar.textContent = email.slice(0, 1).toUpperCase();
   paintProjectSwitch();
+  paintOrgSwitch();
 }
 function currentProject() {
   const projects = (S.account && S.account.projects) || [];
@@ -211,6 +214,14 @@ function paintProjectSwitch() {
     sel.innerHTML = `<option value="">No projects</option>`;
     sel.disabled = true;
   }
+}
+function paintOrgSwitch() {
+  const sel = document.getElementById("org-switch"); if (!sel) return;
+  const orgs = (S.account && S.account.organizations) || [];
+  const activeId = S.account && S.account.org && Number(S.account.org.id);
+  if (!orgs.length) { sel.innerHTML = `<option value="">Organization</option>`; sel.disabled = true; return; }
+  sel.innerHTML = orgs.map((org) => `<option value="${Number(org.id)}"${Number(org.id) === activeId ? " selected" : ""}>${esc(org.name)}</option>`).join("");
+  sel.disabled = S.orgBusy;
 }
 function redirectToLogin() {
   const next = location.pathname + location.search + location.hash;
@@ -295,6 +306,8 @@ const S = {
   roleSaving: false,
   roleDraft: {},
   teamSearch: "",
+  inviteEmail: "", inviteRole: "member", inviteBusy: "",
+  orgBusy: false, orgNameDraft: null,
   newProject: "",
   justCreatedKey: null,      // {appId, apiKey}: surfaced once, right after creation
   integration: null,         // GET /v1/apps/:app/integrations result
@@ -1320,6 +1333,7 @@ function renderTrackerSettings(project) {
 
 function renderTeamSettings(account, org) {
   const members = account.members || [];
+  const invitations = account.invitations || [];
   const q = S.teamSearch.trim().toLowerCase();
   const roleValue = (m) => S.roleDraft[m.userId] || m.role || "none";
   const changed = members.some((m) => roleValue(m) !== (m.role || "none"));
@@ -1342,9 +1356,11 @@ function renderTeamSettings(account, org) {
       <td class="m-role">${roleSelect(m)}</td>
     </tr>`;
   }).join("");
+  const pendingRows = invitations.map((invite) => `<tr><td class="m-email">${esc(invite.email)} <span class="tag">pending</span></td><td class="m-role invite-actions"><span class="muted">${esc(invite.role)}</span><button class="linkbtn" type="button" data-invite-resend="${Number(invite.id)}" ${S.inviteBusy ? "disabled" : ""}>Resend</button><button class="linkbtn danger-link" type="button" data-invite-revoke="${Number(invite.id)}" ${S.inviteBusy ? "disabled" : ""}>Revoke</button></td></tr>`).join("");
   return `<div class="card team-card">
     <div class="hd">Team access</div>
     <div class="bd">
+      ${canManageOrg() ? `<form id="invite-form" class="invite-form"><label class="fld-lbl" for="invite-email">Invite member</label><div class="invite-row"><input id="invite-email" type="email" value="${esc(S.inviteEmail)}" placeholder="teammate@company.com" autocomplete="email" required /><div class="selwrap"><select id="invite-role"><option value="member"${S.inviteRole === "member" ? " selected" : ""}>member</option><option value="admin"${S.inviteRole === "admin" ? " selected" : ""}>admin</option></select></div><button class="primary-sm" type="submit" ${S.inviteBusy ? "disabled" : ""}>${S.inviteBusy === "send" ? "Sending..." : "Send invite"}</button></div><div class="muted">The invitation expires in 7 days.</div></form>` : ""}
       <div class="team-tools">
         <input id="team-search" value="${esc(S.teamSearch)}" placeholder="Search users" autocomplete="off" />
         <button class="primary-sm" id="team-save" type="button" ${!changed || S.roleSaving ? "disabled" : ""}>${S.roleSaving ? "Saving..." : "Save changes"}</button>
@@ -1355,10 +1371,15 @@ function renderTeamSettings(account, org) {
           <col class="role-col">
         </colgroup>
         <thead><tr><th>User</th><th>Role</th></tr></thead>
-        <tbody>${rows || `<tr><td colspan="2" class="muted">${members.length ? "No users match your search." : "No users loaded."}</td></tr>`}</tbody>
+        <tbody>${rows || `<tr><td colspan="2" class="muted">${members.length ? "No users match your search." : "No users loaded."}</td></tr>`}${q ? "" : pendingRows}</tbody>
       </table>
     </div>
   </div>`;
+}
+
+function renderOrganizationSettings(account, org) {
+  const name = S.orgNameDraft == null ? (org.name || "") : S.orgNameDraft;
+  return `<div class="card org-card"><div class="hd">Organization</div><div class="bd">${canManageOrg() ? `<form id="org-name-form" class="inline-form"><label class="fld-lbl" for="org-name">Organization name</label><div class="inline-row"><input id="org-name" value="${esc(name)}" maxlength="80" required /><button class="primary-sm" type="submit" ${S.orgBusy ? "disabled" : ""}>Save</button></div></form>` : `<div class="muted">${esc(org.name || "Organization")}</div>`}</div></div>`;
 }
 
 function renderAccountView() {
@@ -1390,7 +1411,7 @@ function renderAccountView() {
   return `<div class="single"><section class="seatcard">
     <div class="account-hero">
       <div class="account-ident">
-        <div class="crumb">Account</div>
+        <div class="crumb">${esc(org.name || "Organization")} · Account</div>
         <h1 class="h1">${esc(a.email || "Account")}</h1>
         <div class="src">${esc(org.role || "member")} · self-hosted · ${projects.length} project${projects.length === 1 ? "" : "s"}</div>
       </div>
@@ -1401,6 +1422,7 @@ function renderAccountView() {
 
     <div class="grid">
       <div>
+        ${renderOrganizationSettings(a, org)}
         <div class="card">
           <div class="hd">Project</div>
           <div class="bd">
@@ -1477,6 +1499,11 @@ async function saveTeamAccess() {
   await loadAccount();
   render();
 }
+
+async function switchOrganization(orgId){if(!orgId||S.orgBusy)return;S.orgBusy=true;paintOrgSwitch();const r=await accountReq("/account/orgs/active","POST",{orgId:Number(orgId)});if(!r.ok){S.orgBusy=false;setBanner((r.data&&r.data.error)||"Could not switch organization","warn");paintOrgSwitch();return}try{localStorage.setItem("reproit.activeOrg",String(orgId))}catch{}CFG={...CFG,app:"",key:""};saveConfig(CFG);S.orgBusy=false;S.orgNameDraft=null;S.roleDraft={};S.teamSearch="";resetAppData();if(window.ReproitTriage&&window.ReproitTriage.resetForApp)window.ReproitTriage.resetForApp();await loadAccount();syncProjectUrl(true);setBanner("");if(S.view==="scans")loadScans();else render()}
+async function sendInvitation(){const email=S.inviteEmail.trim();if(!email||S.inviteBusy)return;S.inviteBusy="send";render();const r=await accountReq("/account/invitations","POST",{email,role:S.inviteRole});S.inviteBusy="";if(!r.ok){setBanner((r.data&&r.data.error)||"Could not send invitation","warn");render();return}S.inviteEmail="";setBanner(`Invitation sent to ${email}.`);await loadAccount();render()}
+async function invitationAction(action,id){if(S.inviteBusy)return;S.inviteBusy=action;render();const r=await accountReq(`/account/invitations/${action}`,"POST",{invitationId:Number(id)});S.inviteBusy="";if(!r.ok){setBanner((r.data&&r.data.error)||`Could not ${action} invitation`,"warn");render();return}setBanner(action==="resend"?"Invitation sent again.":"Invitation revoked.");await loadAccount();render()}
+async function saveOrganizationName(){const name=(S.orgNameDraft==null?(S.account&&S.account.org&&S.account.org.name):S.orgNameDraft||"").trim();if(!name||S.orgBusy)return;S.orgBusy=true;render();const r=await accountReq("/account/orgs/name","POST",{name});S.orgBusy=false;if(!r.ok){setBanner((r.data&&r.data.error)||"Could not rename organization","warn");render();return}S.orgNameDraft=null;setBanner("");await loadAccount();render()}
 
 async function createProject(name) {
   const clean = String(name || "").trim();
@@ -1678,6 +1705,8 @@ document.addEventListener("click", (ev) => {
     saveTeamAccess();
     return;
   }
+  const resendInvite=t.closest("[data-invite-resend]");if(resendInvite){invitationAction("resend",resendInvite.dataset.inviteResend);return}
+  const revokeInvite=t.closest("[data-invite-revoke]");if(revokeInvite){invitationAction("revoke",revokeInvite.dataset.inviteRevoke);return}
 
   if (t.id === "sign-out") {
     signOut();
@@ -1745,6 +1774,8 @@ document.addEventListener("input", (ev) => {
   if (ev.target.id === "project-name") {
     S.newProject = ev.target.value;
   }
+  if(ev.target.id==="invite-email")S.inviteEmail=ev.target.value;
+  if(ev.target.id==="org-name")S.orgNameDraft=ev.target.value;
   if (ev.target.id === "dispatch-repo") {
     S.dispatchRepoDraft = ev.target.value;
   }
@@ -1770,6 +1801,8 @@ document.addEventListener("change", (ev) => {
   if (ev.target.id === "project-switch") {
     setActiveProject(ev.target.value);
   }
+  if(ev.target.id==="org-switch")switchOrganization(ev.target.value);
+  if(ev.target.id==="invite-role")S.inviteRole=ev.target.value;
 });
 document.addEventListener("submit", (ev) => {
   if (ev.target.id === "project-form") {
@@ -1780,6 +1813,8 @@ document.addEventListener("submit", (ev) => {
     ev.preventDefault();
     saveDispatch();
   }
+  if(ev.target.id==="invite-form"){ev.preventDefault();sendInvitation()}
+  if(ev.target.id==="org-name-form"){ev.preventDefault();saveOrganizationName()}
 });
 
 // ---- interaction: keyboard navigation ---------------------------------------

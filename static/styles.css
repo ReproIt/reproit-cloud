@@ -41,6 +41,7 @@ nav a:hover{color:var(--ink)}
 .project-switch{appearance:none;max-width:230px;background:var(--panel2);border:1px solid var(--line);border-radius:7px;color:var(--ink);font-family:var(--mono);font-size:11.5px;padding:5px 26px 5px 10px;background-image:linear-gradient(45deg,transparent 50%,var(--dim) 50%),linear-gradient(135deg,var(--dim) 50%,transparent 50%);background-position:calc(100% - 12px) 10px,calc(100% - 8px) 10px;background-size:4px 4px,4px 4px;background-repeat:no-repeat}
 .project-switch:hover{border-color:var(--line2)}
 .project-switch:disabled{color:var(--dim)}
+.org-switch{max-width:190px;font-weight:600;color:var(--ink)}
 .avatar{width:26px;height:26px;border:0;border-radius:50%;background:linear-gradient(135deg,#4ade80,#2f9e5c);color:#06140c;display:grid;place-items:center;font-family:var(--disp);font-weight:800;font-size:12px;padding:0}
 .avatar:hover{filter:brightness(1.06)}
 .cfgbtn{background:none;border:1px solid var(--line);color:var(--mut);border-radius:7px;padding:5px 10px;font-size:11px}
@@ -323,6 +324,13 @@ kbd{background:var(--panel2);border:1px solid var(--line);border-bottom-width:2p
 .team-tools{display:flex;align-items:center;gap:10px;margin-bottom:12px}
 .team-tools input{flex:1;min-width:0;background:var(--bg);border:1px solid var(--line);border-radius:8px;color:var(--ink);font-family:var(--mono);font-size:12px;padding:9px 11px}
 .team-tools input:focus{outline:none;border-color:var(--green);box-shadow:0 0 0 2px rgba(74,222,128,.14)}
+.invite-form{padding-bottom:16px;margin-bottom:14px;border-bottom:1px solid var(--line)}
+.invite-row{display:grid;grid-template-columns:minmax(0,1fr) 112px auto;gap:8px;align-items:center;margin-bottom:8px}
+.invite-row input{min-width:0;background:var(--bg);border:1px solid var(--line);border-radius:8px;color:var(--ink);font-family:var(--mono);font-size:12px;padding:9px 11px}
+.invite-row select{width:100%}
+.invite-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px;white-space:nowrap}
+.linkbtn{border:0;background:none;color:var(--green);font:500 11px var(--mono);padding:3px;cursor:pointer}
+.linkbtn:disabled{opacity:.5;cursor:default}.danger-link{color:var(--red)}
 .role-select-wrap{width:150px;margin:0}
 .role-select-wrap select{padding-left:12px;text-align:left;text-align-last:left}
 .role-cell{display:inline-flex;align-items:center;justify-content:center;gap:8px;flex-wrap:wrap;min-height:30px}
