@@ -1292,9 +1292,9 @@ function renderDispatchSettings(project) {
     inner = `<div class="muted">Bind the GitHub repo whose CI reproduces this app's bugs. Reproit fires a repository_dispatch there; your workflow runs the reproduction and posts the verdict back. The token is a fine-grained PAT with Contents read/write on that repo.</div>
       <form id="dispatch-form" class="inline-form" style="margin-top:14px">
         <label class="fld-lbl" for="dispatch-repo">Dispatch repo (owner/name)</label>
-        <input id="dispatch-repo" value="${esc(repoVal)}" placeholder="acme/web" autocomplete="off" />
+        <input class="field-input" id="dispatch-repo" value="${esc(repoVal)}" placeholder="acme/web" autocomplete="off" />
         <label class="fld-lbl" for="dispatch-token" style="margin-top:12px">Dispatch token</label>
-        <input id="dispatch-token" type="password" value="" placeholder="${tokenSet ? "•••••••• set. Leave blank to keep" : "ghp_… required to enable dispatch"}" autocomplete="off" />
+        <input class="field-input" id="dispatch-token" type="password" value="" placeholder="${tokenSet ? "•••••••• set. Leave blank to keep" : "ghp_… required to enable dispatch"}" autocomplete="off" />
         <div class="inline-row" style="margin-top:14px">
           <button class="primary-sm" type="submit"${S.dispatchBusy ? " disabled" : ""}>${S.dispatchBusy ? "Saving…" : "Save dispatch settings"}</button>
         </div>

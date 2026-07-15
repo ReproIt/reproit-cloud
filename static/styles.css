@@ -300,6 +300,9 @@ kbd{background:var(--panel2);border:1px solid var(--line);border-bottom-width:2p
 .workflow-row .term-replay{white-space:nowrap}
 .inline-form{display:block}
 .inline-row{display:flex;gap:9px;align-items:center}
+.field-input{display:block;width:100%;min-width:0;background:var(--bg);border:1px solid var(--line);border-radius:8px;color:var(--ink);font-family:var(--mono);font-size:12.5px;padding:10px 11px;transition:border-color .14s ease,box-shadow .14s ease}
+.field-input::placeholder{color:var(--dim)}
+.field-input:focus{outline:none;border-color:var(--green);box-shadow:0 0 0 2px rgba(74,222,128,.14)}
 .inline-row input{flex:1;min-width:0;background:var(--bg);border:1px solid var(--line);border-radius:8px;color:var(--ink);font-family:var(--mono);font-size:12.5px;padding:8px 10px}
 .inline-row input:focus{border-color:var(--line2)}
 .keybox{display:flex;align-items:center;gap:10px;margin-bottom:12px;background:#070809;border:1px solid var(--line);border-radius:8px;padding:10px 12px;color:var(--green);font-size:12px;word-break:break-all}
