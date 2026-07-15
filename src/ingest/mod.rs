@@ -656,11 +656,37 @@ fn aggregate_events(events: &[Value], batch_ctx: &Map<String, Value>) -> BatchAg
                     })
                     .unwrap_or_default();
                 let mut context = merge_context(batch_ctx, ev);
+                // The SDK emits the same framework-neutral structural identity
+                // the CLI writes beside a prelaunch finding. Preserve only a
+                // fully typed, bounded object. Never trust a caller-supplied
+                // `bugId`; the service recomputes it from these fields.
+                let finding_identity = ev
+                    .get("findingIdentity")
+                    .cloned()
+                    .and_then(|value| {
+                        serde_json::from_value::<buckets::FindingIdentity>(value).ok()
+                    })
+                    .filter(|identity| {
+                        [
+                            identity.oracle.as_str(),
+                            identity.invariant.as_str(),
+                            identity.kind.as_str(),
+                            identity.message.as_str(),
+                            identity.frame.as_str(),
+                            identity.trigger.as_str(),
+                            identity.boundary.as_deref().unwrap_or(""),
+                        ]
+                        .iter()
+                        .all(|field| field.len() <= MAX_STEP_FIELD_BYTES)
+                    });
                 // A context past the cap is dropped whole, leaving a marker: any
                 // slice of it could mislead fixture synthesis downstream.
                 if Value::Object(context.clone()).to_string().len() > MAX_CONTEXT_BYTES {
                     context = Map::new();
                     context.insert("reproitContextDropped".into(), Value::Bool(true));
+                }
+                if let Some(identity) = finding_identity {
+                    context.insert("findingIdentity".into(), json!(identity));
                 }
                 // The structured oracle category the finding carried (crash /
                 // security / blank-screen / ...), preserved for severity classifi-
@@ -1209,6 +1235,8 @@ pub(crate) async fn bucket_list_for_tenant(tenant: &Tenant, app_id: &str) -> any
 
         let item = json!({
             "bucketId": bid,
+            "bugId": buckets::bug_id(newest),
+            "findingIdentity": buckets::finding_identity(newest),
             "count": idxs.len(),
             "message": newest.message,
             "crashSig": newest.sig,
@@ -1262,6 +1290,8 @@ fn bucket_package(
     let visual_evidence = visual_evidence_refs(&evidence);
     json!({
         "bucketId": bucket,
+        "bugId": buckets::bug_id(newest),
+        "findingIdentity": buckets::finding_identity(newest),
         "summary": buckets::crash_summary(newest),
         "message": newest.message,
         "expectedError": newest.message,
@@ -2027,6 +2057,34 @@ mod tests {
         assert_eq!(agg.error_recs[0].context["oracle"], json!("crash"));
         // A bucket id is derivable for the accepted occurrence.
         assert!(!buckets::bucket_id(&agg.error_recs[0]).is_empty());
+    }
+
+    #[test]
+    fn ingest_preserves_bounded_structural_identity_and_recomputes_bug_id() {
+        let identity = json!({
+            "oracle": "crash",
+            "invariant": "no-exception",
+            "kind": "exception",
+            "message": "boom at #",
+            "frame": "",
+            "trigger": ""
+        });
+        let events = vec![json!({
+            "kind": "error",
+            "sig": "screen",
+            "message": "boom at 42",
+            "oracle": "crash",
+            "findingIdentity": identity,
+            "bugId": "bug_attacker_controlled"
+        })];
+        let agg = aggregate_events(&events, &Map::new());
+        let rec = &agg.error_recs[0];
+        assert_eq!(rec.context["findingIdentity"], identity);
+        assert_ne!(buckets::bug_id(rec), "bug_attacker_controlled");
+        assert_eq!(
+            buckets::bucket_id(rec).trim_start_matches("bkt_"),
+            buckets::bug_id(rec).trim_start_matches("bug_")
+        );
     }
 
     #[test]

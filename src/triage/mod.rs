@@ -167,6 +167,8 @@ pub fn bucket_detail(
     };
     json!({
         "bucketId": bucket_id,
+        "bugId": buckets::bug_id(newest),
+        "findingIdentity": buckets::finding_identity(newest),
         "appId": app_id,
         "count": count,
         "crashSummary": buckets::crash_summary(newest),

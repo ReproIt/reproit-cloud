@@ -14,13 +14,66 @@
 //! in the handlers.
 
 use super::{ErrorRec, ReplayResult};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+
+/// Framework-independent defect identity shared with the CLI causal capsule.
+/// It contains only structural cause coordinates, never a seed, action path,
+/// build, machine, occurrence, or raw user value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FindingIdentity {
+    pub oracle: String,
+    pub invariant: String,
+    pub kind: String,
+    #[serde(default)]
+    pub message: String,
+    pub frame: String,
+    pub trigger: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boundary: Option<String>,
+}
+
+pub fn structural_bug_id(identity: &FindingIdentity) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"reproit-structural-bug-v1\n");
+    for part in [
+        identity.oracle.as_str(),
+        identity.invariant.as_str(),
+        identity.kind.as_str(),
+        identity.message.as_str(),
+        identity.frame.as_str(),
+        identity.trigger.as_str(),
+        identity.boundary.as_deref().unwrap_or(""),
+    ] {
+        h.update(part.trim().as_bytes());
+        h.update(b"\n");
+    }
+    let hex = hex::encode(h.finalize());
+    format!("bug_{}", &hex[..12])
+}
+
+pub fn finding_identity(rec: &ErrorRec) -> Option<FindingIdentity> {
+    rec.context
+        .get("findingIdentity")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+}
 
 /// Stable bucket id for an error: a hash of its root-cause features, NOT its
 /// position. We hash the normalized message (volatile specifics removed), the
 /// crash-state signature, and the entry-state signature, so two occurrences of
 /// the same bug, reached by the same entry, collapse to one bucket.
 pub fn bucket_id(rec: &ErrorRec) -> String {
+    if let Some(identity) = finding_identity(rec) {
+        let bug = structural_bug_id(&identity);
+        return format!("bkt_{}", bug.trim_start_matches("bug_"));
+    }
+    legacy_bucket_id(rec)
+}
+
+fn legacy_bucket_id(rec: &ErrorRec) -> String {
     use sha2::{Digest, Sha256};
     let start_sig = rec.path.first().map(|s| s.sig.as_str()).unwrap_or("");
     let crash_sig = rec.sig.as_str();
@@ -33,6 +86,15 @@ pub fn bucket_id(rec: &ErrorRec) -> String {
     h.update(start_sig.as_bytes());
     let hex = hex::encode(h.finalize());
     format!("bkt_{}", &hex[..12])
+}
+
+/// The shared defect id for API/UI correlation. Older SDKs without a structured
+/// identity retain the exact historical bucket digest, just under the `bug_`
+/// namespace, so every production bucket still exposes one coherent identity.
+pub fn bug_id(rec: &ErrorRec) -> String {
+    finding_identity(rec)
+        .map(|identity| structural_bug_id(&identity))
+        .unwrap_or_else(|| legacy_bucket_id(rec).replacen("bkt_", "bug_", 1))
 }
 
 /// The normalized (digit/whitespace-collapsed) message for a bucket. PII-safe:
@@ -412,6 +474,42 @@ mod tests {
         // Different entry state -> different bucket.
         let d = rec("Cannot read property at line 42", "crashA", "settings", &[]);
         assert_ne!(bucket_id(&a), bucket_id(&d));
+    }
+
+    #[test]
+    fn structured_identity_joins_prelaunch_and_production_paths() {
+        let mut a = rec(
+            "raw prod message 9001",
+            "prod-state",
+            "entry-a",
+            &["tap:key:a"],
+        );
+        let identity = FindingIdentity {
+            oracle: "crash".into(),
+            invariant: "no-exception".into(),
+            kind: "exception".into(),
+            message: "cannot read property at line #".into(),
+            frame: String::new(),
+            trigger: String::new(),
+            boundary: None,
+        };
+        a.context.insert(
+            "findingIdentity".into(),
+            serde_json::to_value(&identity).unwrap(),
+        );
+        let mut b = rec(
+            "different runtime text",
+            "other-state",
+            "entry-b",
+            &["tap:key:b"],
+        );
+        b.context = a.context.clone();
+
+        let bug = structural_bug_id(&identity);
+        assert_eq!(bug_id(&a), bug);
+        assert_eq!(bug_id(&b), bug);
+        assert_eq!(bucket_id(&a), bucket_id(&b));
+        assert_eq!(bucket_id(&a), bug.replacen("bug_", "bkt_", 1));
     }
 
     #[test]
