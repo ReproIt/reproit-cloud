@@ -1179,7 +1179,7 @@ function maskKey(k) {
   return k.slice(0, 12) + "…" + k.slice(-4);
 }
 
-// The bundled demo shop, served same-origin by this cloud with the reproit web
+// The bundled sample shop, served same-origin by this cloud with the ReproIt web
 // SDK already inside it. Opening it with ?appId=&key= wires that SDK to THIS
 // project's ingest, so clicking Checkout in the demo reports a real crash here.
 // It's the fastest way for a new self-host user to see the monitoring loop close
@@ -1201,10 +1201,10 @@ function renderDemoLauncher(appId, key, context) {
   const url = demoUrl(appId, key);
   if (!url) return "";
   const caption = context === "bugs"
-    ? "Open the bundled demo shop, add an item, and hit <b>Checkout</b>. The demo ships with the SDK wired to this project, so the crash it hits reports right here."
-    : "See the loop close now: the bundled demo shop has the SDK wired to this project. Open it, hit <b>Checkout</b>, and watch the crash land in <b>Bugs</b>.";
+    ? "Open ReproIt’s sample shop, add an item, then check out. The sample crash will appear here."
+    : "Open ReproIt’s sample shop and check out to send a sample crash to <b>Bugs</b>.";
   return `<div class="muted" style="margin-top:14px">${caption}</div>
-    <button class="primary-sm" type="button" data-demo="${esc(url)}" style="margin-top:8px">Launch the demo shop &#8599;</button>`;
+    <button class="primary-sm" type="button" data-demo="${esc(url)}" style="margin-top:8px">Open sample shop &#8599;</button>`;
 }
 
 // First-run panel for the Bugs list before any bucket exists. It turns the dead
@@ -1217,15 +1217,14 @@ function renderGetStarted(project) {
   const key = appId ? pubKeyForApp(appId) : null;
   const launcher = renderDemoLauncher(appId, key, "bugs");
   const body = launcher
-    ? `<div class="sub">Your project is ready. See reproit catch a live crash before you wire the SDK into your own app.</div>
-       ${launcher}
+    ? `${launcher}
        <div class="muted demo-waiting" style="margin-top:16px">Waiting for your first bug<span class="demo-dots">…</span></div>`
     : `<div class="sub">This project has no key in this browser, so the demo can't be wired here. Create a project on the Account page (the key is shown once), or run <code>reproit cloud setup --app ${esc(appId || "your-app")}</code> from your repo.</div>
        <button class="ghostbtn" id="go-account" style="margin-top:12px">Open account</button>`;
   return `<aside class="list">${renderListHead(0, 0)}
     <div class="empty"><div style="max-width:560px">
       <div class="ico" aria-hidden="true">[ ]</div>
-      <div class="big">Watch reproit catch a bug</div>
+      <div class="big">Test your new project</div>
       ${body}
     </div></div></aside>`;
 }
