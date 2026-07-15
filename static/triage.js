@@ -338,6 +338,14 @@
       quiet ? paintListBodyOnly() : renderTriage();
       return;
     }
+    if (r.status === 429 && quiet) {
+      // Background refreshes must never replace a valid empty/list state with a
+      // transient throttle error. The poller backs off before trying again.
+      T.listStatus = "ready";
+      T.listErr = null;
+      setBugCountConn();
+      return 429;
+    }
     if (!r.ok) {
       T.listStatus = "error";
       T.listErr = (r.data && r.data.error) || ("HTTP " + r.status);
@@ -360,6 +368,9 @@
     }
     if (!quiet) renderTriage();
     else if (before !== after) paintListBodyOnly();
+    // First-bug polling only needs the bucket list. Avoid fan-out reads while
+    // the project is still empty.
+    if (quiet && !T.buckets.length) return 200;
     // Fetch triage state per bucket (cookie-auth) so the list shows the dev's
     // INTENT status alongside the prod-truth resolution. Done after the list
     // paints so the list isn't blocked on it.
@@ -367,6 +378,7 @@
     // The regressions / activity strip (recent prod-truth transitions).
     loadEvents({ quiet });
     if (T.selBucket) loadDetail(T.selBucket, false);
+    return 200;
   }
 
   // ---- regressions / activity strip: recent resolution transitions ----------
@@ -495,30 +507,51 @@
     renderTriage();
   }
 
-  // ---- first-bug poll: while the empty onboarding state is on screen (the demo
-  // is running in another tab), poll quietly for the first bucket so it appears
-  // live. loadBuckets({quiet}) + paintListBodyOnly means no skeleton flicker
-  // between polls. Self-heals: the tick stops itself once a bucket lands or the
-  // Bugs view is no longer mounted (the user navigated to Account/Scans).
+  // ---- first-bug poll: enabled briefly after the user opens the sample shop.
+  // It is intentionally event-driven rather than running forever on every empty
+  // project. A transient throttle keeps the current empty state and backs off.
   let _firstBugPollTimer = null;
+  let _firstBugPollUntil = 0;
+  let _firstBugPollBusy = false;
   function firstBugWaiting() {
     const c = cfg();
-    return T.listStatus === "ready" && !(T.buckets && T.buckets.length)
+    return Date.now() < _firstBugPollUntil && T.listStatus === "ready" && !(T.buckets && T.buckets.length)
       && !!c.app && !!(A.keyForApp && A.keyForApp(c.app));
   }
   function stopFirstBugPoll() {
-    if (_firstBugPollTimer) { clearInterval(_firstBugPollTimer); _firstBugPollTimer = null; }
+    if (_firstBugPollTimer) clearTimeout(_firstBugPollTimer);
+    _firstBugPollTimer = null;
+    _firstBugPollUntil = 0;
+    _firstBugPollBusy = false;
+  }
+  function scheduleFirstBugPoll(delay) {
+    if (_firstBugPollTimer || !firstBugWaiting()) return;
+    _firstBugPollTimer = setTimeout(() => {
+      _firstBugPollTimer = null;
+      firstBugTick();
+    }, delay);
   }
   async function firstBugTick() {
     if (!root().querySelector("#t-list-body") || !firstBugWaiting()) { stopFirstBugPoll(); return; }
-    await loadBuckets({ quiet: true });
+    if (_firstBugPollBusy) return;
+    _firstBugPollBusy = true;
+    const status = await loadBuckets({ quiet: true });
+    _firstBugPollBusy = false;
+    if (firstBugWaiting()) scheduleFirstBugPoll(status === 429 ? 15000 : 5000);
   }
   function syncFirstBugPoll() {
     if (firstBugWaiting() && root().querySelector("#t-list-body")) {
-      if (!_firstBugPollTimer) _firstBugPollTimer = setInterval(firstBugTick, 4000);
+      scheduleFirstBugPoll(1500);
     } else {
-      stopFirstBugPoll();
+      if (_firstBugPollTimer) clearTimeout(_firstBugPollTimer);
+      _firstBugPollTimer = null;
     }
+  }
+  function watchForFirstBug() {
+    _firstBugPollUntil = Date.now() + 2 * 60 * 1000;
+    if (_firstBugPollTimer) clearTimeout(_firstBugPollTimer);
+    _firstBugPollTimer = null;
+    syncFirstBugPoll();
   }
 
   // ---- triage view (list + detail) ------------------------------------------
@@ -689,8 +722,7 @@
         rows = launcher
           ? `<div class="empty"><div style="max-width:560px">
               <div class="ico" aria-hidden="true">[ ]</div>
-              <div class="big">Watch reproit catch a bug</div>
-              <div class="sub">Your project is ready. See reproit catch a live crash before you wire the SDK into your own app.</div>
+              <div class="big">Test your new project</div>
               ${launcher}
               <div class="muted demo-waiting" style="margin-top:16px">Waiting for your first bug<span class="demo-dots">…</span></div>
             </div></div>`
@@ -1114,5 +1146,5 @@
   }
 
   // expose to app.js
-  window.ReproitTriage = { render, resetForApp };
+  window.ReproitTriage = { render, resetForApp, watchForFirstBug };
 })();

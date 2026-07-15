@@ -1637,32 +1637,7 @@ function syncNav() {
 }
 
 // ---- top-level render -------------------------------------------------------
-// While the Bugs list is waiting for its first bucket (the onboarding demo is
-// open in another tab), poll quietly for one. A bare buckets read that re-renders
-// only when something arrives, so the "waiting" panel never flickers to a
-// skeleton between polls. Stops itself as soon as a bucket lands or the view
-// changes (reconciled from render() against current state).
-let _demoPollTimer = null;
-async function pollForFirstBug() {
-  if (!CFG.app) return;
-  try {
-    const b = await dashboardGet(`/v1/apps/${encodeURIComponent(CFG.app)}/dashboard/buckets`);
-    if (b && b.items && b.items.length) await loadFindings();
-  } catch {}
-}
-function syncDemoPoll() {
-  const waiting = S.view === "findings" && S.accountStatus === "ready"
-    && (!S.cohorts || !S.cohorts.length) && !!CFG.app;
-  if (waiting && !_demoPollTimer) {
-    _demoPollTimer = setInterval(pollForFirstBug, 4000);
-  } else if (!waiting && _demoPollTimer) {
-    clearInterval(_demoPollTimer);
-    _demoPollTimer = null;
-  }
-}
-
 function render() {
-  syncDemoPoll();
   if (S.view === "account") {
     root().innerHTML = renderAccountView();
     wireAccountScroll();
@@ -1764,6 +1739,7 @@ document.addEventListener("click", (ev) => {
     // "waiting for your first bug" poller is on screen when the crash arrives
     // from the demo tab.
     if (S.view !== "triage") setView("triage");
+    window.ReproitTriage?.watchForFirstBug?.();
     return;
   }
 
