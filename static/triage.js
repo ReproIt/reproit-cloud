@@ -967,7 +967,7 @@
 
       <div class="grid">
         <div>
-          <div class="card">
+          <div class="card workflow-card">
             <div class="hd">Workflow</div>
             <div class="bd">
               <div class="workflow-row">

@@ -297,6 +297,7 @@ kbd{background:var(--panel2);border:1px solid var(--line);border-bottom-width:2p
 .detail .acts{display:flex;gap:10px}
 .detail .term-replay[disabled]{opacity:.6;cursor:default}
 .workflow-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;align-items:center}
+.workflow-card{overflow:visible}
 .workflow-row .term-replay{white-space:nowrap}
 .inline-form{display:block}
 .inline-row{display:flex;gap:9px;align-items:center}
