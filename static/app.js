@@ -201,27 +201,40 @@ function projectOptions() {
     `<option value="${esc(p.appId)}"${p.appId === CFG.app ? " selected" : ""}>${esc(p.name)} · ${esc(p.appId)}</option>`
   ).join("");
 }
+function closeHeaderPickers(except) {
+  document.querySelectorAll(".header-picker.open").forEach((picker) => {
+    if (picker.id === `${except}-picker`) return;
+    picker.classList.remove("open");
+    picker.querySelector(".header-picker-button")?.setAttribute("aria-expanded", "false");
+  });
+}
+function paintHeaderPicker(kind, items, activeValue, fallback, disabled) {
+  const picker = document.getElementById(`${kind}-picker`), button = document.getElementById(`${kind}-picker-button`), value = document.getElementById(`${kind}-picker-value`), menu = document.getElementById(`${kind}-picker-menu`);
+  if (!picker || !button || !value || !menu) return;
+  const active = items.find((item) => String(item.value) === String(activeValue));
+  value.textContent = active ? active.label : fallback;
+  button.disabled = disabled || !items.length;
+  picker.classList.toggle("disabled", button.disabled);
+  menu.innerHTML = items.map((item) => { const selected = String(item.value) === String(activeValue); return `<button type="button" role="option" aria-selected="${selected}" data-picker-option="${kind}" data-picker-value="${esc(item.value)}"><span>${esc(item.label)}</span>${item.meta ? `<small>${esc(item.meta)}</small>` : ""}<i aria-hidden="true">${selected ? "✓" : ""}</i></button>`; }).join("");
+  if (button.disabled) closeHeaderPickers();
+}
+function toggleHeaderPicker(kind, forceOpen) {
+  const picker = document.getElementById(`${kind}-picker`), button = document.getElementById(`${kind}-picker-button`);
+  if (!picker || !button || button.disabled) return;
+  const willOpen = forceOpen == null ? !picker.classList.contains("open") : forceOpen;
+  closeHeaderPickers(willOpen ? kind : null);
+  picker.classList.toggle("open", willOpen);
+  button.setAttribute("aria-expanded", String(willOpen));
+  if (willOpen) (picker.querySelector('[role="option"][aria-selected="true"]') || picker.querySelector('[role="option"]'))?.focus();
+}
 function paintProjectSwitch() {
-  const sel = document.getElementById("project-switch");
-  if (!sel) return;
   const projects = (S.account && S.account.projects) || [];
-  if (projects.length) {
-    sel.innerHTML = projects.map((p) =>
-      `<option value="${esc(p.appId)}"${p.appId === CFG.app ? " selected" : ""}>${esc(p.name)}</option>`
-    ).join("");
-    sel.disabled = false;
-  } else {
-    sel.innerHTML = `<option value="">No projects</option>`;
-    sel.disabled = true;
-  }
+  paintHeaderPicker("project", projects.map((p) => ({ value: p.appId, label: p.name, meta: p.appId })), CFG.app, "No projects", false);
 }
 function paintOrgSwitch() {
-  const sel = document.getElementById("org-switch"); if (!sel) return;
   const orgs = (S.account && S.account.organizations) || [];
   const activeId = S.account && S.account.org && Number(S.account.org.id);
-  if (!orgs.length) { sel.innerHTML = `<option value="">Organization</option>`; sel.disabled = true; return; }
-  sel.innerHTML = orgs.map((org) => `<option value="${Number(org.id)}"${Number(org.id) === activeId ? " selected" : ""}>${esc(org.name)}</option>`).join("");
-  sel.disabled = S.orgBusy;
+  paintHeaderPicker("org", orgs.map((org) => ({ value: Number(org.id), label: org.name, meta: org.role })), activeId, "Organization", S.orgBusy);
 }
 function redirectToLogin() {
   const next = location.pathname + location.search + location.hash;
@@ -1692,6 +1705,17 @@ function render() {
 document.addEventListener("click", (ev) => {
   const t = ev.target;
 
+  const pickerToggle = t.closest("[data-picker-toggle]");
+  if (pickerToggle) { toggleHeaderPicker(pickerToggle.dataset.pickerToggle); return; }
+  const pickerOption = t.closest("[data-picker-option]");
+  if (pickerOption) {
+    const kind = pickerOption.dataset.pickerOption, value = pickerOption.dataset.pickerValue;
+    closeHeaderPickers();
+    if (kind === "org") switchOrganization(Number(value)); else setActiveProject(value);
+    return;
+  }
+  closeHeaderPickers();
+
   const item = t.closest(".item[data-sig]");
   if (item) { S.kbdIdx = Number(item.dataset.idx); selectSig(item.dataset.sig); return; }
 
@@ -1816,10 +1840,6 @@ document.addEventListener("change", (ev) => {
     setActiveProject(ev.target.value);
     render();
   }
-  if (ev.target.id === "project-switch") {
-    setActiveProject(ev.target.value);
-  }
-  if(ev.target.id==="org-switch")switchOrganization(ev.target.value);
   if(ev.target.id==="invite-role")S.inviteRole=ev.target.value;
 });
 document.addEventListener("submit", (ev) => {
@@ -1836,6 +1856,19 @@ document.addEventListener("submit", (ev) => {
 });
 
 // ---- interaction: keyboard navigation ---------------------------------------
+document.addEventListener("keydown", (ev) => {
+  const toggle = ev.target.closest?.("[data-picker-toggle]");
+  if (toggle && ["Enter", " ", "ArrowDown", "ArrowUp"].includes(ev.key)) { ev.preventDefault(); toggleHeaderPicker(toggle.dataset.pickerToggle, true); return; }
+  const option = ev.target.closest?.("[data-picker-option]");
+  if (!option) return;
+  const options = Array.from(option.closest("[role=listbox]").querySelectorAll("[data-picker-option]")), index = options.indexOf(option);
+  if (["ArrowDown", "ArrowUp", "Home", "End"].includes(ev.key)) {
+    ev.preventDefault();
+    const next = ev.key === "Home" ? 0 : ev.key === "End" ? options.length - 1 : ev.key === "ArrowDown" ? Math.min(options.length - 1, index + 1) : Math.max(0, index - 1);
+    options[next]?.focus();
+  } else if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); option.click(); }
+  else if (ev.key === "Escape") { ev.preventDefault(); const kind = option.dataset.pickerOption; closeHeaderPickers(); document.getElementById(`${kind}-picker-button`)?.focus(); }
+});
 document.addEventListener("keydown", (ev) => {
   if (S.view !== "findings") return;
   // don't hijack typing in the search box except for arrows/enter
