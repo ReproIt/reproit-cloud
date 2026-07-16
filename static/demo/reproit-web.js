@@ -965,7 +965,14 @@
 
       // 2. navigations (SPA + classic)
       this._wrapHistory();
-      addEventListener("popstate", function () { self._settle(function () { self._observe("nav"); }); });
+      // Navigation can be caused by the click we just captured. Preserve that
+      // structural click instead of replacing it with a generic `nav`, or the
+      // cloud replay loses the control that opened the destination screen.
+      var observeNavigation = function () {
+        self._settle(function () { self._observe(self._pending || "nav"); });
+      };
+      addEventListener("popstate", observeNavigation);
+      addEventListener("hashchange", observeNavigation);
 
       // 3. interactions -> remember structural action + display label, then re-snapshot
       addEventListener(
@@ -1078,7 +1085,7 @@
         var orig = history[m];
         history[m] = function () {
           var r = orig.apply(this, arguments);
-          self._settle(function () { self._observe("nav"); });
+          self._settle(function () { self._observe(self._pending || "nav"); });
           return r;
         };
       });
