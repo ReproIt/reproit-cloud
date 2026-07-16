@@ -354,6 +354,9 @@ const S = {
   scanErr: null,
   scanFilter: { q: "", status: "all" },
   evKind: null, // selected evidence kind index
+  sdkPlatform: (() => {
+    try { return localStorage.getItem("reproit.sdkPlatform") || "web"; } catch { return "web"; }
+  })(),
   kbdIdx: -1, // keyboard-focused row in filtered list
 };
 const root = () => document.getElementById("app-root");
@@ -1239,6 +1242,72 @@ function renderGetStarted(project) {
 // browser-remembered one), the SDK start snippet with the app id filled in, and
 // the one-line CLI setup command. This is the post-signup onboarding step that
 // used to be missing (the key was silently written to localStorage only).
+function sdkSetup(platform, appId, publishableKey, ingestBase) {
+  const key = publishableKey || "<your pk_live_ key>";
+  const repo = "https://github.com/ReproIt/reproit";
+  const setups = {
+    web: {
+      label: "Web",
+      install: `mkdir -p src/vendor\ncurl -fsSLo src/vendor/reproit-web.js https://raw.githubusercontent.com/ReproIt/reproit/main/sdk/reproit-web.js`,
+      code: `import './vendor/reproit-web.js';\n\nReproIt.start({\n  appId: '${appId}',\n  key: '${key}',\n  endpoint: '${ingestBase}/v1/events',\n  build: { version: '1.4.2', commit: 'abc123' },\n});`,
+      guide: `${repo}/blob/main/sdk/reproit-web.README.md`,
+    },
+    reactNative: {
+      label: "React Native",
+      install: `git submodule add ${repo} vendor/reproit\nnpm install ./vendor/reproit/sdk/reproit-react-native`,
+      code: `import { ReproIt } from 'reproit-react-native';\n\nReproIt.init({\n  appId: '${appId}',\n  endpoint: '${ingestBase}',\n  apiKey: '${key}',\n  build: { version: '1.4.2', commit: 'abc123' },\n});`,
+      guide: `${repo}/blob/main/sdk/reproit-react-native/README.md`,
+    },
+    flutter: {
+      label: "Flutter",
+      install: `dependencies:\n  reproit_flutter:\n    git:\n      url: ${repo}.git\n      path: sdk/reproit_flutter\n      ref: main`,
+      code: `ReproIt.init(const ReproItConfig(\n  appId: '${appId}',\n  endpoint: '${ingestBase}',\n  apiKey: '${key}',\n  buildVersion: '1.4.2',\n  buildCommit: 'abc123',\n));`,
+      guide: `${repo}/blob/main/sdk/reproit_flutter/README.md`,
+    },
+    apple: {
+      label: "iOS + macOS",
+      install: `git submodule add ${repo} Vendor/reproit\n# Add Vendor/reproit/sdk/reproit-ios as a local Swift package`,
+      code: `ReproIt.start(ReproItConfig(\n  appId: "${appId}",\n  endpoint: "${ingestBase}",\n  apiKey: "${key}",\n  buildVersion: "1.4.2",\n  buildCommit: "abc123"\n))`,
+      guide: `${repo}/blob/main/sdk/reproit-ios/README.md`,
+    },
+    android: {
+      label: "Android",
+      install: `git submodule add ${repo} vendor/reproit\n# Include vendor/reproit/sdk/reproit-android in settings.gradle.kts`,
+      code: `ReproIt.init(this, ReproItConfig(\n  appId = "${appId}",\n  endpoint = "${ingestBase}",\n  apiKey = "${key}",\n  buildVersion = "1.4.2",\n  buildCommit = "abc123",\n))`,
+      guide: `${repo}/blob/main/sdk/reproit-android/README.md`,
+    },
+    windows: {
+      label: "Windows",
+      install: `git submodule add ${repo} vendor/reproit\ndotnet add reference vendor/reproit/sdk/reproit-windows/src/ReproIt.Windows/ReproIt.Windows.csproj`,
+      code: `ReproItClient.Init(new ReproItConfig("${appId}")\n{\n    Endpoint = "${ingestBase}",\n    ApiKey = "${key}",\n    BuildVersion = "1.4.2",\n    BuildCommit = "abc123",\n});`,
+      guide: `${repo}/blob/main/sdk/reproit-windows/README.md`,
+    },
+    linux: {
+      label: "Linux",
+      install: `pip install 'reproit-linux @ git+${repo}.git#subdirectory=sdk/reproit-linux'`,
+      code: `ReproIt.init(\n    app_id="${appId}",\n    endpoint="${ingestBase}",\n    api_key="${key}",\n    build_version="1.4.2",\n    build_commit="abc123",\n    root_widget=window,\n)`,
+      guide: `${repo}/blob/main/sdk/reproit-linux/README.md`,
+    },
+  };
+  return setups[platform] || setups.web;
+}
+
+function renderSdkSetup(appId, publishableKey, ingestBase) {
+  const keys = ["web", "reactNative", "flutter", "apple", "android", "windows", "linux"];
+  const setup = sdkSetup(S.sdkPlatform, appId, publishableKey, ingestBase);
+  const tabs = keys.map((key) => {
+    const item = sdkSetup(key, appId, publishableKey, ingestBase);
+    return `<button type="button" class="sdk-tab${key === S.sdkPlatform ? " active" : ""}" data-sdk-platform="${key}" aria-pressed="${key === S.sdkPlatform}">${esc(item.label)}</button>`;
+  }).join("");
+  const codeBox = (label, value) => `<div class="sdk-step"><div class="sdk-step-head"><b>${label}</b><button class="term-copy" data-copy="${esc(value)}" type="button">copy</button></div><pre>${esc(value)}</pre></div>`;
+  return `<div class="sdk-setup">
+    <div class="sdk-tabs" role="group" aria-label="SDK platform">${tabs}</div>
+    ${codeBox("1. Install", setup.install)}
+    ${codeBox("2. Initialize at app launch", setup.code)}
+    <a class="sdk-guide" href="${esc(setup.guide)}" target="_blank" rel="noopener">Read the ${esc(setup.label)} guide &#8599;</a>
+  </div>`;
+}
+
 function renderConnectCard(project) {
   if (!project) return "";
   const appId = project.appId;
@@ -1249,7 +1318,6 @@ function renderConnectCard(project) {
   // the secret key stays for the CLI command and is never placed in page JS.
   const pubKey = justCreated ? S.justCreatedKey.publishableKey : pubKeyForApp(appId);
   const endpoint = location.origin.replace("://cloud.", "://ingest.");
-  const sdk = `ReproIt.start({ appId: '${appId}', key: '${pubKey || "<your pk_live_ key>"}', endpoint: '${endpoint}' });`;
   let keyBlock;
   if (justCreated) {
     keyBlock = `<div style="border:1px solid var(--ok,#2e7d32);border-radius:8px;padding:10px 12px;margin-bottom:12px">
@@ -1273,8 +1341,8 @@ function renderConnectCard(project) {
       ${keyBlock}
       ${publishableBlock}
       ${renderDemoLauncher(appId, pubKey, "connect")}
-      <div class="muted" style="margin-top:14px">Start the SDK in your app so crashes report here (the key below is your write-only publishable key, safe to ship in client code):</div>
-      <div class="keybox"><span>${esc(sdk)}</span><button class="term-copy" data-copy="${esc(sdk)}" type="button">copy</button></div>
+      <div class="muted" style="margin-top:14px">Connect your app with the write-only publishable key. It can send events but cannot read project data.</div>
+      ${renderSdkSetup(appId, pubKey, endpoint)}
     </div>
   </div>`;
 }
@@ -1848,6 +1916,14 @@ document.addEventListener("click", (ev) => {
     return;
   }
   if (t.id === "rotate-publishable-key") { rotatePublishableKey(); return; }
+
+  const sdkPlatform = t.closest("[data-sdk-platform]");
+  if (sdkPlatform) {
+    S.sdkPlatform = sdkPlatform.dataset.sdkPlatform;
+    try { localStorage.setItem("reproit.sdkPlatform", S.sdkPlatform); } catch {}
+    render();
+    return;
+  }
 
   const demoBtn = t.closest("[data-demo]");
   if (demoBtn) {

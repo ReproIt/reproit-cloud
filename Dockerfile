@@ -12,6 +12,8 @@
 FROM rust:1-slim-bookworm AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
+COPY experimental/reproit-backend ./experimental/reproit-backend
+COPY contracts ./contracts
 COPY src ./src
 COPY static ./static
 RUN apt-get update && apt-get install -y --no-install-recommends pkg-config \

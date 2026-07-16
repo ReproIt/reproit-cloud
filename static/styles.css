@@ -308,6 +308,17 @@ kbd{background:var(--panel2);border:1px solid var(--line);border-bottom-width:2p
 .inline-row input:focus{border-color:var(--line2)}
 .keybox{display:flex;align-items:center;gap:10px;margin-bottom:12px;background:#070809;border:1px solid var(--line);border-radius:8px;padding:10px 12px;color:var(--green);font-size:12px;word-break:break-all}
 .keybox span{flex:1;min-width:0}
+.sdk-setup{display:grid;gap:10px;margin-top:10px}
+.sdk-tabs{display:flex;flex-wrap:wrap;gap:6px;padding:2px 0 4px}
+.sdk-tab{flex:0 0 auto;border:1px solid var(--line);border-radius:7px;background:#070809;color:var(--mut);font:600 11px var(--mono);padding:7px 9px;cursor:pointer}
+.sdk-tab:hover{border-color:var(--line2);color:var(--ink)}
+.sdk-tab.active{border-color:rgba(74,222,128,.48);background:rgba(74,222,128,.08);color:var(--green)}
+.sdk-step{min-width:0;border:1px solid var(--line);border-radius:8px;background:#070809;overflow:hidden}
+.sdk-step-head{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:8px 11px;border-bottom:1px solid var(--line)}
+.sdk-step-head b{color:var(--mut);font-size:10px;text-transform:uppercase;letter-spacing:.08em}
+.sdk-step pre{margin:0;padding:11px;color:var(--green);font:11.5px/1.55 var(--mono);white-space:pre;overflow:auto}
+.sdk-guide{width:max-content;max-width:100%;color:var(--green);font-size:12px;text-decoration:none}
+.sdk-guide:hover{text-decoration:underline}
 .empty a.ghostbtn,.empty a.retry{display:inline-flex;align-items:center;justify-content:center;margin:18px 5px 0}
 .setup-list{display:grid;gap:9px}
 .setup-row{display:grid;gap:6px;padding:10px 12px;background:#070809;border:1px solid var(--line);border-radius:8px}
