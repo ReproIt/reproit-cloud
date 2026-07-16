@@ -14,7 +14,7 @@
 use crate::db::User;
 use crate::App;
 use axum::{
-    extract::State,
+    extract::{Path, State},
     http::{header::COOKIE, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,
@@ -111,7 +111,10 @@ pub async fn cli_device(State(app): State<App>, Json(req): Json<CliDeviceReq>) -
         .await
     {
         tracing::error!("could not create CLI authorization: {e}");
-        return err(StatusCode::INTERNAL_SERVER_ERROR, "could not start CLI login");
+        return err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not start CLI login",
+        );
     }
     app.control
         .audit(
@@ -154,14 +157,22 @@ pub async fn cli_approve(
     {
         Ok(true) => {
             app.control
-                .audit(&format!("user:{}", user.id), "cli.login.approve", Some(org.id), json!({}))
+                .audit(
+                    &format!("user:{}", user.id),
+                    "cli.login.approve",
+                    Some(org.id),
+                    json!({}),
+                )
                 .await;
             Json(json!({ "approved": true, "organization": org.name })).into_response()
         }
         Ok(false) => err(StatusCode::NOT_FOUND, "code is invalid or expired"),
         Err(e) => {
             tracing::error!("could not approve CLI authorization: {e}");
-            err(StatusCode::INTERNAL_SERVER_ERROR, "could not approve CLI login")
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not approve CLI login",
+            )
         }
     }
 }
@@ -178,7 +189,10 @@ pub async fn cli_token(State(app): State<App>, Json(req): Json<CliCodeReq>) -> R
         Ok(Some((true, false))) => {}
         Err(e) => {
             tracing::error!("could not read CLI authorization: {e}");
-            return err(StatusCode::INTERNAL_SERVER_ERROR, "could not finish CLI login");
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not finish CLI login",
+            );
         }
     }
     let token = new_api_key();
@@ -192,7 +206,10 @@ pub async fn cli_token(State(app): State<App>, Json(req): Json<CliCodeReq>) -> R
         Ok(None) => return err(StatusCode::GONE, "authorization is expired or already used"),
         Err(e) => {
             tracing::error!("could not consume CLI authorization: {e}");
-            return err(StatusCode::INTERNAL_SERVER_ERROR, "could not finish CLI login");
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not finish CLI login",
+            );
         }
     };
     let projects = match app.tenancy.resolve(org_id).await {
@@ -231,9 +248,16 @@ pub async fn rotate_publishable_key(
         Ok(Some(id)) => id,
         _ => return err(StatusCode::NOT_FOUND, "project not found"),
     };
-    if let Err(e) = app.control.revoke_publishable_keys_for_project(project_id).await {
+    if let Err(e) = app
+        .control
+        .revoke_publishable_keys_for_project(project_id)
+        .await
+    {
         tracing::error!("could not revoke publishable keys: {e}");
-        return err(StatusCode::INTERNAL_SERVER_ERROR, "could not rotate publishable key");
+        return err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not rotate publishable key",
+        );
     }
     let key = new_publishable_key();
     let prefix = api_key_prefix(&key);
@@ -243,10 +267,18 @@ pub async fn rotate_publishable_key(
         .await
     {
         tracing::error!("could not create publishable key: {e}");
-        return err(StatusCode::INTERNAL_SERVER_ERROR, "could not rotate publishable key");
+        return err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not rotate publishable key",
+        );
     }
     app.control
-        .audit(&format!("user:{}", user.id), "apikey.publishable.rotate", Some(org.id), json!({ "project": project_id, "prefix": prefix }))
+        .audit(
+            &format!("user:{}", user.id),
+            "apikey.publishable.rotate",
+            Some(org.id),
+            json!({ "project": project_id, "prefix": prefix }),
+        )
         .await;
     Json(json!({ "appId": app_id, "publishableKey": key, "publishableKeyPrefix": prefix }))
         .into_response()
@@ -462,6 +494,11 @@ pub struct NewProject {
     pub name: String,
 }
 
+#[derive(Deserialize)]
+pub struct DeleteConfirm {
+    pub confirm: String,
+}
+
 /// Create a project (org-owned) and mint its first API key. Owner/admin only.
 pub async fn create_project(
     State(app): State<App>,
@@ -584,6 +621,90 @@ pub async fn create_project(
         .into_response()
 }
 
+/// Permanently delete one project and all of its telemetry, evidence, keys,
+/// integrations, and triage state. Owner/admin only with exact-name confirmation.
+pub async fn delete_project(
+    State(app): State<App>,
+    Path(app_id): Path<String>,
+    headers: HeaderMap,
+    Json(req): Json<DeleteConfirm>,
+) -> Response {
+    let (user, org) = match user_and_org(&app, &headers).await {
+        Ok(x) => x,
+        Err(r) => return r,
+    };
+    if !can_manage(&org.role) {
+        return err(
+            StatusCode::FORBIDDEN,
+            "only owners/admins can delete projects",
+        );
+    }
+    let tenant = match app.tenancy.resolve(org.id).await {
+        Ok(t) => t,
+        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "could not open project"),
+    };
+    let (project_id, project_name) = match tenant.store.project_for_app(&app_id).await {
+        Ok(Some(project)) => project,
+        Ok(None) => return err(StatusCode::NOT_FOUND, "project not found"),
+        Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "could not open project"),
+    };
+    if req.confirm != project_name {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "type the exact project name to confirm deletion",
+        );
+    }
+    let keys = match tenant.store.project_evidence_keys(&app_id).await {
+        Ok(keys) => keys,
+        Err(_) => {
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not enumerate project evidence",
+            )
+        }
+    };
+    for key in &keys {
+        if let Err(error) = tenant.blobs.delete(key).await {
+            tracing::error!("delete_project: blob {key} failed for {app_id}: {error}");
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not delete project evidence; nothing else was removed",
+            );
+        }
+    }
+    if app
+        .control
+        .delete_api_keys_for_project(project_id)
+        .await
+        .is_err()
+    {
+        return err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not revoke project keys",
+        );
+    }
+    match tenant.store.delete_project_by_app(&app_id).await {
+        Ok(true) => {}
+        Ok(false) => return err(StatusCode::NOT_FOUND, "project not found"),
+        Err(error) => {
+            tracing::error!("delete_project: database cleanup failed for {app_id}: {error}");
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "could not delete project data",
+            );
+        }
+    }
+    app.control
+        .audit(
+            &format!("user:{}", user.id),
+            "project.delete",
+            Some(org.id),
+            json!({"appId":app_id,"project":project_id,"name":project_name,"evidenceObjects":keys.len()}),
+        )
+        .await;
+    Json(json!({"ok":true,"appId":app_id})).into_response()
+}
+
 #[derive(Deserialize)]
 pub struct ActiveOrgReq {
     #[serde(rename = "orgId")]
@@ -655,6 +776,51 @@ pub async fn rename_org(
         )
         .await;
     Json(json!({"ok":true,"name":name})).into_response()
+}
+
+/// Hosted organization deletion uses the same full offboarding pipeline as the
+/// operator command. Personal workspaces and self-hosted installations have
+/// separate account/deployment lifecycles and cannot be deleted here.
+pub async fn delete_org(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(req): Json<DeleteConfirm>,
+) -> Response {
+    let (user, org) = match user_and_org(&app, &headers).await {
+        Ok(x) => x,
+        Err(r) => return r,
+    };
+    if org.role != "owner" {
+        return err(
+            StatusCode::FORBIDDEN,
+            "only the organization owner can delete it",
+        );
+    }
+    if req.confirm != org.name {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "type the exact organization name to confirm deletion",
+        );
+    }
+    if app.self_hosted {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "self-hosted workspace deletion is managed by the deployment owner",
+        );
+    }
+    if app.control.org_is_personal(org.id).await.ok().flatten() != Some(false) {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "the personal workspace is deleted through account deletion",
+        );
+    }
+    // Hosted builds add the billing guard and full provider teardown. This
+    // source-available build deliberately refuses rather than partially delete.
+    let _ = user;
+    err(
+        StatusCode::NOT_IMPLEMENTED,
+        "organization deletion requires the hosted offboarding service",
+    )
 }
 
 #[derive(Deserialize)]

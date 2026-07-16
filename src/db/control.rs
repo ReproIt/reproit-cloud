@@ -1071,6 +1071,24 @@ impl ControlStore {
         Ok(())
     }
 
+    /// Remove every credential scoped to a deleted project. Account-scoped CLI
+    /// tokens have project_id NULL and remain valid for the user's other apps.
+    pub async fn delete_api_keys_for_project(&self, project_id: i64) -> anyhow::Result<u64> {
+        let result = sqlx::query("DELETE FROM api_keys WHERE project_id = $1")
+            .bind(project_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
+
+    pub async fn org_is_personal(&self, org_id: i64) -> anyhow::Result<Option<bool>> {
+        sqlx::query_scalar("SELECT personal FROM orgs WHERE id = $1")
+            .bind(org_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(Into::into)
+    }
+
     pub async fn org_exists(&self, org_id: i64) -> anyhow::Result<bool> {
         let row = sqlx::query_scalar::<_, i32>("SELECT 1 FROM orgs WHERE id = $1")
             .bind(org_id)

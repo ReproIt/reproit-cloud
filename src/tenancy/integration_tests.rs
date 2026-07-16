@@ -285,6 +285,30 @@ async fn full_path_org_to_provision_to_key_to_tenant_row() {
             "edge row should read back with count 2: {edges:?}"
         );
 
+        // Project deletion removes its tenant data and revokes only its keys.
+        let project = tenant
+            .store
+            .project_for_app("acme-web")
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("project should exist before deletion"))?;
+        control.delete_api_keys_for_project(project.0).await?;
+        anyhow::ensure!(
+            tenant.store.delete_project_by_app("acme-web").await?,
+            "project deletion should report a removed project"
+        );
+        anyhow::ensure!(
+            !tenant.store.owns_app("acme-web").await?,
+            "deleted project should no longer be owned"
+        );
+        anyhow::ensure!(
+            tenant.store.edges("acme-web").await?.is_empty(),
+            "deleted project should leave no edge data"
+        );
+        anyhow::ensure!(
+            control.org_for_api_key("secret-xyz").await?.is_none(),
+            "deleted project key should no longer authenticate"
+        );
+
         anyhow::Ok(())
     }
     .await;

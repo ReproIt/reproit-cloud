@@ -338,6 +338,12 @@ kbd{background:var(--panel2);border:1px solid var(--line);border-bottom-width:2p
 .danger-btn{display:inline-flex;align-items:center;justify-content:center;min-height:34px;padding:0 13px;border:1px solid rgba(244,98,90,.32);border-radius:8px;background:rgba(244,98,90,.07);color:var(--red);font-family:var(--mono);font-size:11.5px;font-weight:700;line-height:1;white-space:nowrap}
 .danger-btn:hover{background:rgba(244,98,90,.12);border-color:rgba(244,98,90,.52);color:var(--red)}
 .danger-btn:focus-visible{outline:none;border-color:var(--red);box-shadow:0 0 0 2px rgba(244,98,90,.18)}
+.danger-btn[disabled]{opacity:.45;cursor:default}
+.danger-zone{border-color:rgba(244,98,90,.24)}
+.danger-zone .hd{color:var(--red)}
+.danger-zone p{margin:0 0 13px;color:var(--mut);font-size:12px;line-height:1.55}
+.danger-form{padding-top:2px}
+.danger-note{padding:10px 11px;border:1px solid rgba(244,98,90,.18);border-radius:8px;background:rgba(244,98,90,.04);line-height:1.5}
 .seat-usage{text-align:right;min-width:170px}
 .su-num{font-family:var(--disp);font-weight:800;font-size:30px;color:var(--green);line-height:1}
 .su-num span{color:var(--dim);font-size:18px;font-weight:600}

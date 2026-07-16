@@ -602,13 +602,21 @@ async fn main() -> anyhow::Result<()> {
         .route("/account/me", get(auth::me))
         .route("/account/usage", get(auth::usage))
         .route(backend_contract::CREATE_PROJECT, post(auth::create_project))
+        .route(
+            "/account/projects/:app",
+            axum::routing::delete(auth::delete_project),
+        )
         .route("/auth/cli/approve", post(auth::cli_approve))
         .route(
             "/account/projects/:app/publishable-key",
             post(auth::rotate_publishable_key),
         )
-        .route("/account/orgs/active", post(auth::set_active_org))
         .route("/account/orgs/name", post(auth::rename_org))
+        .route("/account/orgs/active", post(auth::set_active_org))
+        .route(
+            "/account/orgs/current",
+            axum::routing::delete(auth::delete_org),
+        )
         .route("/account/invitations", post(auth::invite_member))
         .route("/account/invitations/accept", post(auth::accept_invitation))
         .route("/account/invitations/resend", post(auth::resend_invitation))

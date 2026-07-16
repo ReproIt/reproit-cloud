@@ -59,6 +59,15 @@ function rememberKey(appId, key, pubKey) {
     localStorage.setItem("reproit.pubkeys", JSON.stringify(pubs));
   }
 }
+function forgetProjectKeys(appId) {
+  if (!appId) return;
+  const keys = keyStore();
+  const pubs = pubKeyStore();
+  delete keys[appId];
+  delete pubs[appId];
+  localStorage.setItem("reproit.keys", JSON.stringify(keys));
+  localStorage.setItem("reproit.pubkeys", JSON.stringify(pubs));
+}
 function saveConfig(cfg) {
   localStorage.setItem("reproit.cfg", JSON.stringify(cfg));
 }
@@ -323,6 +332,8 @@ const S = {
   inviteEmail: "", inviteRole: "member", inviteBusy: "",
   orgBusy: false, orgNameDraft: null,
   newProject: "",
+  projectDeleteConfirm: "", projectDeleteBusy: false,
+  orgDeleteConfirm: "", orgDeleteBusy: false,
   justCreatedKey: null,      // {appId, apiKey}: surfaced once, right after creation
   integration: null,         // GET /v1/apps/:app/integrations result
   integrationApp: null,      // which app `integration` belongs to
@@ -1413,6 +1424,44 @@ function renderOrganizationSettings(account, org) {
   return `<div class="card org-card"><div class="hd">Workspace</div><div class="bd">${canManageOrg() ? `<form id="org-name-form" class="inline-form"><label class="fld-lbl" for="org-name">Workspace name</label><div class="inline-row"><input id="org-name" value="${esc(name)}" maxlength="80" required /><button class="primary-sm" type="submit" ${S.orgBusy ? "disabled" : ""}>Rename</button></div></form>` : `<div class="muted">${esc(org.name || "Workspace")}</div>`}</div></div>`;
 }
 
+function renderProjectDanger(project) {
+  if (!project || !canManageOrg()) return "";
+  const ready = S.projectDeleteConfirm === project.name && !S.projectDeleteBusy;
+  return `<div class="card danger-zone">
+    <div class="hd">Delete project</div>
+    <div class="bd">
+      <p>Permanently deletes this project's bugs, runs, evidence, integrations, and API keys.</p>
+      <form id="project-delete-form" class="danger-form">
+        <label class="fld-lbl" for="project-delete-confirm">Type ${esc(project.name)} to confirm</label>
+        <div class="inline-row">
+          <input id="project-delete-confirm" value="${esc(S.projectDeleteConfirm)}" autocomplete="off" />
+          <button class="danger-btn" type="submit"${ready ? "" : " disabled"}>${S.projectDeleteBusy ? "Deleting..." : "Delete project"}</button>
+        </div>
+      </form>
+    </div>
+  </div>`;
+}
+
+function renderOrganizationDanger(account, org) {
+  const active = (account.organizations || []).find((item) => item.id === org.id);
+  if (org.role !== "owner" || org.selfHosted || !active || active.personal) return "";
+  const paid = org.plan && org.plan !== "free";
+  const ready = S.orgDeleteConfirm === org.name && !S.orgDeleteBusy && !paid;
+  return `<div class="card danger-zone">
+    <div class="hd">Delete organization</div>
+    <div class="bd">
+      <p>Permanently deletes this organization, every project, member, key, bug, run, and evidence object.</p>
+      ${paid ? `<div class="muted danger-note">Cancel the ${esc(org.plan)} subscription in billing and wait for the plan to become free before deleting.</div>` : `<form id="org-delete-form" class="danger-form">
+        <label class="fld-lbl" for="org-delete-confirm">Type ${esc(org.name)} to confirm</label>
+        <div class="inline-row">
+          <input id="org-delete-confirm" value="${esc(S.orgDeleteConfirm)}" autocomplete="off" />
+          <button class="danger-btn" type="submit"${ready ? "" : " disabled"}>${S.orgDeleteBusy ? "Deleting..." : "Delete organization"}</button>
+        </div>
+      </form>`}
+    </div>
+  </div>`;
+}
+
 function renderAccountView() {
   if (S.accountStatus === "loading" || S.accountStatus === "idle") {
     return `<div class="single"><section class="seatcard"><div class="sk sk-card"></div></section></div>`;
@@ -1474,9 +1523,11 @@ function renderAccountView() {
         ${renderConnectCard(project)}
         ${renderDispatchSettings(project)}
         ${renderTrackerSettings(project)}
+        ${renderProjectDanger(project)}
       </div>
       <div>
         ${canManage ? `${renderInviteSettings(a)}${renderTeamSettings(a, org)}` : `<div class="card"><div class="hd">Team access</div><div class="bd"><div class="muted">Owners and admins manage team access.</div></div></div>`}
+        ${renderOrganizationDanger(a, org)}
       </div>
     </div>
   </section></div>`;
@@ -1577,6 +1628,56 @@ async function createProject(name) {
   resetAppData();
   if (window.ReproitTriage && window.ReproitTriage.resetForApp) window.ReproitTriage.resetForApp();
   setView("account", { replace: true, force: true });
+  render();
+}
+
+async function deleteCurrentProject() {
+  const project = currentProject();
+  if (!project || S.projectDeleteBusy || S.projectDeleteConfirm !== project.name) return;
+  S.projectDeleteBusy = true;
+  render();
+  const r = await accountReq(`/account/projects/${encodeURIComponent(project.appId)}`, "DELETE", { confirm: S.projectDeleteConfirm });
+  S.projectDeleteBusy = false;
+  if (!r.ok) {
+    setBanner((r.data && r.data.error) || "Could not delete project", "warn");
+    render();
+    return;
+  }
+  forgetProjectKeys(project.appId);
+  S.projectDeleteConfirm = "";
+  S.justCreatedKey = null;
+  CFG = { ...CFG, app: "", key: "" };
+  saveConfig(CFG);
+  resetAppData();
+  if (window.ReproitTriage && window.ReproitTriage.resetForApp) window.ReproitTriage.resetForApp();
+  await loadAccount();
+  syncProjectUrl(true);
+  setBanner(`Deleted ${project.name}.`);
+  render();
+}
+
+async function deleteCurrentOrganization() {
+  const org = S.account && S.account.org;
+  if (!org || S.orgDeleteBusy || S.orgDeleteConfirm !== org.name) return;
+  S.orgDeleteBusy = true;
+  render();
+  const r = await accountReq("/account/orgs/current", "DELETE", { confirm: S.orgDeleteConfirm });
+  S.orgDeleteBusy = false;
+  if (!r.ok) {
+    setBanner((r.data && r.data.error) || "Could not delete organization", "warn");
+    render();
+    return;
+  }
+  S.orgDeleteConfirm = "";
+  CFG = { ...CFG, app: "", key: "" };
+  saveConfig(CFG);
+  resetAppData();
+  if (r.data && r.data.orgId) {
+    try { localStorage.setItem("reproit.activeOrg", String(r.data.orgId)); } catch {}
+  }
+  await loadAccount();
+  syncProjectUrl(true);
+  setBanner(`Deleted ${org.name}.`);
   render();
 }
 
@@ -1812,6 +1913,12 @@ document.addEventListener("input", (ev) => {
   }
   if(ev.target.id==="invite-email")S.inviteEmail=ev.target.value;
   if(ev.target.id==="org-name")S.orgNameDraft=ev.target.value;
+  if(ev.target.id==="project-delete-confirm" || ev.target.id==="org-delete-confirm"){
+    const id=ev.target.id,pos=ev.target.selectionStart;
+    if(id==="project-delete-confirm")S.projectDeleteConfirm=ev.target.value;else S.orgDeleteConfirm=ev.target.value;
+    render();
+    const el=document.getElementById(id);if(el){el.focus();try{el.setSelectionRange(pos,pos)}catch{}}
+  }
   if (ev.target.id === "dispatch-repo") {
     S.dispatchRepoDraft = ev.target.value;
   }
@@ -1847,6 +1954,8 @@ document.addEventListener("submit", (ev) => {
   }
   if(ev.target.id==="invite-form"){ev.preventDefault();sendInvitation()}
   if(ev.target.id==="org-name-form"){ev.preventDefault();saveOrganizationName()}
+  if(ev.target.id==="project-delete-form"){ev.preventDefault();deleteCurrentProject()}
+  if(ev.target.id==="org-delete-form"){ev.preventDefault();deleteCurrentOrganization()}
 });
 
 // ---- interaction: keyboard navigation ---------------------------------------

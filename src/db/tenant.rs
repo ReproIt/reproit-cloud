@@ -157,6 +157,57 @@ impl TenantStore {
         Ok(())
     }
 
+    /// Return the project name and id for an app id inside this tenant.
+    pub async fn project_for_app(&self, app_id: &str) -> anyhow::Result<Option<(i64, String)>> {
+        let row = sqlx::query("SELECT id, name FROM projects WHERE app_id = $1")
+            .bind(app_id)
+            .fetch_optional(self.pool.as_ref())
+            .await?;
+        Ok(row.map(|r| (r.get("id"), r.get("name"))))
+    }
+
+    /// Blob keys owned by one project. Callers delete the blobs before removing
+    /// the database ledger so a failed storage delete remains safely retryable.
+    pub async fn project_evidence_keys(&self, app_id: &str) -> anyhow::Result<Vec<String>> {
+        let rows = sqlx::query("SELECT storage_key FROM evidence WHERE app_id = $1 ORDER BY id")
+            .bind(app_id)
+            .fetch_all(self.pool.as_ref())
+            .await?;
+        Ok(rows.into_iter().map(|r| r.get("storage_key")).collect())
+    }
+
+    /// Delete every tenant-database row owned by an app, then its project row,
+    /// in one transaction. Evidence blobs must be removed first by the caller.
+    pub async fn delete_project_by_app(&self, app_id: &str) -> anyhow::Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        for table in [
+            "evidence",
+            "errors",
+            "edges",
+            "processed_batches",
+            "replay_results",
+            "bucket_tickets",
+            "bucket_triage",
+            "bucket_resolution_status",
+            "bucket_resolution_events",
+            "project_integrations",
+            "cloud_runs",
+        ] {
+            sqlx::query(&format!("DELETE FROM {table} WHERE app_id = $1"))
+                .bind(app_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        let deleted = sqlx::query("DELETE FROM projects WHERE app_id = $1")
+            .bind(app_id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected()
+            > 0;
+        tx.commit().await?;
+        Ok(deleted)
+    }
+
     // ---- per-app integration config -----------------------------------------
 
     pub async fn integration_for(&self, app_id: &str) -> anyhow::Result<Option<IntegrationRow>> {
