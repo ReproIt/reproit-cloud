@@ -279,19 +279,27 @@ pub(crate) async fn tenant_for(
 
 /// GET /v1/me: a minimal "who am I" probe for `reproit cloud login` to VALIDATE a
 /// key without naming an app. Resolves the caller's tenant via the existing
-/// AuthCtx/`tenant_of` path and returns `{ orgId, projects: <count> }` (no PII, no
-/// secrets, no project ids). A bad key never reaches here (require_api_key fails
-/// closed with 401); a valid key resolves to its org.
+/// AuthCtx/`tenant_of` path and returns the projects visible to that credential.
+/// An org-level account token sees the org's projects; a project key sees only
+/// its own project. A bad key never reaches here because `require_api_key` fails
+/// closed with 401.
 pub async fn get_me(
     State(app): State<App>,
     Extension(auth): Extension<crate::AuthCtx>,
+    Extension(scope): Extension<crate::KeyScope>,
     headers: HeaderMap,
 ) -> ApiResult {
     let tenant = app.tenant_of(auth, &headers).await?;
-    let projects = tenant.store.count_projects().await.map_err(err500)?;
+    let mut projects = tenant.store.list_projects().await.map_err(err500)?;
+    if let Some(project_id) = scope.project_id {
+        projects.retain(|(id, _, _)| *id == project_id);
+    }
     Ok(Json(json!({
         "orgId": tenant.org_id,
-        "projects": projects,
+        "projectCount": projects.len(),
+        "projects": projects.into_iter().map(|(id, name, app_id)| json!({
+            "id": id, "name": name, "appId": app_id
+        })).collect::<Vec<_>>(),
     })))
 }
 

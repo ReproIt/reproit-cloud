@@ -157,15 +157,6 @@ impl TenantStore {
         Ok(())
     }
 
-    /// How many projects this tenant owns. Used by `GET /v1/me` so `cloud login`
-    /// can confirm the key resolved to a tenant without leaking project ids/PII.
-    pub async fn count_projects(&self) -> anyhow::Result<i64> {
-        let n = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM projects")
-            .fetch_one(self.pool.as_ref())
-            .await?;
-        Ok(n)
-    }
-
     // ---- per-app integration config -----------------------------------------
 
     pub async fn integration_for(&self, app_id: &str) -> anyhow::Result<Option<IntegrationRow>> {

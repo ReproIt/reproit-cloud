@@ -1,0 +1,5 @@
+var params=new URLSearchParams(location.search),code=document.getElementById('code'),button=document.getElementById('approve'),msg=document.getElementById('msg');
+code.value=(params.get('code')||'').toUpperCase();
+async function account(){var r=await fetch('/account/me',{credentials:'include'});if(r.status===401){location.href='/login?next='+encodeURIComponent(location.pathname+location.search);return false}return r.ok}
+button.addEventListener('click',async function(){var value=code.value.trim().toUpperCase();if(!value)return;button.disabled=true;msg.className='msg';msg.textContent='Authorizing…';try{var r=await fetch('/auth/cli/approve',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({code:value})});var d=await r.json().catch(function(){return{}});if(r.ok){msg.className='msg ok';msg.textContent='Authorized. Return to your terminal.';button.textContent='Authorized';return}msg.className='msg err';msg.textContent=d.error||'Could not authorize'}catch(e){msg.className='msg err';msg.textContent='Network error. Try again.'}button.disabled=false});
+account();

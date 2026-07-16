@@ -316,6 +316,7 @@ const S = {
   accountStatus: "idle", // idle | loading | ready | unauth | error
   accountErr: null,
   projectBusy: false,
+  publishableKeyBusy: false,
   roleSaving: false,
   roleDraft: {},
   teamSearch: "",
@@ -1244,7 +1245,7 @@ function renderConnectCard(project) {
   const pubKey = justCreated ? S.justCreatedKey.publishableKey : pubKeyForApp(appId);
   const endpoint = location.origin.replace("://cloud.", "://ingest.");
   const sdk = `ReproIt.start({ appId: '${appId}', key: '${pubKey || "<your pk_live_ key>"}', endpoint: '${endpoint}' });`;
-  const setupCmd = "reproit cloud setup --app " + appId + (key ? " --key " + key : "");
+  const setupCmd = "reproit cloud setup --app " + appId;
   let keyBlock;
   if (justCreated) {
     keyBlock = `<div style="border:1px solid var(--ok,#2e7d32);border-radius:8px;padding:10px 12px;margin-bottom:12px">
@@ -1255,12 +1256,18 @@ function renderConnectCard(project) {
     keyBlock = `<div class="muted">Project key (remembered in this browser):</div>
       <div class="keybox"><span>${esc(maskKey(storedKey))}</span><button class="term-copy" data-copy="${esc(storedKey)}" type="button">copy</button></div>`;
   } else {
-    keyBlock = `<div class="muted">The project key is shown once at creation. If you no longer have it, create a new project to mint a fresh one.</div>`;
+    keyBlock = `<div class="muted">CLI access now comes from <code>reproit login</code>. It opens the browser, signs in to your account, and discovers your projects.</div>`;
   }
+  const publishableBlock = pubKey
+    ? `<div class="muted" style="margin-top:14px">Publishable SDK key:</div>
+       <div class="keybox"><span>${esc(pubKey)}</span><button class="term-copy" data-copy="${esc(pubKey)}" type="button">copy</button></div>`
+    : `<div class="muted" style="margin-top:14px">The publishable key is not stored in this browser. Generate a replacement to connect the SDK. Any previous publishable key for this project will stop working.</div>
+       <button class="ghostbtn-sm" id="rotate-publishable-key" type="button" style="margin-top:8px" ${S.publishableKeyBusy ? "disabled" : ""}>${S.publishableKeyBusy ? "Generating…" : "Generate publishable key"}</button>`;
   return `<div class="card">
     <div class="hd">Connect</div>
     <div class="bd">
       ${keyBlock}
+      ${publishableBlock}
       ${renderDemoLauncher(appId, pubKey, "connect")}
       <div class="muted" style="margin-top:14px">Start the SDK in your app so crashes report here (the key below is your write-only publishable key, safe to ship in client code):</div>
       <div class="keybox"><span>${esc(sdk)}</span><button class="term-copy" data-copy="${esc(sdk)}" type="button">copy</button></div>
@@ -1582,6 +1589,23 @@ async function createProject(name) {
   render();
 }
 
+async function rotatePublishableKey() {
+  const project = currentProject();
+  if (!project || S.publishableKeyBusy) return;
+  S.publishableKeyBusy = true;
+  render();
+  const r = await accountReq(`/account/projects/${encodeURIComponent(project.appId)}/publishable-key`, "POST", {});
+  S.publishableKeyBusy = false;
+  if (!r.ok || !r.data.publishableKey) {
+    setBanner((r.data && r.data.error) || "Could not generate publishable key", "warn");
+    render();
+    return;
+  }
+  rememberKey(project.appId, null, r.data.publishableKey);
+  setBanner("Publishable key generated. Update the SDK anywhere the previous key was used.");
+  render();
+}
+
 // Load the dispatch/tracker binding for the active project. Uses the project
 // key (Bearer); with no key in this browser we cannot read it, so the form shows
 // a "connect the key" note instead of erroring.
@@ -1731,6 +1755,7 @@ document.addEventListener("click", (ev) => {
     signOut();
     return;
   }
+  if (t.id === "rotate-publishable-key") { rotatePublishableKey(); return; }
 
   const demoBtn = t.closest("[data-demo]");
   if (demoBtn) {

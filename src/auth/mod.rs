@@ -93,6 +93,165 @@ pub(crate) fn can_manage(role: &str) -> bool {
     role == "owner" || role == "admin"
 }
 
+const CLI_AUTH_TTL_SECS: i64 = 10 * 60;
+
+#[derive(Deserialize)]
+pub struct CliDeviceReq {
+    #[serde(default)]
+    pub client: Option<String>,
+}
+
+pub async fn cli_device(State(app): State<App>, Json(req): Json<CliDeviceReq>) -> Response {
+    let device_code = new_session_token();
+    let raw = Uuid::new_v4().simple().to_string().to_ascii_uppercase();
+    let user_code = format!("{}-{}", &raw[..4], &raw[4..8]);
+    if let Err(e) = app
+        .control
+        .create_cli_authorization(&device_code, &user_code, CLI_AUTH_TTL_SECS)
+        .await
+    {
+        tracing::error!("could not create CLI authorization: {e}");
+        return err(StatusCode::INTERNAL_SERVER_ERROR, "could not start CLI login");
+    }
+    app.control
+        .audit(
+            "anonymous",
+            "cli.login.start",
+            None,
+            json!({ "client": req.client.unwrap_or_else(|| "reproit".into()) }),
+        )
+        .await;
+    let verification_uri = format!("{}/cli", crate::mail::public_base());
+    Json(json!({
+        "deviceCode": device_code,
+        "userCode": user_code,
+        "verificationUri": verification_uri,
+        "verificationUriComplete": format!("{verification_uri}?code={user_code}"),
+        "expiresIn": CLI_AUTH_TTL_SECS,
+        "interval": 2,
+    }))
+    .into_response()
+}
+
+#[derive(Deserialize)]
+pub struct CliCodeReq {
+    pub code: String,
+}
+
+pub async fn cli_approve(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(req): Json<CliCodeReq>,
+) -> Response {
+    let (user, org) = match user_and_org(&app, &headers).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    match app
+        .control
+        .approve_cli_authorization(req.code.trim(), user.id, org.id)
+        .await
+    {
+        Ok(true) => {
+            app.control
+                .audit(&format!("user:{}", user.id), "cli.login.approve", Some(org.id), json!({}))
+                .await;
+            Json(json!({ "approved": true, "organization": org.name })).into_response()
+        }
+        Ok(false) => err(StatusCode::NOT_FOUND, "code is invalid or expired"),
+        Err(e) => {
+            tracing::error!("could not approve CLI authorization: {e}");
+            err(StatusCode::INTERNAL_SERVER_ERROR, "could not approve CLI login")
+        }
+    }
+}
+
+pub async fn cli_token(State(app): State<App>, Json(req): Json<CliCodeReq>) -> Response {
+    let device_code = req.code.trim();
+    match app.control.cli_authorization_state(device_code).await {
+        Ok(Some((false, false))) => {
+            return (StatusCode::ACCEPTED, Json(json!({ "status": "pending" }))).into_response()
+        }
+        Ok(Some((_, true))) | Ok(None) => {
+            return err(StatusCode::GONE, "authorization is expired or already used")
+        }
+        Ok(Some((true, false))) => {}
+        Err(e) => {
+            tracing::error!("could not read CLI authorization: {e}");
+            return err(StatusCode::INTERNAL_SERVER_ERROR, "could not finish CLI login");
+        }
+    }
+    let token = new_api_key();
+    let prefix = api_key_prefix(&token);
+    let org_id = match app
+        .control
+        .consume_cli_authorization(device_code, &token, &prefix)
+        .await
+    {
+        Ok(Some(id)) => id,
+        Ok(None) => return err(StatusCode::GONE, "authorization is expired or already used"),
+        Err(e) => {
+            tracing::error!("could not consume CLI authorization: {e}");
+            return err(StatusCode::INTERNAL_SERVER_ERROR, "could not finish CLI login");
+        }
+    };
+    let projects = match app.tenancy.resolve(org_id).await {
+        Ok(tenant) => tenant.store.list_projects().await.unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+    Json(json!({
+        "token": token,
+        "orgId": org_id,
+        "projects": projects.into_iter().map(|(id, name, app_id)| json!({
+            "id": id, "name": name, "appId": app_id
+        })).collect::<Vec<_>>(),
+    }))
+    .into_response()
+}
+
+/// Rotate the browser-safe SDK key from the signed-in dashboard. Full key
+/// material is returned once; only its hash remains after the response.
+pub async fn rotate_publishable_key(
+    State(app): State<App>,
+    headers: HeaderMap,
+    axum::extract::Path(app_id): axum::extract::Path<String>,
+) -> Response {
+    let (user, org) = match user_and_org(&app, &headers).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    if !can_manage(&org.role) {
+        return err(StatusCode::FORBIDDEN, "owner or admin required");
+    }
+    let tenant = match app.tenancy.resolve(org.id).await {
+        Ok(tenant) => tenant,
+        Err(_) => return err(StatusCode::NOT_FOUND, "project not found"),
+    };
+    let project_id = match tenant.store.project_id_for_app(&app_id).await {
+        Ok(Some(id)) => id,
+        _ => return err(StatusCode::NOT_FOUND, "project not found"),
+    };
+    if let Err(e) = app.control.revoke_publishable_keys_for_project(project_id).await {
+        tracing::error!("could not revoke publishable keys: {e}");
+        return err(StatusCode::INTERNAL_SERVER_ERROR, "could not rotate publishable key");
+    }
+    let key = new_publishable_key();
+    let prefix = api_key_prefix(&key);
+    if let Err(e) = app
+        .control
+        .create_api_key(&key, &prefix, org.id, user.id, Some(project_id))
+        .await
+    {
+        tracing::error!("could not create publishable key: {e}");
+        return err(StatusCode::INTERNAL_SERVER_ERROR, "could not rotate publishable key");
+    }
+    app.control
+        .audit(&format!("user:{}", user.id), "apikey.publishable.rotate", Some(org.id), json!({ "project": project_id, "prefix": prefix }))
+        .await;
+    Json(json!({ "appId": app_id, "publishableKey": key, "publishableKeyPrefix": prefix }))
+        .into_response()
+}
+
 pub async fn signup(State(app): State<App>, Json(c): Json<Creds>) -> Response {
     let email = c.email.trim().to_lowercase();
     if !email.contains('@') || email.len() > 254 {

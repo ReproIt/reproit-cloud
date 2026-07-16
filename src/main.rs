@@ -584,6 +584,8 @@ async fn main() -> anyhow::Result<()> {
         .route(backend_contract::SIGNUP, post(auth::signup))
         .route("/auth/login", post(auth::login))
         .route("/auth/logout", post(auth::logout))
+        .route("/auth/cli/device", post(auth::cli_device))
+        .route("/auth/cli/token", post(auth::cli_token))
         .route("/auth/invitations/preview", get(auth::invitation_preview))
         // Email flows: verification (the signup link) + password reset. All
         // token-bearing and unauthenticated, so they belong on the tight limiter.
@@ -599,6 +601,11 @@ async fn main() -> anyhow::Result<()> {
         .route("/account/me", get(auth::me))
         .route("/account/usage", get(auth::usage))
         .route(backend_contract::CREATE_PROJECT, post(auth::create_project))
+        .route("/auth/cli/approve", post(auth::cli_approve))
+        .route(
+            "/account/projects/:app/publishable-key",
+            post(auth::rotate_publishable_key),
+        )
         .route("/account/orgs/active", post(auth::set_active_org))
         .route("/account/orgs/name", post(auth::rename_org))
         .route("/account/invitations", post(auth::invite_member))
@@ -660,6 +667,10 @@ async fn main() -> anyhow::Result<()> {
             get(|| async { Html(include_str!("../static/login.html")) }),
         )
         .route(
+            "/cli",
+            get(|| async { Html(include_str!("../static/cli.html")) }),
+        )
+        .route(
             "/invite",
             get(|| async { Html(include_str!("../static/invite.html")) }),
         )
@@ -671,6 +682,15 @@ async fn main() -> anyhow::Result<()> {
                 (
                     [(axum::http::header::CONTENT_TYPE, "application/javascript")],
                     include_str!("../static/login.js"),
+                )
+            }),
+        )
+        .route(
+            "/cli.js",
+            get(|| async {
+                (
+                    [(CONTENT_TYPE, "application/javascript; charset=utf-8")],
+                    include_str!("../static/cli.js"),
                 )
             }),
         )
