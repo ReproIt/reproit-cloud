@@ -277,7 +277,7 @@ pub(crate) async fn tenant_for(
     }
 }
 
-/// GET /v1/me: a minimal "who am I" probe for `reproit cloud login` to VALIDATE a
+/// GET /v1/me: a minimal "who am I" probe for `reproit login` to validate a
 /// key without naming an app. Resolves the caller's tenant via the existing
 /// AuthCtx/`tenant_of` path and returns the projects visible to that credential.
 /// An org-level account token sees the org's projects; a project key sees only
@@ -1305,7 +1305,7 @@ pub(crate) async fn bucket_list_for_tenant(tenant: &Tenant, app_id: &str) -> any
 }
 
 /// GET /v1/apps/:app/buckets/:bucket, the money endpoint: a portable REPLAY
-/// PACKAGE for one bucket. Everything a local `reproit cloud reproduce` needs to
+/// PACKAGE for one bucket. Everything a direct `reproit bkt_...` needs to
 /// turn a real-user failure into a deterministic local test: the executable
 /// replay, the property-matched fixture spec (from the PII-safe fingerprint),
 /// the discriminators, build lineage, evidence, and the reproduction rate.
@@ -1346,7 +1346,7 @@ fn bucket_package(
         "repro": buckets::repro_status(&results),
         "results": results.clone(),
         "replayResults": results,
-        "howto": "reproit cloud reproduce --app <app> --bucket <bucketId> --as <name> --run: downloads this package, synthesizes the fixture, replays the actions, then POSTs the result to replay-results",
+        "howto": "reproit <bucketId> --app <app>: downloads this package, saves it locally, synthesizes the fixture, replays the actions, then POSTs the result to replay-results",
     })
 }
 
@@ -1492,7 +1492,7 @@ pub async fn post_replay_results(
 /// trigger. Fires a `repository_dispatch` into the app's bound customer repo
 /// (project_integrations.dispatch_repo) so reproduction runs in THEIR CI; the
 /// cloud never holds source or simulators. 202 with the run id; the CI
-/// workflow's `reproit cloud reproduce ... --run` posts the verdict back to
+/// workflow's private replay dispatch command posts the verdict back to
 /// replay-results with this id, completing the ledger row.
 pub async fn post_reproduce(
     State(app): State<App>,

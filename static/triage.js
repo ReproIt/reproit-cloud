@@ -968,7 +968,7 @@
     const rp = reproSummary(d.repro);
     const tr = d.triage || { status: "untriaged" };
     const appId = d.appId || cfg().app;
-    const cmd = d.reproduceCommand || `reproit cloud reproduce --app ${appId} --bucket ${d.bucketId} --as ${d.bucketId} --run`;
+    const cmd = d.reproduceCommand || `reproit ${d.bucketId} --app ${appId}`;
     // The prod-truth resolution (detail carries it directly; the timeline carries
     // it too with the same shape, so the graph + verdict agree).
     const item = selectedBucketItem() || {};

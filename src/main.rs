@@ -505,7 +505,7 @@ async fn main() -> anyhow::Result<()> {
     // is present, and rejects publishable keys (403).
     let protected = Router::new()
         .route("/jobs/:id", get(get_job))
-        // Minimal auth probe: `reproit cloud login` hits this to VALIDATE a key
+        // Minimal auth probe: `reproit login --key ...` hits this to validate a key
         // (resolves the tenant, returns { orgId, projects }), no app id needed.
         .route(backend_contract::GET_ME, get(ingest::get_me))
         .route("/v1/graph/:app", get(ingest::get_graph))
@@ -2012,6 +2012,23 @@ mod tests {
         assert!(!raw_jobs_enabled(false, false));
         assert!(raw_jobs_enabled(true, false));
         assert!(raw_jobs_enabled(false, true));
+    }
+
+    #[test]
+    fn dashboard_never_advertises_retired_cli_commands() {
+        let surfaces = [
+            include_str!("../static/app.js"),
+            include_str!("../static/triage.js"),
+            include_str!("../docs/ci/reproit-repro.yml"),
+        ];
+        for surface in surfaces {
+            assert!(!surface.contains("reproit cloud reproduce"));
+            assert!(!surface.contains("reproit cloud pull"));
+            assert!(!surface.contains("reproit cloud login"));
+            assert!(!surface.contains("reproit check ${job.id}"));
+        }
+        assert!(surfaces[0].contains("reproit ${bktArg} --app ${app}"));
+        assert!(surfaces[2].contains("reproit cloud __replay-dispatch"));
     }
 
     #[test]

@@ -7,7 +7,7 @@
 //!   - **file-on-form**: when a NEW bucket appears for a configured app, file an
 //!     issue carrying the PII-safe repro package (bucket id, crash signature,
 //!     normalized message, replay action list, lineage, and the local
-//!     `reproit cloud reproduce --bucket ...` command), and persist the link.
+//!     direct `reproit bkt_...` command), and persist the link.
 //!   - **close-on-fix**: when a replay-result flips a bucket to FIXED (a posted
 //!     result whose verdict says the bug no longer reproduces), auto-comment +
 //!     close the linked ticket with proof.
@@ -340,7 +340,7 @@ pub fn issue_body(
          \n\
          **Reproduce locally:**\n\
          ```sh\n\
-         reproit cloud reproduce --app {app_id} --bucket {bucket_id} --as {bucket_id} --run\n\
+         reproit {bucket_id} --app {app_id}\n\
          ```\n\
          reproit will download the replay package, synthesize a PII-safe fixture, replay the \
          actions deterministically, and post the verdict back. When it confirms the bug no \
@@ -779,7 +779,7 @@ mod tests {
         assert!(body.contains(bid), "body has bucket id");
         assert!(
             body.contains(&format!(
-                "reproit cloud reproduce --app acme-web --bucket {bid} --as {bid} --run"
+                "reproit {bid} --app acme-web"
             )),
             "body has the reproduce command"
         );

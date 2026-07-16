@@ -13,7 +13,7 @@
 //!      CLI/SDK stays free, seats gate only the cloud dashboard.
 //!   3. **"Grab a bug" detail builder** (`bucket_detail`): bundles everything a
 //!      dev needs to act, the crash summary, repro status/rate, lineage, replay
-//!      actions, the `reproit cloud reproduce --bucket ...` command, the linked
+//!      actions, the direct `reproit bkt_...` command, the linked
 //!      ticket (if any), and the triage state, into one payload.
 //!
 //! HTTP handlers at the bottom wire these to Postgres; everything above the
@@ -183,7 +183,7 @@ pub fn bucket_detail(
         // dev runs to reproduce locally and post a verdict back.
         "replay": buckets::replay_actions(newest),
         "displayPath": buckets::display_path(newest),
-        "reproduceCommand": format!("reproit cloud reproduce --app {app_id} --bucket {bucket_id} --as {bucket_id} --run"),
+        "reproduceCommand": format!("reproit {bucket_id} --app {app_id}"),
         "lineage": buckets::lineage(oldest, newest),
         "context": newest.context,
         "cohorts": cohorts,
@@ -1009,7 +1009,7 @@ mod tests {
         assert_eq!(d["count"], 3);
         assert_eq!(
             d["reproduceCommand"],
-            format!("reproit cloud reproduce --app acme-web --bucket {bid} --as {bid} --run")
+            format!("reproit {bid} --app acme-web")
         );
         // The executable replay (PII-safe class tokens) is present.
         assert_eq!(

@@ -783,36 +783,31 @@ function renderReproHero(cluster) {
 function renderClipHint(cluster) {
   const app = CFG.app;
   const bkt = bucketForSig(cluster.sig);
-  const name = cluster.sig;
   const cmd = bkt
-    ? `reproit cloud pull --app ${app} --bucket ${bkt} --as ${name} && reproit record ${name}`
-    : `reproit cloud buckets --app ${app}`;
+    ? `reproit ${bkt} --app ${app} && reproit record ${bkt}`
+    : `reproit bugs --app ${app}`;
   return `<div class="clip-hint">
     <span class="ch-ico" aria-hidden="true">&#9654;</span>
-    <span>No reproduction clip. A clip records the deterministic reproduction on synthetic, PII-safe data, never a user session. Get one by recording the pulled bucket: <code>${esc(cmd)}</code>.</span>
+    <span>No reproduction clip. A clip records the deterministic reproduction on synthetic, PII-safe data, never a user session. Reproduce the bug, then record it: <code>${esc(cmd)}</code>.</span>
   </div>`;
 }
 
-// The useful cloud->local commands for this finding: pull it down as a local
-// repro, then reproduce it network-free. Copyable and parameterized with the
-// real bucket id (mapped from the sig via the buckets list) so it runs as-is.
+// The direct cloud-to-local command for this finding. A production bucket id is
+// itself executable: reproit downloads it, saves it locally, and replays it.
 function renderReproCommands(cluster) {
   const app = CFG.app;
   const bkt = bucketForSig(cluster.sig);
-  const name = cluster.sig;
   const bktArg = bkt || "<bucket-id>";
-  const pull = `reproit cloud pull --app ${app} --bucket ${bktArg} --as ${name}`;
-  const check = `reproit check ${name}`;
+  const reproduce = `reproit ${bktArg} --app ${app}`;
   return `<div class="cmd-term" role="group" aria-label="Commands to reproduce this finding locally">
     <div class="cmd-bar">
       <span class="cmd-dots" aria-hidden="true"><i></i><i></i><i></i></span>
-      <span class="cmd-title">pull + reproduce locally</span>
-      <button class="term-copy" id="term-copy" data-cmd="${esc(pull + " && " + check)}" aria-label="Copy the pull and reproduce commands">copy</button>
+      <span class="cmd-title">reproduce locally</span>
+      <button class="term-copy" id="term-copy" data-cmd="${esc(reproduce)}" aria-label="Copy the reproduce command">copy</button>
     </div>
     <div class="cmd-body">
-      <div class="ln cmt"># pull this finding as a local repro, then reproduce it (no network)</div>
-      <div class="ln"><span class="prompt">$</span> <span class="cmd">reproit cloud pull</span> --app ${esc(app)} --bucket <span class="arg">${esc(bktArg)}</span> --as <span class="arg">${esc(name)}</span></div>
-      <div class="ln"><span class="prompt">$</span> <span class="cmd">reproit check</span> <span class="arg">${esc(name)}</span></div>
+      <div class="ln cmt"># download, save, and reproduce this production bug locally</div>
+      <div class="ln"><span class="prompt">$</span> <span class="cmd">reproit</span> <span class="arg">${esc(bktArg)}</span> --app ${esc(app)}</div>
     </div>
   </div>`;
 }
@@ -1103,8 +1098,7 @@ function renderFindingPath(path) {
 function renderScanFinding(job, shard, idx) {
   const parsed = parseFindingReport(shard.report || "");
   const title = parsed.title || `Finding ${idx + 1}`;
-  const fallbackCmd = `reproit check ${job.id} --seed ${shard.seed}`;
-  const cmd = parsed.command || fallbackCmd;
+  const cmd = parsed.command;
   return `<div class="scan-report">
     <div class="hd">
       <span>Seed ${esc(shard.seed)}</span>
@@ -1113,13 +1107,13 @@ function renderScanFinding(job, shard, idx) {
     <div class="scan-finding">
       <div class="finding-summary">${esc(title)}</div>
       ${renderFindingPath(parsed.path)}
-      <div class="cmd-term finding-cmd" role="group" aria-label="Command to reproduce this scan finding locally">
+      ${cmd ? `<div class="cmd-term finding-cmd" role="group" aria-label="Command to reproduce this scan finding locally">
         <div class="cmd-bar">
           <span class="cmd-title">reproduce locally</span>
           <button class="term-copy" data-copy="${esc(cmd)}" type="button">copy</button>
         </div>
         <div class="cmd-body"><div class="ln"><span class="prompt">$</span> ${esc(cmd)}</div></div>
-      </div>
+      </div>` : ""}
       ${parsed.observed || parsed.expected ? `<div class="finding-compare">
         ${parsed.observed ? `<div><div class="mini-label">Observed</div><p>${esc(parsed.observed)}</p></div>` : ""}
         ${parsed.expected ? `<div><div class="mini-label">Expected</div><p>${esc(parsed.expected)}</p></div>` : ""}
