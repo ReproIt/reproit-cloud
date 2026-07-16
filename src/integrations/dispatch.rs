@@ -4,7 +4,7 @@
 //! "reproduction and video recording happen in the customer's own CI"): the
 //! cloud holds only the app's `dispatch_repo` binding + a repo-scoped token,
 //! sends `{app, bucket, runId}`, and the workflow closes the loop by running
-//! `reproit cloud __replay-dispatch ... --run`, which POSTs the verdict back to
+//! ReproIt's private CI callback, which POSTs the verdict back to
 //! `/v1/apps/:app/buckets/:bucket/replay-results` with the run id.
 
 use serde_json::Value;

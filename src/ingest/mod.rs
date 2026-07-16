@@ -1311,6 +1311,7 @@ pub(crate) async fn bucket_list_for_tenant(tenant: &Tenant, app_id: &str) -> any
 /// the discriminators, build lineage, evidence, and the reproduction rate.
 #[allow(clippy::too_many_arguments)]
 fn bucket_package(
+    app_id: &str,
     bucket: &str,
     newest: &ErrorRec,
     oldest: &ErrorRec,
@@ -1324,6 +1325,7 @@ fn bucket_package(
     let fixture = fixture_spec(&newest.context, discriminators);
     let visual_evidence = visual_evidence_refs(&evidence);
     json!({
+        "appId": app_id,
         "bucketId": bucket,
         "bugId": buckets::bug_id(newest),
         "findingIdentity": buckets::finding_identity(newest),
@@ -1346,8 +1348,80 @@ fn bucket_package(
         "repro": buckets::repro_status(&results),
         "results": results.clone(),
         "replayResults": results,
-        "howto": "reproit <bucketId> --app <app>: downloads this package, saves it locally, synthesizes the fixture, replays the actions, then POSTs the result to replay-results",
+        "howto": "reproit <bucketId>: downloads this package, saves it locally, synthesizes the fixture, replays the actions, then reports the verdict to Cloud",
     })
+}
+
+async fn bucket_package_for_tenant(
+    tenant: &Tenant,
+    app_id: &str,
+    bucket: &str,
+) -> anyhow::Result<Option<Value>> {
+    let rows = tenant
+        .store
+        .errors_for_bucket(app_id, bucket, max_error_scan())
+        .await?;
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    let base_occ = tenant
+        .store
+        .recent_errors_with_meta(app_id, baseline_sample())
+        .await?;
+    let baseline: Vec<Map<String, Value>> =
+        base_occ.iter().map(|(_, _, r)| r.context.clone()).collect();
+    let oldest = &rows.first().unwrap().2;
+    let newest = &rows.last().unwrap().2;
+    let cohort: Vec<Map<String, Value>> = rows.iter().map(|(_, _, r)| r.context.clone()).collect();
+    let discs = discriminators(&cohort, &baseline);
+    let error_ids: Vec<i64> = rows.iter().map(|(id, _, _)| *id).collect();
+    let evidence = resolve_evidence(tenant, &error_ids).await?;
+    let results = tenant.store.replay_results_for(app_id, bucket).await?;
+    Ok(Some(bucket_package(
+        app_id,
+        bucket,
+        newest,
+        oldest,
+        rows.len(),
+        &discs,
+        evidence,
+        results,
+    )))
+}
+
+pub async fn get_bucket_global(
+    State(app): State<App>,
+    Extension(auth): Extension<crate::AuthCtx>,
+    Extension(scope): Extension<crate::KeyScope>,
+    headers: HeaderMap,
+    Path(bucket): Path<String>,
+) -> ApiResult {
+    let tenant = app.tenant_of(auth, &headers).await?;
+    let mut projects = tenant.store.list_projects().await.map_err(err500)?;
+    if let Some(project_id) = scope.project_id {
+        projects.retain(|(id, _, _)| *id == project_id);
+    }
+    let mut found = Vec::new();
+    for (_, _, app_id) in projects {
+        if let Some(package) = bucket_package_for_tenant(&tenant, &app_id, &bucket)
+            .await
+            .map_err(err500)?
+        {
+            found.push((app_id, package));
+        }
+    }
+    match found.len() {
+        0 => Err(not_found_err()),
+        1 => Ok(Json(found.pop().unwrap().1)),
+        _ => Err((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "bucket exists in more than one accessible project",
+                "bucketId": bucket,
+                "projects": found.into_iter().map(|(app_id, _)| app_id).collect::<Vec<_>>(),
+            })),
+        )),
+    }
 }
 
 pub async fn get_bucket(
@@ -1357,45 +1431,11 @@ pub async fn get_bucket(
     Path((app_id, bucket)): Path<(String, String)>,
 ) -> ApiResult {
     let tenant = tenant_for(&app, auth, &headers, &app_id).await?;
-    // Indexed per-bucket read (materialized bucket_id), plus a bounded recency
-    // sample of the app stream as the discriminator baseline.
-    let rows = tenant
-        .store
-        .errors_for_bucket(&app_id, &bucket, max_error_scan())
+    bucket_package_for_tenant(&tenant, &app_id, &bucket)
         .await
-        .map_err(err500)?;
-    if rows.is_empty() {
-        return Err(not_found_err());
-    }
-    let base_occ = tenant
-        .store
-        .recent_errors_with_meta(&app_id, baseline_sample())
-        .await
-        .map_err(err500)?;
-    let baseline: Vec<Map<String, Value>> =
-        base_occ.iter().map(|(_, _, r)| r.context.clone()).collect();
-    let oldest = &rows.first().unwrap().2;
-    let newest = &rows.last().unwrap().2;
-    let cohort: Vec<Map<String, Value>> = rows.iter().map(|(_, _, r)| r.context.clone()).collect();
-    let discs = discriminators(&cohort, &baseline);
-    let error_ids: Vec<i64> = rows.iter().map(|(id, _, _)| *id).collect();
-    let evidence = resolve_evidence(&tenant, &error_ids)
-        .await
-        .map_err(err500)?;
-    let results = tenant
-        .store
-        .replay_results_for(&app_id, &bucket)
-        .await
-        .map_err(err500)?;
-    Ok(Json(bucket_package(
-        &bucket,
-        newest,
-        oldest,
-        rows.len(),
-        &discs,
-        evidence,
-        results,
-    )))
+        .map_err(err500)?
+        .map(Json)
+        .ok_or_else(not_found_err)
 }
 
 /// Reproduction verdicts a client may report for a bucket.
@@ -2043,6 +2083,7 @@ mod tests {
         }];
 
         let pkg = bucket_package(
+            "app-test",
             "bkt_deadbeef0001",
             &newest,
             &oldest,
@@ -2052,7 +2093,9 @@ mod tests {
             results,
         );
 
+        assert_eq!(pkg["appId"], "app-test");
         assert_eq!(pkg["bucketId"], "bkt_deadbeef0001");
+        assert_eq!(pkg["howto"], "reproit <bucketId>: downloads this package, saves it locally, synthesizes the fixture, replays the actions, then reports the verdict to Cloud");
         assert_eq!(pkg["message"], "Cannot read property at line 42");
         assert_eq!(pkg["summary"], "Cannot read property at line N (crashA)");
         assert_eq!(pkg["actions"], pkg["replay"]);

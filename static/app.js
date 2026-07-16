@@ -784,8 +784,8 @@ function renderClipHint(cluster) {
   const app = CFG.app;
   const bkt = bucketForSig(cluster.sig);
   const cmd = bkt
-    ? `reproit ${bkt} --app ${app} && reproit record ${bkt}`
-    : `reproit bugs --app ${app}`;
+    ? `reproit ${bkt} && reproit record ${bkt}`
+    : `reproit bugs`;
   return `<div class="clip-hint">
     <span class="ch-ico" aria-hidden="true">&#9654;</span>
     <span>No reproduction clip. A clip records the deterministic reproduction on synthetic, PII-safe data, never a user session. Reproduce the bug, then record it: <code>${esc(cmd)}</code>.</span>
@@ -798,7 +798,7 @@ function renderReproCommands(cluster) {
   const app = CFG.app;
   const bkt = bucketForSig(cluster.sig);
   const bktArg = bkt || "<bucket-id>";
-  const reproduce = `reproit ${bktArg} --app ${app}`;
+  const reproduce = `reproit ${bktArg}`;
   return `<div class="cmd-term" role="group" aria-label="Commands to reproduce this finding locally">
     <div class="cmd-bar">
       <span class="cmd-dots" aria-hidden="true"><i></i><i></i><i></i></span>
@@ -807,7 +807,7 @@ function renderReproCommands(cluster) {
     </div>
     <div class="cmd-body">
       <div class="ln cmt"># download, save, and reproduce this production bug locally</div>
-      <div class="ln"><span class="prompt">$</span> <span class="cmd">reproit</span> <span class="arg">${esc(bktArg)}</span> --app ${esc(app)}</div>
+      <div class="ln"><span class="prompt">$</span> <span class="cmd">reproit</span> <span class="arg">${esc(bktArg)}</span></div>
     </div>
   </div>`;
 }
@@ -1214,7 +1214,7 @@ function renderGetStarted(project) {
   const body = launcher
     ? `${launcher}
        <div class="muted demo-waiting" style="margin-top:16px">Waiting for your first bug<span class="demo-dots">…</span></div>`
-    : `<div class="sub">This project has no key in this browser, so the demo can't be wired here. Create a project on the Account page (the key is shown once), or run <code>reproit cloud setup --app ${esc(appId || "your-app")}</code> from your repo.</div>
+    : `<div class="sub">Create a project on the Account page to receive its one-time SDK key and connect the sample.</div>
        <button class="ghostbtn" id="go-account" style="margin-top:12px">Open account</button>`;
   return `<aside class="list">${renderListHead(0, 0)}
     <div class="empty"><div style="max-width:560px">
@@ -1239,7 +1239,6 @@ function renderConnectCard(project) {
   const pubKey = justCreated ? S.justCreatedKey.publishableKey : pubKeyForApp(appId);
   const endpoint = location.origin.replace("://cloud.", "://ingest.");
   const sdk = `ReproIt.start({ appId: '${appId}', key: '${pubKey || "<your pk_live_ key>"}', endpoint: '${endpoint}' });`;
-  const setupCmd = "reproit cloud setup --app " + appId;
   let keyBlock;
   if (justCreated) {
     keyBlock = `<div style="border:1px solid var(--ok,#2e7d32);border-radius:8px;padding:10px 12px;margin-bottom:12px">
@@ -1265,8 +1264,6 @@ function renderConnectCard(project) {
       ${renderDemoLauncher(appId, pubKey, "connect")}
       <div class="muted" style="margin-top:14px">Start the SDK in your app so crashes report here (the key below is your write-only publishable key, safe to ship in client code):</div>
       <div class="keybox"><span>${esc(sdk)}</span><button class="term-copy" data-copy="${esc(sdk)}" type="button">copy</button></div>
-      <div class="muted" style="margin-top:14px">Or wire a git repo up from the CLI in one step:</div>
-      <div class="keybox"><span>${esc(setupCmd)}</span><button class="term-copy" data-copy="${esc(setupCmd)}" type="button">copy</button></div>
     </div>
   </div>`;
 }
@@ -1280,11 +1277,11 @@ function renderDispatchSettings(project) {
   const st = S.integrationApp === appId ? S.integrationStatus : "idle";
   let inner;
   if (st === "nokey") {
-    inner = `<div class="muted">Configuring dispatch needs this project's key in the browser. Create the project here, or run <code>reproit cloud setup --app ${esc(appId)}</code> from your repo.</div>`;
+    inner = `<div class="muted">Configure hosted reproduction when you create the project and its one-time key is available here.</div>`;
   } else if (st === "loading" || st === "idle") {
     inner = `<div class="muted">Loading…</div>`;
   } else if (st === "error") {
-    inner = `<div class="muted">Could not load the dispatch binding. Retry from the project switcher, or configure it with <code>reproit cloud setup --app ${esc(appId)}</code>.</div>`;
+    inner = `<div class="muted">Could not load the dispatch binding. Retry from the project switcher.</div>`;
   } else {
     const intg = S.integrationApp === appId && S.integration ? S.integration : {};
     const repoVal = S.dispatchRepoDraft !== null ? S.dispatchRepoDraft : intg.dispatchRepo || "";
@@ -1310,8 +1307,8 @@ function renderTrackerSettings(project) {
   const suffix = project ? String(project.appId || "").toUpperCase().replace(/[^A-Z0-9]/g, "_") : "APP_ID";
   const appId = project ? project.appId : "your-app";
   const loginCommand = location.hostname === "cloud.reproit.com"
-    ? `reproit login --app ${appId}`
-    : `reproit login --cloud ${location.origin} --app ${appId}`;
+    ? `reproit login`
+    : `reproit login --cloud ${location.origin}`;
   return `<div class="card">
     <div class="hd">Issue tracker</div>
     <div class="bd">

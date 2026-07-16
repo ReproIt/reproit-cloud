@@ -1,7 +1,7 @@
 "use strict";
 
 // =============================================================================
-// reproit cloud, per-seat Bugs product.
+// ReproIt hosted per-seat Bugs product.
 //
 // The front-end a developer uses to see production bugs, GRAB one, and manage
 // it. This module owns the Bugs view and account-adjacent helpers; app.js owns
@@ -968,7 +968,7 @@
     const rp = reproSummary(d.repro);
     const tr = d.triage || { status: "untriaged" };
     const appId = d.appId || cfg().app;
-    const cmd = d.reproduceCommand || `reproit ${d.bucketId} --app ${appId}`;
+    const cmd = d.reproduceCommand || `reproit ${d.bucketId}`;
     // The prod-truth resolution (detail carries it directly; the timeline carries
     // it too with the same shape, so the graph + verdict agree).
     const item = selectedBucketItem() || {};

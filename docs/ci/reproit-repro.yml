@@ -6,8 +6,8 @@
 # workflow reproduces the bug against your code and posts the verdict (and the
 # recording) back with the CLI's private replay dispatch command.
 #
-# Easiest setup: `reproit cloud setup --app <app>` writes this file, binds the
-# repo, and prints the secret command. To wire it by hand instead:
+# Cloud can install this workflow when hosted reproduction is connected. To
+# wire it by hand instead:
 #   1. Copy this file to .github/workflows/reproit-repro.yml in the app repo.
 #   2. Add your sk_live_ project key as the REPROIT_CLOUD_KEY repo secret (this
 #      is the name the CLI reads; a secret under any other name is ignored and
@@ -39,7 +39,7 @@ jobs:
           # The CLI reads REPROIT_CLOUD_KEY; the repo secret holds your sk_live_ key.
           REPROIT_CLOUD_KEY: ${{ secrets.REPROIT_CLOUD_KEY }}
         run: |
-          ~/.local/bin/reproit cloud __replay-dispatch \
+          ~/.local/bin/reproit __cloud-internal __replay-dispatch \
             --app "${{ github.event.client_payload.app }}" \
             --bucket "${{ github.event.client_payload.bucket }}" \
             --as "${{ github.event.client_payload.bucket }}" \

@@ -340,7 +340,7 @@ pub fn issue_body(
          \n\
          **Reproduce locally:**\n\
          ```sh\n\
-         reproit {bucket_id} --app {app_id}\n\
+         reproit {bucket_id}\n\
          ```\n\
          reproit will download the replay package, synthesize a PII-safe fixture, replay the \
          actions deterministically, and post the verdict back. When it confirms the bug no \
@@ -778,9 +778,7 @@ mod tests {
         assert!(title.contains(bid), "title has bucket id: {title}");
         assert!(body.contains(bid), "body has bucket id");
         assert!(
-            body.contains(&format!(
-                "reproit {bid} --app acme-web"
-            )),
+            body.contains(&format!("reproit {bid}")),
             "body has the reproduce command"
         );
         // Carries the PII-safe replay (class tokens) + lineage.

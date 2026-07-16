@@ -183,7 +183,7 @@ pub fn bucket_detail(
         // dev runs to reproduce locally and post a verdict back.
         "replay": buckets::replay_actions(newest),
         "displayPath": buckets::display_path(newest),
-        "reproduceCommand": format!("reproit {bucket_id} --app {app_id}"),
+        "reproduceCommand": format!("reproit {bucket_id}"),
         "lineage": buckets::lineage(oldest, newest),
         "context": newest.context,
         "cohorts": cohorts,
@@ -1007,10 +1007,7 @@ mod tests {
         assert_eq!(d["bucketId"], bid);
         assert_eq!(d["appId"], "acme-web");
         assert_eq!(d["count"], 3);
-        assert_eq!(
-            d["reproduceCommand"],
-            format!("reproit {bid} --app acme-web")
-        );
+        assert_eq!(d["reproduceCommand"], format!("reproit {bid}"));
         // The executable replay (PII-safe class tokens) is present.
         assert_eq!(
             d["replay"],

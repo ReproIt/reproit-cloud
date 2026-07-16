@@ -508,6 +508,7 @@ async fn main() -> anyhow::Result<()> {
         // Minimal auth probe: `reproit login --key ...` hits this to validate a key
         // (resolves the tenant, returns { orgId, projects }), no app id needed.
         .route(backend_contract::GET_ME, get(ingest::get_me))
+        .route("/v1/buckets/:bucket", get(ingest::get_bucket_global))
         .route("/v1/graph/:app", get(ingest::get_graph))
         .route("/v1/errors/:app", get(ingest::get_errors))
         .route("/v1/errors/:app/cohorts", get(ingest::get_cohorts))
@@ -515,7 +516,7 @@ async fn main() -> anyhow::Result<()> {
         // indices shift as new errors arrive, bucket ids do not.
         .route("/v1/apps/:app/buckets", get(ingest::get_buckets))
         // Mint/rotate the write-only browser key from an authenticated secret
-        // key. This lets `reproit cloud setup` obtain SDK credentials without
+        // key. This lets account setup obtain SDK credentials without
         // ever putting the management key in application code.
         .route(
             "/v1/apps/:app/publishable-key",
@@ -2027,8 +2028,9 @@ mod tests {
             assert!(!surface.contains("reproit cloud login"));
             assert!(!surface.contains("reproit check ${job.id}"));
         }
-        assert!(surfaces[0].contains("reproit ${bktArg} --app ${app}"));
-        assert!(surfaces[2].contains("reproit cloud __replay-dispatch"));
+        assert!(surfaces[0].contains("reproit ${bktArg}"));
+        assert!(!surfaces[0].contains("--app ${app}"));
+        assert!(surfaces[2].contains("reproit __cloud-internal __replay-dispatch"));
     }
 
     #[test]
