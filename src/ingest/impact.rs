@@ -88,8 +88,8 @@ pub enum Severity {
     /// A visual jank / layout overflow: cosmetic, lowest severity.
     Jank,
     /// Anything we can't classify from the signal: a middling default so an
-    /// unknown bug isn't silently buried OR falsely promoted to crash.
-    Unknown,
+    /// unclassified bug isn't silently buried OR falsely promoted to crash.
+    Unclassified,
 }
 
 impl Severity {
@@ -101,7 +101,7 @@ impl Severity {
             Severity::Leak => 0.8,
             Severity::Operability => 0.55,
             Severity::Jank => 0.3,
-            Severity::Unknown => 0.5,
+            Severity::Unclassified => 0.5,
         }
     }
 
@@ -112,7 +112,7 @@ impl Severity {
             Severity::Leak => "leak",
             Severity::Operability => "operability",
             Severity::Jank => "jank",
-            Severity::Unknown => "unknown",
+            Severity::Unclassified => "unclassified",
         }
     }
 }
@@ -131,10 +131,13 @@ impl Severity {
 /// safe-area, permission-walk, invariant, contract) are real functional/operability
 /// defects; content/flicker/visual/jank are cosmetic.
 pub const KNOWN_ORACLES: &[(&str, Severity)] = &[
+    // Registry/taxonomy drift is diagnostic evidence, never a confirmed bug.
+    ("unclassified", Severity::Unclassified),
     ("crash", Severity::Crash),
     ("hang", Severity::Crash),
     ("leak", Severity::Leak),
     ("occlusion", Severity::Operability),
+    ("detached-indicator", Severity::Operability),
     ("choice-anomaly", Severity::Operability),
     ("broken-route", Severity::Operability),
     ("stuck-keyboard", Severity::Operability),
@@ -160,47 +163,14 @@ pub const KNOWN_ORACLES: &[(&str, Severity)] = &[
 ];
 
 /// The Severity for a STRUCTURED oracle id (the finding's `oracle` field), the
-/// preferred classifier when the CLI supplies one. Falls back to `Unknown` for an
-/// id the cloud does not recognize -- so a newer CLI never breaks ingestion, it
-/// only trips the drift test to add first-class handling. Unknown here lets the
-/// caller fall through to the keyword `classify`.
+/// authoritative classifier. An unrecognized id remains `Unclassified`, so a newer CLI
+/// never breaks ingestion and prose cannot promote taxonomy drift into a bug claim.
 pub fn severity_for_oracle(id: &str) -> Severity {
     KNOWN_ORACLES
         .iter()
         .find(|(k, _)| *k == id)
         .map(|(_, s)| *s)
-        .unwrap_or(Severity::Unknown)
-}
-
-/// Classify a bucket's oracle/severity class from its crash signature and message.
-/// Cloud telemetry carries no structured oracle tag, so we match the lowercased
-/// signal against each class's keyword set, most-severe class first (a signal that
-/// mentions both "crash" and "overflow" is a crash). The keyword sets are the
-/// founder-tunable classification table. Unknown when nothing matches, never a
-/// silent crash-or-jank guess.
-pub fn classify(crash_sig: &str, message: &str) -> Severity {
-    let hay = format!("{} {}", crash_sig, message).to_ascii_lowercase();
-    let has = |needles: &[&str]| needles.iter().any(|n| hay.contains(n));
-    // Order matters: check most-severe class first so a mixed signal lands high.
-    if has(&[
-        "crash",
-        "panic",
-        "fatal",
-        "unhandled",
-        "segfault",
-        "abort",
-        "exception",
-    ]) {
-        Severity::Crash
-    } else if has(&["leak", "oom", "out of memory", "retain", "unbounded"]) {
-        Severity::Leak
-    } else if has(&["operab", "focus", "unreachable", "tab order", "keyboard"]) {
-        Severity::Operability
-    } else if has(&["jank", "flicker"]) {
-        Severity::Jank
-    } else {
-        Severity::Unknown
-    }
+        .unwrap_or(Severity::Unclassified)
 }
 
 // ---- the score + its explanation --------------------------------------------
@@ -250,15 +220,9 @@ pub struct Actionability {
 /// signature honest and the call site readable.
 #[derive(Debug, Clone)]
 pub struct BucketSignals<'a> {
-    /// The STRUCTURED oracle id from the finding (`crash`/`security`/`metamorphic`
-    /// /...), when the CLI supplied one. Preferred over keyword inference; `None`
-    /// falls back to `classify(crash_sig, message)`. Reproit findings carry this;
-    /// older SDK telemetry may not, hence optional.
+    /// The structured oracle id from the finding. Missing or unrecognized ids
+    /// remain unclassified; message prose never upgrades evidence severity.
     pub oracle: Option<&'a str>,
-    /// The bucket's crash signature (drives severity classification).
-    pub crash_sig: &'a str,
-    /// A representative message (drives severity classification alongside the sig).
-    pub message: &'a str,
     /// Total occurrence count for the bucket (today's blast-radius proxy).
     pub count: u64,
     /// The bucket's occurrence time-series (drives trend/velocity + frequency).
@@ -281,13 +245,11 @@ pub struct BucketSignals<'a> {
 /// comparable. The boosts are additive on top (a NEW or REGRESSED bug is pushed
 /// up regardless of its raw factors, because it's the one a dev can act on now).
 pub fn impact_score(sig: &BucketSignals, now: &str) -> Impact {
-    // Prefer the STRUCTURED oracle id when the finding carried one and the cloud
-    // recognizes it; otherwise fall back to keyword inference off the signature.
+    // Structured taxonomy is authoritative. Prose is presentation, not proof.
     let severity = sig
         .oracle
         .map(severity_for_oracle)
-        .filter(|s| *s != Severity::Unknown)
-        .unwrap_or_else(|| classify(sig.crash_sig, sig.message));
+        .unwrap_or(Severity::Unclassified);
     let now_epoch = parse_epoch(now);
 
     let f_sev = severity.weight();
@@ -440,17 +402,15 @@ mod tests {
     }
 
     fn signals<'a>(
-        crash_sig: &'a str,
-        message: &'a str,
+        _crash_sig: &'a str,
+        _message: &'a str,
         count: u64,
         timeline: &'a Timeline,
         last_seen: Option<&'a str>,
         action: Actionability,
     ) -> BucketSignals<'a> {
         BucketSignals {
-            oracle: None,
-            crash_sig,
-            message,
+            oracle: Some("crash"),
             count,
             timeline,
             last_seen,
@@ -461,31 +421,6 @@ mod tests {
     const NOW: &str = "2026-06-21T12:00:00Z";
 
     #[test]
-    fn classify_picks_the_most_severe_matching_class() {
-        assert_eq!(classify("crashHomeNull", ""), Severity::Crash);
-        assert_eq!(classify("", "panic: index out of bounds"), Severity::Crash);
-        assert_eq!(
-            classify("memLeakRetain", "unbounded growth"),
-            Severity::Leak
-        );
-        assert_eq!(
-            classify("a11yFocusTrap", "control unreachable by keyboard"),
-            Severity::Operability
-        );
-        assert_eq!(classify("layoutJank", "visible frame jank"), Severity::Jank);
-        assert_eq!(classify("layout", "text overflow clip"), Severity::Unknown);
-        assert_eq!(
-            classify("weirdSig", "something happened"),
-            Severity::Unknown
-        );
-        // A mixed signal lands on the MOST severe class (crash beats overflow).
-        assert_eq!(
-            classify("crashOverflow", "overflow then crash"),
-            Severity::Crash
-        );
-    }
-
-    #[test]
     fn severity_table_orders_crash_over_leak_over_operability_over_jank() {
         assert!(Severity::Crash.weight() > Severity::Leak.weight());
         assert!(Severity::Leak.weight() > Severity::Operability.weight());
@@ -493,7 +428,7 @@ mod tests {
     }
 
     #[test]
-    fn severity_for_oracle_maps_known_ids_and_defaults_unknown() {
+    fn severity_for_oracle_maps_known_ids_and_defaults_unclassified() {
         assert_eq!(severity_for_oracle("crash"), Severity::Crash);
         assert_eq!(severity_for_oracle("hang"), Severity::Crash);
         assert_eq!(severity_for_oracle("leak"), Severity::Leak);
@@ -501,24 +436,28 @@ mod tests {
         assert_eq!(severity_for_oracle("rotation"), Severity::Operability);
         assert_eq!(severity_for_oracle("stuck-keyboard"), Severity::Operability);
         assert_eq!(severity_for_oracle("occlusion"), Severity::Operability);
-        assert_eq!(severity_for_oracle("graph"), Severity::Unknown);
-        assert_eq!(severity_for_oracle("overflow"), Severity::Unknown);
-        assert_eq!(severity_for_oracle("dynamic-type"), Severity::Unknown);
-        assert_eq!(severity_for_oracle("undo-inverse"), Severity::Unknown);
-        // An id the cloud does not recognize defaults to Unknown -- never dropped,
-        // never panics; the caller then falls back to keyword inference. This also
-        // covers oracle ids the CLI has RETIRED (metamorphic, deep-link-parity): a
-        // stale finding still ingests, just via the keyword fallback.
-        assert_eq!(severity_for_oracle("metamorphic"), Severity::Unknown);
-        assert_eq!(severity_for_oracle("deep-link-parity"), Severity::Unknown);
-        assert_eq!(severity_for_oracle("no-such-oracle"), Severity::Unknown);
+        assert_eq!(severity_for_oracle("graph"), Severity::Unclassified);
+        assert_eq!(severity_for_oracle("overflow"), Severity::Unclassified);
+        assert_eq!(severity_for_oracle("dynamic-type"), Severity::Unclassified);
+        assert_eq!(severity_for_oracle("undo-inverse"), Severity::Unclassified);
+        // An id the cloud does not recognize remains Unclassified. It is retained
+        // without guessing severity from prose.
+        assert_eq!(severity_for_oracle("metamorphic"), Severity::Unclassified);
+        assert_eq!(
+            severity_for_oracle("deep-link-parity"),
+            Severity::Unclassified
+        );
+        assert_eq!(
+            severity_for_oracle("no-such-oracle"),
+            Severity::Unclassified
+        );
     }
 
     #[test]
-    fn impact_score_prefers_the_structured_oracle_over_keyword_inference() {
+    fn impact_score_uses_only_the_structured_oracle() {
         let t = tl(&[(NOW, 1)]);
         // A "security" finding whose sig/message carry NO severity keywords:
-        // keyword inference alone would land Unknown (0.5), but the structured
+        // keyword inference alone would land Unclassified (0.5), but the structured
         // oracle id classifies it Operability.
         let mut sig = signals(
             "someSig",
@@ -530,16 +469,17 @@ mod tests {
         );
         sig.oracle = Some("security");
         assert_eq!(impact_score(&sig, NOW).severity, Severity::Operability);
-        // An unrecognized oracle id falls back to keyword inference (here Unknown).
+        // An unrecognized oracle id remains unclassified; taxonomy drift cannot
+        // manufacture a confirmed bug from presentation prose.
         sig.oracle = Some("brand-new-oracle");
-        assert_eq!(impact_score(&sig, NOW).severity, Severity::Unknown);
+        assert_eq!(impact_score(&sig, NOW).severity, Severity::Unclassified);
     }
 
     // CROSS-REPO DRIFT GUARD (P0). tests/golden/fixtures/oracle-registry.json is a
     // pinned copy of reproit-cli's canonical oracle contract. The cloud MUST map
     // every id in it (via KNOWN_ORACLES) or CI fails HERE until the new id + its
     // Severity are added. A newer CLI never breaks ingestion (severity_for_oracle
-    // degrades to Unknown -> keyword fallback); this test is the alarm to add
+    // degrades safely to Unclassified); this test is the alarm to add
     // first-class handling. Mirrors the fixture-spec drift test in cohorts.rs.
     #[test]
     fn known_oracles_cover_the_cli_registry() {
@@ -620,17 +560,16 @@ mod tests {
 
         // A STALE jank: low severity, last seen a week ago, no recent hits.
         let stale = tl(&[("2026-06-14T06:00:00Z", 5), ("2026-06-14T07:00:00Z", 4)]);
-        let stale_jank = impact_score(
-            &signals(
-                "layoutJank",
-                "visible frame jank",
-                9,
-                &stale,
-                Some("2026-06-14T07:00:00Z"),
-                Actionability::default(),
-            ),
-            NOW,
+        let mut stale_jank_signals = signals(
+            "layoutJank",
+            "visible frame jank",
+            9,
+            &stale,
+            Some("2026-06-14T07:00:00Z"),
+            Actionability::default(),
         );
+        stale_jank_signals.oracle = Some("jank");
+        let stale_jank = impact_score(&stale_jank_signals, NOW);
 
         assert!(
             spiking_crash.score > stable_crash.score,
@@ -676,20 +615,19 @@ mod tests {
         // regression boost is set above the sum of every weighted factor, so any
         // regression is the dominant actionability signal.
         let small_jank = tl(&[("2026-06-21T11:00:00Z", 2)]);
-        let regressed_jank = impact_score(
-            &signals(
-                "layoutJank",
-                "visible frame jank",
-                3,
-                &small_jank,
-                Some("2026-06-21T11:30:00Z"),
-                Actionability {
-                    is_new: false,
-                    is_regressed: true,
-                },
-            ),
-            NOW,
+        let mut regressed_jank_signals = signals(
+            "layoutJank",
+            "visible frame jank",
+            3,
+            &small_jank,
+            Some("2026-06-21T11:30:00Z"),
+            Actionability {
+                is_new: false,
+                is_regressed: true,
+            },
         );
+        regressed_jank_signals.oracle = Some("jank");
+        let regressed_jank = impact_score(&regressed_jank_signals, NOW);
         let big_stable_crash = worst_active_crash;
 
         assert!(

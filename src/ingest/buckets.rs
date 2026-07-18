@@ -61,6 +61,17 @@ pub fn finding_identity(rec: &ErrorRec) -> Option<FindingIdentity> {
         .and_then(|value| serde_json::from_value(value).ok())
 }
 
+/// A tester capture is an explicit human signal, not an automatically fired
+/// oracle. It remains outside the confirmed-bug feed until a clean local replay
+/// reaches the captured structural state and reports `reproduced`.
+pub fn is_tester_capture(rec: &ErrorRec) -> bool {
+    rec.context.get("oracle").and_then(Value::as_str) == Some("tester-capture")
+}
+
+pub fn tester_capture_confirmed(results: &[ReplayResult]) -> bool {
+    results.iter().any(|result| result.status == "reproduced")
+}
+
 /// Stable bucket id for an error: a hash of its root-cause features, NOT its
 /// position. We hash the normalized message (volatile specifics removed), the
 /// crash-state signature, and the entry-state signature, so two occurrences of
@@ -70,10 +81,10 @@ pub fn bucket_id(rec: &ErrorRec) -> String {
         let bug = structural_bug_id(&identity);
         return format!("bkt_{}", bug.trim_start_matches("bug_"));
     }
-    legacy_bucket_id(rec)
+    derived_bucket_id(rec)
 }
 
-fn legacy_bucket_id(rec: &ErrorRec) -> String {
+fn derived_bucket_id(rec: &ErrorRec) -> String {
     use sha2::{Digest, Sha256};
     let start_sig = rec.path.first().map(|s| s.sig.as_str()).unwrap_or("");
     let crash_sig = rec.sig.as_str();
@@ -88,13 +99,12 @@ fn legacy_bucket_id(rec: &ErrorRec) -> String {
     format!("bkt_{}", &hex[..12])
 }
 
-/// The shared defect id for API/UI correlation. Older SDKs without a structured
-/// identity retain the exact historical bucket digest, just under the `bug_`
-/// namespace, so every production bucket still exposes one coherent identity.
+/// The shared defect id for API/UI correlation. Findings without a structural
+/// identity use the same deterministic derived digest as their bucket id.
 pub fn bug_id(rec: &ErrorRec) -> String {
     finding_identity(rec)
         .map(|identity| structural_bug_id(&identity))
-        .unwrap_or_else(|| legacy_bucket_id(rec).replacen("bkt_", "bug_", 1))
+        .unwrap_or_else(|| derived_bucket_id(rec).replacen("bkt_", "bug_", 1))
 }
 
 /// The normalized (digit/whitespace-collapsed) message for a bucket. PII-safe:
@@ -566,7 +576,7 @@ mod tests {
     }
 
     #[test]
-    fn replay_actions_keep_pii_safe_typed_steps_for_data_dependent_repro() {
+    fn replay_actions_keep_pii_safe_typed_steps_for_non_reproduction() {
         // A data-dependent failure: the crash needs an RTL value typed into a
         // field. The typed step carries a property CLASS token (`rtl`), not the
         // user's text, so it must survive into the replay package -- otherwise the
@@ -693,7 +703,7 @@ mod tests {
                 created_at: "t2".into(),
             },
             ReplayResult {
-                status: "clean".into(),
+                status: "not_reproduced".into(),
                 runs: 3,
                 failures: 0,
                 local_repro_id: None,
@@ -706,5 +716,29 @@ mod tests {
         assert_eq!(s["reproduced"], 1);
         assert_eq!(s["rate"], json!(0.5));
         assert_eq!(s["localReproId"], "abc123");
+    }
+
+    #[test]
+    fn tester_capture_requires_a_reproduced_replay() {
+        let mut capture = rec("Tester observed a bug in this state", "broken", "home", &[]);
+        capture
+            .context
+            .insert("oracle".into(), json!("tester-capture"));
+        assert!(is_tester_capture(&capture));
+        assert!(!tester_capture_confirmed(&[]));
+        assert!(!tester_capture_confirmed(&[ReplayResult {
+            status: "not_reproduced".into(),
+            runs: 2,
+            failures: 0,
+            local_repro_id: None,
+            created_at: "t".into(),
+        }]));
+        assert!(tester_capture_confirmed(&[ReplayResult {
+            status: "reproduced".into(),
+            runs: 2,
+            failures: 2,
+            local_repro_id: Some("rep_x".into()),
+            created_at: "t".into(),
+        }]));
     }
 }

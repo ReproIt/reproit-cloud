@@ -289,13 +289,13 @@ fn env_key(app_id: &str) -> String {
 /// is verified fixed (and so its ticket should be commented + closed)?
 ///
 /// The verified-fix signal is a result whose verdict says the bug no longer
-/// reproduces: multiple `clean` runs (actual replays that did NOT crash) with
-/// zero failures. We deliberately do NOT treat `data_dependent`,
-/// `stale`, or `flaky` as fixed (those are "couldn't pin it down", not "gone"),
-/// and a `clean` with `runs == 0` is a non-result, not a verification. Kept a
+/// reproduces: multiple `not_reproduced` runs (actual replays that did NOT crash) with
+/// zero failures. We deliberately do NOT treat `stale` or `flaky` as fixed
+/// (those are "couldn't pin it down", not "gone"),
+/// and a result with `runs == 0` is a non-result, not a verification. Kept a
 /// free function over primitives so it's unit-testable with no DB/HTTP.
 pub fn is_verified_fix(status: &str, runs: i32, failures: i32) -> bool {
-    status == "clean" && runs >= 3 && failures == 0
+    status == "not_reproduced" && runs >= 3 && failures == 0
 }
 
 /// PII-safe title + body for the issue filed when a bucket forms. The body
@@ -726,19 +726,18 @@ mod tests {
     }
 
     #[test]
-    fn verified_fix_only_on_clean_run_with_no_failures() {
+    fn verified_fix_only_on_not_reproduced_run_with_no_failures() {
         // The fix signal: repeated clean replays, zero failures.
-        assert!(is_verified_fix("clean", 5, 0));
-        assert!(is_verified_fix("clean", 3, 0));
-        assert!(!is_verified_fix("clean", 1, 0));
-        assert!(!is_verified_fix("clean", 2, 0));
+        assert!(is_verified_fix("not_reproduced", 5, 0));
+        assert!(is_verified_fix("not_reproduced", 3, 0));
+        assert!(!is_verified_fix("not_reproduced", 1, 0));
+        assert!(!is_verified_fix("not_reproduced", 2, 0));
         // Still reproducing: not fixed.
         assert!(!is_verified_fix("reproduced", 5, 5));
-        assert!(!is_verified_fix("clean", 5, 1));
+        assert!(!is_verified_fix("not_reproduced", 5, 1));
         // A clean verdict with no runs is a non-result, not a verification.
-        assert!(!is_verified_fix("clean", 0, 0));
+        assert!(!is_verified_fix("not_reproduced", 0, 0));
         // "Couldn't pin it down" verdicts are NOT a verified fix.
-        assert!(!is_verified_fix("data_dependent", 5, 0));
         assert!(!is_verified_fix("stale", 5, 0));
         assert!(!is_verified_fix("flaky", 5, 0));
     }

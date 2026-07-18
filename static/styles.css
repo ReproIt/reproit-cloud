@@ -91,6 +91,10 @@ nav a:hover{color:var(--ink)}
 #t-list-body{display:flex;flex-direction:column;flex:1;min-height:0}
 .list-scroll{overflow:auto;flex:1;min-height:0}
 .list-scroll[role="listbox"]:focus-visible{outline:2px solid var(--focus);outline-offset:-2px}
+.pending-captures{margin:14px;padding:14px;border:1px solid var(--line2);border-radius:10px;background:var(--panel)}
+.pending-title{color:var(--ink);font-weight:600;margin-bottom:6px}
+.pending-capture{display:flex;justify-content:space-between;gap:12px;padding-top:10px;color:var(--dim);font-size:11px}
+.pending-capture code{color:var(--green);overflow-wrap:anywhere}
 .item{padding:13px 16px;border-bottom:1px solid var(--line);cursor:pointer;border-left:2px solid transparent;outline:none}
 .item:hover{background:var(--panel)}
 .item.sel{background:var(--panel);border-left-color:var(--green)}
@@ -442,7 +446,7 @@ kbd{background:var(--panel2);border:1px solid var(--line);border-bottom-width:2p
 .sev-leak{background:rgba(245,181,61,.13);color:var(--amber);border-color:rgba(245,181,61,.3)}
 .sev-operability{background:rgba(122,162,247,.13);color:#9bb4ff;border-color:rgba(122,162,247,.3)}
 .sev-jank{background:rgba(154,167,181,.12);color:var(--blue);border-color:rgba(154,167,181,.25)}
-.sev-unknown{background:rgba(154,167,181,.08);color:var(--dim);border-color:var(--line)}
+.sev-unclassified{background:rgba(154,167,181,.08);color:var(--dim);border-color:var(--line)}
 
 /* prod-truth resolution chip (active/resolving/resolved/regressed) */
 .rstatus{display:inline-flex;align-items:center;gap:4px;padding:2px 9px;border-radius:999px;font-size:10.5px;font-weight:600;letter-spacing:.02em;text-transform:lowercase;border:1px solid transparent;white-space:nowrap}

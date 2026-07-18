@@ -61,6 +61,7 @@
   const T = {
     // bug list (impact-sorted by the API; carries impact + resolution per item)
     buckets: null,        // [{bucketId, count, message, crashSig, repro, lineage, impact, resolution, ...}]
+    pendingCaptures: [],  // tester reports waiting for a clean replay
     triageByBucket: {},   // bucketId -> {status, updatedAt}
     listStatus: "idle",   // idle | loading | ready | error | noproject | needkey | unauth | noseat
     listErr: null,
@@ -149,7 +150,7 @@
   // src/ingest/impact.rs `Severity::as_str`, so the chip names the same class the
   // ranking used.
   function severityChip(sev) {
-    const s = sev || "unknown";
+    const s = sev || "unclassified";
     return `<span class="sev sev-${esc(s)}" title="oracle class: ${esc(s)}">${esc(s)}</span>`;
   }
 
@@ -175,7 +176,7 @@
     const count = (why.blast && why.blast.count) != null ? why.blast.count : b.count;
     if (count != null) parts.push("~" + count + " hit" + (count === 1 ? "" : "s"));
     const sev = b.impact && b.impact.severity;
-    if (sev && sev !== "unknown") parts.push(sev);
+    if (sev && sev !== "unclassified") parts.push(sev);
     return parts.join(" · ");
   }
 
@@ -296,24 +297,25 @@
   }
 
   // ---- bug list: data -------------------------------------------------------
-  function bucketListFingerprint(list) {
-    return JSON.stringify((list || []).map((b) => [
+  function bucketListFingerprint(list, pending) {
+    return JSON.stringify({ items: (list || []).map((b) => [
       b.bucketId,
       b.count,
       b.message,
       bucketResolution(b),
       b.triage && b.triage.status,
       b.repro && b.repro.status,
-    ]));
+    ]), pending: (pending || []).map((b) => [b.bucketId, b.count, b.repro && b.repro.status]) });
   }
 
   async function loadBuckets(opts) {
     const quiet = opts && opts.quiet;
-    const before = bucketListFingerprint(T.buckets || []);
+    const before = bucketListFingerprint(T.buckets || [], T.pendingCaptures);
     T.listErr = null;
     const c = cfg();
     if (!c.app) {
       T.buckets = [];
+      T.pendingCaptures = [];
       T.triageByBucket = {};
       T.selBucket = null;
       T.listStatus = "noproject";
@@ -356,11 +358,12 @@
     }
     const nextBuckets = (r.data && r.data.items) || [];
     T.buckets = nextBuckets;
+    T.pendingCaptures = (r.data && r.data.pendingCaptures) || [];
     T.triageByBucket = {};
     T.buckets.forEach((b) => { if (b.triage) T.triageByBucket[b.bucketId] = b.triage; });
     T.listStatus = "ready";
     setBugCountConn();
-    const after = bucketListFingerprint(T.buckets || []);
+    const after = bucketListFingerprint(T.buckets || [], T.pendingCaptures);
     const wanted = new URLSearchParams(location.search).get("bucket");
     const hasBucket = (id) => !!id && T.buckets.some((b) => b.bucketId === id);
     if (wanted && hasBucket(wanted)) {
@@ -732,6 +735,7 @@
 
   function renderReadyListBodyHTML() {
     const list = filteredBuckets();
+    const pending = T.pendingCaptures || [];
     let rows;
     if (!list.length) {
       const hasBuckets = (T.buckets || []).length;
@@ -741,6 +745,15 @@
           <div class="big">No matches</div>
           <div class="sub">No buckets match this status filter.</div>
         </div></div>`;
+      } else if (pending.length) {
+        rows = `<div class="pending-captures">
+          <div class="pending-title">Verifying ${pending.length} tester capture${pending.length === 1 ? "" : "s"}</div>
+          <div class="muted">These are reports, not confirmed bugs yet. A clean replay must reach the captured structural state.</div>
+          ${pending.map((b) => `<div class="pending-capture">
+            <code>${esc(b.bucketId)}</code>
+            <span>${esc((b.replay && b.replay.status) || "waiting for replay")}</span>
+          </div>`).join("")}
+        </div>`;
       } else {
         // First-run: this is the primary place a new user lands. If the project
         // key is in this browser, offer the wired demo so they can watch a real
@@ -796,9 +809,15 @@
         </div>`;
       }).join("");
     }
+    const pendingNotice = (T.buckets || []).length && pending.length
+      ? `<div class="pending-captures">
+          <div class="pending-title">Verifying ${pending.length} tester capture${pending.length === 1 ? "" : "s"}</div>
+          <div class="muted">They stay outside the confirmed bug feed until a clean replay reaches the captured structural state.</div>
+        </div>`
+      : "";
     return `
       ${renderActivityStrip()}
-      <div class="list-scroll" id="t-list" role="listbox" aria-label="Bugs">${rows}</div>
+      <div class="list-scroll" id="t-list" role="listbox" aria-label="Bugs">${pendingNotice}${rows}</div>
       <div class="list-foot">${list.length} bug${list.length === 1 ? "" : "s"}</div>`;
   }
 
