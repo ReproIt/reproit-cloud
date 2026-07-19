@@ -83,8 +83,9 @@ fn clipped(s: &str, max: usize) -> String {
     s[..end].to_string()
 }
 
-/// Default aggregate evidence cap per app. This is a product guardrail against
-/// one tenant/API key filling shared object storage; self-host can set
+/// Default aggregate evidence cap per app, including human original captures.
+/// This is a product guardrail against one tenant/API key filling shared object
+/// storage; self-host can set
 /// REPROIT_MAX_EVIDENCE_BYTES_PER_APP=0 to disable it.
 const DEFAULT_MAX_EVIDENCE_BYTES_PER_APP: i64 = 10 * 1024 * 1024 * 1024;
 
@@ -117,7 +118,7 @@ pub(crate) fn baseline_sample() -> i64 {
         .unwrap_or(20_000)
 }
 
-fn max_evidence_bytes_per_app() -> Option<i64> {
+pub(crate) fn max_evidence_bytes_per_app() -> Option<i64> {
     std::env::var("REPROIT_MAX_EVIDENCE_BYTES_PER_APP")
         .ok()
         .and_then(|v| v.parse::<i64>().ok())

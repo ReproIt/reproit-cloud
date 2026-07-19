@@ -135,6 +135,40 @@ CREATE TABLE IF NOT EXISTS projects (
 );
 CREATE INDEX IF NOT EXISTS projects_app ON projects(app_id);
 
+-- ---- human-authored original captures -----------------------------------------
+-- A capture is a report, not a confirmed bug. Its immutable local id remains the
+-- primary key through browser review, upload, and later derived reproductions.
+CREATE TABLE IF NOT EXISTS captures (
+  id                TEXT PRIMARY KEY,
+  review_token_hash TEXT UNIQUE NOT NULL,
+  created_by        BIGINT,
+  app_id            TEXT REFERENCES projects(app_id) ON DELETE CASCADE,
+  status            TEXT NOT NULL DEFAULT 'pending_review',
+  title             TEXT,
+  description       TEXT,
+  severity          TEXT NOT NULL DEFAULT 'normal',
+  visibility        TEXT NOT NULL DEFAULT 'project',
+  platform          TEXT NOT NULL,
+  target            TEXT NOT NULL,
+  source_created_at TEXT NOT NULL,
+  manifest          JSONB NOT NULL,
+  expires_at        TIMESTAMPTZ NOT NULL,
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at        TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS captures_app ON captures(app_id, created_at DESC);
+CREATE TABLE IF NOT EXISTS capture_files (
+  capture_id   TEXT NOT NULL REFERENCES captures(id) ON DELETE CASCADE,
+  filename     TEXT NOT NULL,
+  storage_key  TEXT NOT NULL,
+  bytes        BIGINT NOT NULL,
+  sha256       TEXT NOT NULL,
+  content_type TEXT NOT NULL,
+  uploaded     BOOLEAN NOT NULL DEFAULT false,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (capture_id, filename)
+);
+
 -- ---- triage + resolution state --------------------------------------------------
 -- `assignee` references a control-plane user id (plain BIGINT, no cross-db FK).
 -- Within-tenant assignment validity (assignee is a member of THIS org) is checked

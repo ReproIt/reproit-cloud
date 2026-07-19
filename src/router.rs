@@ -132,6 +132,13 @@ pub(crate) fn build(app: App) -> Router {
         // holds for one app as newline-delimited JSON (bucket triage metadata,
         // error rows within retention, evidence blob keys).
         .route("/v1/apps/:app/export", get(ingest::get_export))
+        .route("/v1/captures", post(captures::create))
+        .route("/v1/captures/:id", get(captures::status))
+        .route(
+            "/v1/captures/:id/files/:filename",
+            axum::routing::put(captures::put_file),
+        )
+        .route("/v1/captures/:id/complete", post(captures::complete))
         .route("/v1/blob/*key", get(ingest::get_blob))
         .layer(GovernorLayer { config: ingest_rl })
         .route_layer(middleware::from_fn_with_state(app.clone(), require_api_key));
@@ -202,6 +209,11 @@ pub(crate) fn build(app: App) -> Router {
         .route("/account/seats", post(auth::set_seat))
         .route("/account/scans", get(account_scans))
         .route("/account/scans/:id", get(account_scan_detail))
+        .route(
+            "/account/capture-uploads/:token",
+            get(captures::review).post(captures::approve),
+        )
+        .route("/account/captures/:id", get(captures::account_capture))
         // The per-seat triage/management surface (the dashboard, not the engine):
         // cookie-authenticated AND seat-gated inside the handlers (a member without
         // a seat gets 402; the free CLI never reaches these). Triage state on a
@@ -255,6 +267,14 @@ pub(crate) fn build(app: App) -> Router {
             get(|| async { Html(include_str!("../static/cli.html")) }),
         )
         .route(
+            "/capture-upload/:token",
+            get(|| async { Html(include_str!("../static/capture-upload.html")) }),
+        )
+        .route(
+            "/captures/:id",
+            get(|| async { Html(include_str!("../static/capture.html")) }),
+        )
+        .route(
             "/invite",
             get(|| async { Html(include_str!("../static/invite.html")) }),
         )
@@ -275,6 +295,24 @@ pub(crate) fn build(app: App) -> Router {
                 (
                     [(CONTENT_TYPE, "application/javascript; charset=utf-8")],
                     include_str!("../static/cli.js"),
+                )
+            }),
+        )
+        .route(
+            "/capture-upload.js",
+            get(|| async {
+                (
+                    [(CONTENT_TYPE, "application/javascript; charset=utf-8")],
+                    include_str!("../static/capture-upload.js"),
+                )
+            }),
+        )
+        .route(
+            "/capture.js",
+            get(|| async {
+                (
+                    [(CONTENT_TYPE, "application/javascript; charset=utf-8")],
+                    include_str!("../static/capture.js"),
                 )
             }),
         )

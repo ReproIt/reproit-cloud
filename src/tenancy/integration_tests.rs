@@ -157,6 +157,8 @@ async fn schema_apply_creates_tables_and_reapply_is_noop() {
             "replay_results",
             "bucket_tickets",
             "projects",
+            "captures",
+            "capture_files",
             "bucket_triage",
             "bucket_resolution_status",
             "bucket_resolution_events",
@@ -283,6 +285,86 @@ async fn full_path_org_to_provision_to_key_to_tenant_row() {
         anyhow::ensure!(
             edges == vec![("s1->s2".to_string(), 2)],
             "edge row should read back with count 2: {edges:?}"
+        );
+
+        // Human capture lifecycle: pending review, browser approval, immutable
+        // file ledger, completion, and project-owned deletion inventory.
+        let capture_manifest = serde_json::json!({
+            "schemaVersion": 1,
+            "id": "cap_0123456789abcdef",
+            "immutableOriginal": true,
+            "fileSha256": { "original.mov": "a".repeat(64) }
+        });
+        anyhow::ensure!(
+            tenant
+                .store
+                .create_capture(
+                    "cap_0123456789abcdef",
+                    "review-hash",
+                    Some(user_id),
+                    Some("acme-web"),
+                    "web",
+                    "https://example.test",
+                    "2026-07-18T00:00:00Z",
+                    &capture_manifest,
+                )
+                .await?,
+            "capture should be created"
+        );
+        anyhow::ensure!(
+            tenant
+                .store
+                .approve_capture(
+                    "review-hash",
+                    "acme-web",
+                    "Menu clips content",
+                    "Observed on checkout",
+                    "normal",
+                    "project",
+                )
+                .await?,
+            "capture should be approved"
+        );
+        anyhow::ensure!(
+            tenant
+                .store
+                .add_capture_file(
+                    "cap_0123456789abcdef",
+                    "original.mov",
+                    "captures/cap_0123456789abcdef/original.mov",
+                    42,
+                    &"a".repeat(64),
+                    "video/quicktime",
+                    Some(1024),
+                )
+                .await?
+                == Some(true),
+            "capture file should be recorded"
+        );
+        anyhow::ensure!(
+            tenant
+                .store
+                .mark_capture_file_uploaded("cap_0123456789abcdef", "original.mov")
+                .await?,
+            "capture file should become visible after blob persistence"
+        );
+        anyhow::ensure!(
+            tenant
+                .store
+                .complete_capture("cap_0123456789abcdef")
+                .await?,
+            "capture should complete"
+        );
+        let capture = tenant
+            .store
+            .capture("cap_0123456789abcdef")
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("capture should read back"))?;
+        anyhow::ensure!(capture.status == "complete", "capture status should persist");
+        let owned_keys = tenant.store.project_evidence_keys("acme-web").await?;
+        anyhow::ensure!(
+            owned_keys == vec!["captures/cap_0123456789abcdef/original.mov"],
+            "capture blob should belong to the project: {owned_keys:?}"
         );
 
         // Project deletion removes its tenant data and revokes only its keys.

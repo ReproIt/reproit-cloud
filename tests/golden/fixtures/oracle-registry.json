@@ -7,6 +7,7 @@
     "contract"
   ],
   "experimental_defaults_off": [
+    "accessibility-state",
     "choice-anomaly",
     "focus-loss",
     "security",
@@ -51,7 +52,8 @@
       "focus-loss",
       "blank-screen",
       "broken-asset",
-      "zoom-reflow"
+      "zoom-reflow",
+      "accessibility-state"
     ]
   },
   "authoritative_exact_replay": [
@@ -68,6 +70,7 @@
     "flicker",
     "divergence",
     "content-bug",
+    "accessibility-state",
     "detached-indicator",
     "hang",
     "occlusion",

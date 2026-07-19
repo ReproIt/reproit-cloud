@@ -143,6 +143,7 @@ pub const KNOWN_ORACLES: &[(&str, Severity)] = &[
     ("stuck-keyboard", Severity::Operability),
     ("duplicate-submit", Severity::Operability),
     ("focus-loss", Severity::Operability),
+    ("accessibility-state", Severity::Operability),
     ("blank-screen", Severity::Operability),
     ("zoom-reflow", Severity::Operability),
     ("security", Severity::Operability),

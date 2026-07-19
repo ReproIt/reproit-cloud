@@ -10,6 +10,7 @@
 mod auth;
 mod backend_contract;
 mod bootstrap;
+mod captures;
 mod db;
 mod http_security;
 mod ingest;
@@ -736,7 +737,7 @@ async fn get_job(
     }
 }
 
-async fn account_tenant(app: &App, headers: &HeaderMap) -> Result<Tenant, Response> {
+pub(crate) async fn account_tenant(app: &App, headers: &HeaderMap) -> Result<Tenant, Response> {
     let (_user, org) = auth::user_and_org(app, headers).await?;
     app.tenancy.resolve(org.id).await.map_err(|e| match e {
         ResolveError::NotProvisioned | ResolveError::NotActive(_) => {

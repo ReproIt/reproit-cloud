@@ -14,6 +14,7 @@ const EXPORT_PAGE: i64 = 1000;
 ///   3. error rows within the retention window, oldest first (`"kind":"error"`),
 ///   4. evidence blob KEYS (`"kind":"evidence"`; bytes stay in object storage,
 ///      fetch each via `GET /v1/blob/<key>`).
+///   5. human-authored original captures and their immutable file keys.
 ///
 /// The body is produced by a spawned task paging the tenant DB with keyset
 /// reads and writing lines into a bounded channel, so an export never
@@ -169,6 +170,31 @@ async fn export_stream(
         }
         if n < EXPORT_PAGE {
             break;
+        }
+    }
+
+    // 5. Human-authored originals and their object keys. Captures are reports,
+    //    not confirmed bugs, so they retain their own kind in the export.
+    let captures = match tenant.store.captures_for_app(&app_id).await {
+        Ok(captures) => captures,
+        Err(e) => return abort(&tx, &app_id, "capture read", e).await,
+    };
+    for capture in captures {
+        let files = match tenant.store.capture_files(&capture.id).await {
+            Ok(files) => files,
+            Err(e) => return abort(&tx, &app_id, "capture file read", e).await,
+        };
+        if !line(
+            &tx,
+            json!({
+                "kind": "capture",
+                "capture": capture,
+                "files": files,
+            }),
+        )
+        .await
+        {
+            return;
         }
     }
 }

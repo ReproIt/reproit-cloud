@@ -92,6 +92,14 @@ POST /v1/worker/shards/:id/result
 See [self-hosted architecture](docs/architecture/self-hosted.md) and
 [data handling](https://github.com/ReproIt/reproit/blob/main/docs/data-handling.md).
 
+## Original captures
+
+`reproit record --upload` creates a short-lived Cloud review session. The signed-in user chooses
+the destination project and report details in the browser, then the CLI streams the immutable
+manifest, video, and structural evidence. Cloud verifies the declared SHA-256 hashes before the
+capture becomes complete. Capture rows and blobs are tenant-scoped, project deletion removes their
+object keys, and portability exports include both capture metadata and immutable file keys.
+
 ## Validation
 
 ```bash

@@ -33,6 +33,13 @@ const PRESIGN_EXPIRY_SECS: u32 = 3600;
 #[allow(async_fn_in_trait)]
 pub trait BlobBackend: Send + Sync {
     async fn put(&self, scope: &str, key: &str, bytes: &[u8]) -> anyhow::Result<String>;
+    async fn put_path(
+        &self,
+        scope: &str,
+        key: &str,
+        path: &std::path::Path,
+        content_type: &str,
+    ) -> anyhow::Result<String>;
     async fn get(&self, scope: &str, key: &str) -> anyhow::Result<Vec<u8>>;
     /// A url a client can fetch `key` from: a cloud-proxied path (local) or a
     /// short-lived presigned GET (R2).
@@ -161,6 +168,17 @@ impl TenantBlobs {
             .await
     }
 
+    pub async fn put_path(
+        &self,
+        key: &str,
+        path: &std::path::Path,
+        content_type: &str,
+    ) -> anyhow::Result<String> {
+        self.backend
+            .put_path(&self.scope, &self.safe_scoped(key)?, path, content_type)
+            .await
+    }
+
     pub async fn get(&self, key: &str) -> anyhow::Result<Vec<u8>> {
         self.backend.get(&self.scope, &self.safe_scoped(key)?).await
     }
@@ -184,6 +202,19 @@ impl Backend {
             Backend::Local(b) => b.put(scope, key, bytes).await,
             #[cfg(feature = "r2")]
             Backend::R2(b) => b.put(scope, key, bytes).await,
+        }
+    }
+    async fn put_path(
+        &self,
+        scope: &str,
+        key: &str,
+        path: &std::path::Path,
+        content_type: &str,
+    ) -> anyhow::Result<String> {
+        match self {
+            Backend::Local(b) => b.put_path(scope, key, path, content_type).await,
+            #[cfg(feature = "r2")]
+            Backend::R2(b) => b.put_path(scope, key, path, content_type).await,
         }
     }
     async fn get(&self, scope: &str, key: &str) -> anyhow::Result<Vec<u8>> {
@@ -230,6 +261,20 @@ impl BlobBackend for LocalBackend {
             fs::create_dir_all(p).await?;
         }
         fs::write(&path, bytes).await?;
+        Ok(format!("file://{}", path.display()))
+    }
+    async fn put_path(
+        &self,
+        _scope: &str,
+        key: &str,
+        source: &std::path::Path,
+        _content_type: &str,
+    ) -> anyhow::Result<String> {
+        let path = self.root.join(safe_key(key));
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        fs::copy(source, &path).await?;
         Ok(format!("file://{}", path.display()))
     }
     async fn get(&self, _scope: &str, key: &str) -> anyhow::Result<Vec<u8>> {
@@ -321,6 +366,23 @@ impl R2Backend {
 impl BlobBackend for R2Backend {
     async fn put(&self, _scope: &str, key: &str, bytes: &[u8]) -> anyhow::Result<String> {
         self.bucket.put_object(format!("/{key}"), bytes).await?;
+        Ok(format!("r2://{key}"))
+    }
+    async fn put_path(
+        &self,
+        _scope: &str,
+        key: &str,
+        path: &std::path::Path,
+        content_type: &str,
+    ) -> anyhow::Result<String> {
+        let mut file = fs::File::open(path).await?;
+        self.bucket
+            .put_object_stream_with_content_type(
+                &mut file,
+                format!("/{key}"),
+                content_type.to_string(),
+            )
+            .await?;
         Ok(format!("r2://{key}"))
     }
     async fn get(&self, _scope: &str, key: &str) -> anyhow::Result<Vec<u8>> {
