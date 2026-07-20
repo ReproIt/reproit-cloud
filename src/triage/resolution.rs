@@ -181,6 +181,31 @@ pub fn post_fix_traffic(app_stream: &[Occurrence], fixed_in_build: &str) -> u64 
         .count() as u64
 }
 
+/// Count accepted SDK batches on builds deployed at or after the candidate fix.
+pub fn post_fix_build_traffic(builds: &[(Occurrence, u64)], fixed_in_build: &str) -> u64 {
+    let first_seen = first_seen_by_build(
+        &builds
+            .iter()
+            .map(|(occurrence, _)| occurrence.clone())
+            .collect::<Vec<_>>(),
+    );
+    let Some(&fix_epoch) = first_seen.get(fixed_in_build) else {
+        return 0;
+    };
+    builds
+        .iter()
+        .filter_map(|(occurrence, count)| {
+            let build = occurrence.build.as_deref()?;
+            let epoch = parse_epoch(&occurrence.at)?;
+            let on_or_after = build == fixed_in_build
+                || first_seen
+                    .get(build)
+                    .is_some_and(|&first| first >= fix_epoch);
+            (on_or_after && epoch >= fix_epoch).then_some(*count)
+        })
+        .sum()
+}
+
 /// PURE prod-truth decision. Inputs:
 ///   - `bug` : the BUG's own occurrences (this bucket's stream), each `(at, build)`.
 ///   - `fix_first_seen` : map of build -> first-seen epoch from the APP-WIDE

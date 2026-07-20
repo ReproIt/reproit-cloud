@@ -47,6 +47,8 @@ ALTER TABLE shards ADD COLUMN IF NOT EXISTS claimed_at   TIMESTAMPTZ;
 ALTER TABLE shards ADD COLUMN IF NOT EXISTS heartbeat_at TIMESTAMPTZ;
 ALTER TABLE shards ADD COLUMN IF NOT EXISTS attempts     INT NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS shards_pending ON shards(state, backend);
+CREATE INDEX IF NOT EXISTS shards_claimable
+  ON shards(backend, job_id, seed) WHERE state='pending';
 -- The requeue-stranded sweep filters state='running' by heartbeat age; this
 -- partial index matches that predicate exactly.
 CREATE INDEX IF NOT EXISTS shards_running_heartbeat
@@ -77,6 +79,16 @@ CREATE INDEX IF NOT EXISTS errors_app ON errors(app_id, id);
 CREATE INDEX IF NOT EXISTS errors_bucket ON errors(app_id, bucket_id, id);
 -- Retention pruning deletes errors by age.
 CREATE INDEX IF NOT EXISTS errors_created ON errors(created_at);
+CREATE TABLE IF NOT EXISTS build_traffic (
+  app_id     TEXT        NOT NULL,
+  build      TEXT        NOT NULL,
+  count      BIGINT      NOT NULL DEFAULT 0,
+  first_seen TIMESTAMPTZ NOT NULL DEFAULT now(),
+  last_seen  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (app_id, build)
+);
+CREATE INDEX IF NOT EXISTS build_traffic_app_first
+  ON build_traffic(app_id, first_seen);
 CREATE TABLE IF NOT EXISTS evidence (
   id          BIGSERIAL PRIMARY KEY,
   app_id      TEXT  NOT NULL,
@@ -87,6 +99,7 @@ CREATE TABLE IF NOT EXISTS evidence (
   created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS evidence_error ON evidence(error_id, id);
+CREATE INDEX IF NOT EXISTS evidence_app_id ON evidence(app_id, id) INCLUDE (bytes);
 
 -- Immutable evidence graphs. Node ids are hashes of kind, parents, and payload;
 -- roots attach a validated graph to a run without copying node content.
@@ -120,6 +133,7 @@ CREATE TABLE IF NOT EXISTS processed_batches (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY (app_id, batch_id)
 );
+CREATE INDEX IF NOT EXISTS processed_batches_created_at ON processed_batches(created_at);
 
 -- ---- reproduction attempts + external ticket links ----------------------------
 CREATE TABLE IF NOT EXISTS replay_results (

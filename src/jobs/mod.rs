@@ -77,6 +77,27 @@ pub struct JobSpec {
     pub backend: String,
 }
 
+pub const MAX_JOB_SEEDS: u32 = 1_024;
+pub const MAX_JOB_BUDGET: u32 = 10_000;
+
+impl JobSpec {
+    pub fn validate(&self) -> Result<(), String> {
+        if !(1..=MAX_JOB_SEEDS).contains(&self.seeds) {
+            return Err(format!("seeds must be between 1 and {MAX_JOB_SEEDS}"));
+        }
+        if !(1..=MAX_JOB_BUDGET).contains(&self.budget) {
+            return Err(format!("budget must be between 1 and {MAX_JOB_BUDGET}"));
+        }
+        if !matches!(self.backend.as_str(), "web" | "android" | "ios") {
+            return Err("backend must be one of: web, android, ios".into());
+        }
+        if self.mode != "fuzz" {
+            return Err("mode must be fuzz".into());
+        }
+        Ok(())
+    }
+}
+
 fn default_mode() -> String {
     "fuzz".into()
 }

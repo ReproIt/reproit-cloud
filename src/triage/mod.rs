@@ -229,19 +229,36 @@ async fn compute_resolution(
     bucket: &str,
     fixed_in_build: Option<&str>,
 ) -> resolution::Outcome {
-    // App-wide stream (bounded recency sample): drives first-seen build
-    // ordering + the post-fix traffic denominator across ALL buckets.
-    let app_occ = store
-        .recent_errors_with_meta(app_id, crate::ingest::baseline_sample())
-        .await
-        .unwrap_or_default();
-    let app_stream: Vec<resolution::Occurrence> = app_occ
+    let traffic_rows = store.build_traffic(app_id).await.unwrap_or_default();
+    let weighted_traffic: Vec<(resolution::Occurrence, u64)> = traffic_rows
         .iter()
-        .map(|(_, at, rec)| resolution::Occurrence {
-            at: at.clone(),
-            build: buckets::build_version(rec),
+        .map(|(build, count, at)| {
+            (
+                resolution::Occurrence {
+                    at: at.clone(),
+                    build: Some(build.clone()),
+                },
+                *count,
+            )
         })
         .collect();
+    let app_stream: Vec<resolution::Occurrence> = if weighted_traffic.is_empty() {
+        store
+            .recent_errors_with_meta(app_id, crate::ingest::baseline_sample())
+            .await
+            .unwrap_or_default()
+            .iter()
+            .map(|(_, at, record)| resolution::Occurrence {
+                at: at.clone(),
+                build: buckets::build_version(record),
+            })
+            .collect()
+    } else {
+        weighted_traffic
+            .iter()
+            .map(|(occurrence, _)| occurrence.clone())
+            .collect()
+    };
     // This bucket's own occurrences (the recurrence signal), via the
     // materialized bucket_id index.
     let bug: Vec<resolution::Occurrence> = store
@@ -256,7 +273,13 @@ async fn compute_resolution(
         .collect();
     let first_seen = resolution::first_seen_by_build(&app_stream);
     let traffic = fixed_in_build
-        .map(|f| resolution::post_fix_traffic(&app_stream, f))
+        .map(|f| {
+            if weighted_traffic.is_empty() {
+                resolution::post_fix_traffic(&app_stream, f)
+            } else {
+                resolution::post_fix_build_traffic(&weighted_traffic, f)
+            }
+        })
         .unwrap_or(0);
     let now = chrono::Utc::now().to_rfc3339();
     resolution::evaluate(

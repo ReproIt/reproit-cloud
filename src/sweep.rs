@@ -315,16 +315,35 @@ async fn compute_for_bucket(
     fixed_in_build: &str,
     now: &str,
 ) -> anyhow::Result<resolution::Outcome> {
-    let app_occ = store
-        .recent_errors_with_meta(app_id, crate::ingest::baseline_sample())
-        .await?;
-    let app_stream: Vec<resolution::Occurrence> = app_occ
+    let traffic_rows = store.build_traffic(app_id).await?;
+    let weighted_traffic: Vec<(resolution::Occurrence, u64)> = traffic_rows
         .iter()
-        .map(|(_, at, rec)| resolution::Occurrence {
-            at: at.clone(),
-            build: buckets::build_version(rec),
+        .map(|(build, count, at)| {
+            (
+                resolution::Occurrence {
+                    at: at.clone(),
+                    build: Some(build.clone()),
+                },
+                *count,
+            )
         })
         .collect();
+    let app_stream: Vec<resolution::Occurrence> = if weighted_traffic.is_empty() {
+        store
+            .recent_errors_with_meta(app_id, crate::ingest::baseline_sample())
+            .await?
+            .iter()
+            .map(|(_, at, record)| resolution::Occurrence {
+                at: at.clone(),
+                build: buckets::build_version(record),
+            })
+            .collect()
+    } else {
+        weighted_traffic
+            .iter()
+            .map(|(occurrence, _)| occurrence.clone())
+            .collect()
+    };
     let bug: Vec<resolution::Occurrence> = store
         .errors_for_bucket(app_id, bucket, crate::ingest::baseline_sample())
         .await?
@@ -335,7 +354,11 @@ async fn compute_for_bucket(
         })
         .collect();
     let first_seen = resolution::first_seen_by_build(&app_stream);
-    let traffic = resolution::post_fix_traffic(&app_stream, fixed_in_build);
+    let traffic = if weighted_traffic.is_empty() {
+        resolution::post_fix_traffic(&app_stream, fixed_in_build)
+    } else {
+        resolution::post_fix_build_traffic(&weighted_traffic, fixed_in_build)
+    };
     Ok(resolution::evaluate(
         &bug,
         &first_seen,

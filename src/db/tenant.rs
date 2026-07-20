@@ -21,6 +21,8 @@ use sqlx::types::Json;
 use sqlx::{PgPool, Row};
 use std::sync::Arc;
 
+mod traffic;
+
 /// A connection handle bound to one tenant's database. Clone is cheap (shares the
 /// underlying pool). Handlers receive this, never a global store.
 #[derive(Clone)]
@@ -792,41 +794,6 @@ impl TenantStore {
 
     // ---- telemetry: edges / errors / evidence ------------------------------
 
-    /// Single-row edge upsert. Retained for the tenancy integration tests and as
-    /// a one-off helper; the hot ingest path uses the batched `ingest_batch`.
-    #[allow(dead_code)]
-    pub async fn incr_edge(&self, app_id: &str, key: &str) -> anyhow::Result<()> {
-        sqlx::query(
-            "INSERT INTO edges (app_id, edge_key, count) VALUES ($1,$2,1)
-             ON CONFLICT (app_id, edge_key) DO UPDATE SET count = edges.count + 1",
-        )
-        .bind(app_id)
-        .bind(key)
-        .execute(self.pool.as_ref())
-        .await?;
-        Ok(())
-    }
-
-    /// Single-row error insert. Retained for the tenancy integration tests and as
-    /// a one-off helper; the hot ingest path uses the batched `ingest_batch`.
-    #[allow(dead_code)]
-    pub async fn add_error(&self, app_id: &str, rec: &ErrorRec) -> anyhow::Result<()> {
-        let bucket_id = crate::ingest::buckets::bucket_id(rec);
-        sqlx::query(
-            "INSERT INTO errors (app_id, sig, message, path, context, bucket_id)
-             VALUES ($1,$2,$3,$4,$5,$6)",
-        )
-        .bind(app_id)
-        .bind(&rec.sig)
-        .bind(&rec.message)
-        .bind(Json(&rec.path))
-        .bind(Json(&rec.context))
-        .bind(bucket_id)
-        .execute(self.pool.as_ref())
-        .await?;
-        Ok(())
-    }
-
     /// Ingest a whole event batch ATOMICALLY in one transaction and a constant
     /// number of round-trips, instead of one auto-commit statement per event.
     ///
@@ -850,6 +817,7 @@ impl TenantStore {
         errors: &[ErrorRec],
         evidence: &[reproit_protocol::EvidenceGraph],
         batch_id: &str,
+        deployment: Option<&str>,
     ) -> anyhow::Result<bool> {
         if edges.is_empty() && errors.is_empty() && evidence.is_empty() {
             return Ok(false);
@@ -867,6 +835,18 @@ impl TenantStore {
         if r.rows_affected() == 0 {
             tx.rollback().await?;
             return Ok(true);
+        }
+
+        if let Some(build) = deployment {
+            sqlx::query(
+                "INSERT INTO build_traffic (app_id, build, count) VALUES ($1,$2,1)
+                 ON CONFLICT (app_id, build) DO UPDATE SET
+                   count=build_traffic.count + 1, last_seen=now()",
+            )
+            .bind(app_id)
+            .bind(build)
+            .execute(&mut *tx)
+            .await?;
         }
 
         if !edges.is_empty() {
@@ -1442,17 +1422,16 @@ impl TenantStore {
         .bind(&job.started_at)
         .execute(&mut *tx)
         .await?;
-        for s in &job.shards {
-            sqlx::query(
-                "INSERT INTO shards (job_id, seed, state, backend, duration_s) VALUES ($1,$2,$3,$4,0)",
-            )
-            .bind(&job.id)
-            .bind(s.seed as i32)
-            .bind(s.state.as_str())
-            .bind(&job.backend)
-            .execute(&mut *tx)
-            .await?;
-        }
+        let seeds: Vec<i32> = job.shards.iter().map(|shard| shard.seed as i32).collect();
+        sqlx::query(
+            "INSERT INTO shards (job_id, seed, state, backend, duration_s)
+             SELECT $1, seed, 'pending', $2, 0 FROM UNNEST($3::INT[]) AS seed",
+        )
+        .bind(&job.id)
+        .bind(&job.backend)
+        .bind(&seeds)
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -1476,16 +1455,20 @@ impl TenantStore {
         capabilities: &[String],
     ) -> anyhow::Result<Option<ClaimedShard>> {
         let row = sqlx::query(
-            "UPDATE shards SET state='running', claimed_by=$1, claimed_at=now(),
+            "WITH claimed AS (
+               UPDATE shards SET state='running', claimed_by=$1, claimed_at=now(),
                     heartbeat_at=now(), attempts=attempts+1
-             WHERE (job_id, seed) IN (
+               WHERE (job_id, seed) IN (
                  SELECT s.job_id, s.seed FROM shards s
                  WHERE s.state='pending' AND s.backend = ANY($2)
                  ORDER BY s.job_id, s.seed
                  FOR UPDATE SKIP LOCKED
                  LIMIT 1
+               )
+               RETURNING job_id, seed, claimed_by, backend
              )
-             RETURNING job_id, seed, claimed_by, backend",
+             SELECT c.job_id, c.seed, c.claimed_by, c.backend, j.app_dir, j.budget
+             FROM claimed c JOIN jobs j ON j.id=c.job_id",
         )
         .bind(worker_id)
         .bind(capabilities)
@@ -1496,17 +1479,13 @@ impl TenantStore {
         let seed: i32 = row.get("seed");
         let claimed_by: String = row.get("claimed_by");
         let backend: String = row.get("backend");
-        let job = sqlx::query("SELECT app_dir, budget FROM jobs WHERE id=$1")
-            .bind(&job_id)
-            .fetch_one(self.pool.as_ref())
-            .await?;
         Ok(Some(ClaimedShard {
             job_id,
             seed: seed as u32,
             claimed_by,
             backend,
-            app_dir: job.get::<String, _>("app_dir"),
-            budget: job.get::<i32, _>("budget") as u32,
+            app_dir: row.get::<String, _>("app_dir"),
+            budget: row.get::<i32, _>("budget") as u32,
         }))
     }
 

@@ -663,6 +663,13 @@ async fn submit_job(
     if !app.allow_raw_jobs {
         return (StatusCode::NOT_FOUND, Json(not_found())).into_response();
     }
+    if let Err(msg) = spec.validate() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": msg })),
+        )
+            .into_response();
+    }
     // Confine the submitted app_dir to the allowed jobs root BEFORE doing any
     // work: a caller must not be able to point the worker at an arbitrary absolute
     // path (canonicalize + confine; rejects traversal, symlink escape, and

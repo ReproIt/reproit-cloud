@@ -33,6 +33,8 @@ pub struct EventBatch {
     pub version: u16,
     pub batch_id: String,
     pub app_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment: Option<DeploymentIdentity>,
     pub frames: Vec<EventFrame>,
     pub evidence: Vec<EvidenceGraph>,
 }
@@ -44,6 +46,9 @@ impl EventBatch {
         }
         validate_token(&self.batch_id)?;
         validate_token(&self.app_id)?;
+        if let Some(deployment) = &self.deployment {
+            deployment.validate()?;
+        }
         if self.frames.len() > MAX_BATCH_FRAMES {
             return Err(ProtocolError::new(ReasonCode::BatchTooLarge));
         }
@@ -65,6 +70,34 @@ impl EventBatch {
             graph.validate()?;
         }
         Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DeploymentIdentity {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+}
+
+impl DeploymentIdentity {
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.version.is_none() && self.commit.is_none() {
+            return Err(ProtocolError::new(ReasonCode::InvalidEvent));
+        }
+        if let Some(version) = &self.version {
+            validate_token(version)?;
+        }
+        if let Some(commit) = &self.commit {
+            validate_token(commit)?;
+        }
+        Ok(())
+    }
+
+    pub fn key(&self) -> Option<&str> {
+        self.commit.as_deref().or(self.version.as_deref())
     }
 }
 

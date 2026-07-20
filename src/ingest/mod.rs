@@ -396,6 +396,7 @@ pub async fn post_events(
             &error_recs,
             &batch.evidence,
             &batch.batch_id,
+            batch.deployment.as_ref().and_then(|value| value.key()),
         )
         .await
         .map_err(err500)?;
