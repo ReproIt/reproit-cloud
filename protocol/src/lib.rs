@@ -382,6 +382,194 @@ pub struct Evaluation {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
+pub enum AuthoritySource {
+    AuthoredContract,
+    RuntimeDiagnosis,
+    ApprovedBaseline,
+    PublishedStandard,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ConfirmationStatus {
+    NotAttempted,
+    Reproduced,
+    NotReproduced,
+    Flaky,
+    Stale,
+    CouldNotReplay,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MinimizationStatus {
+    NotAttempted,
+    Preserved,
+    CouldNotConfirm,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PromotionStatus {
+    Candidate,
+    Confirmed,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PromotionBlocker {
+    MissingAuthority,
+    NoViolation,
+    EvaluationAbstained,
+    ReplayNotReproduced,
+    ReplayIdentityMismatch,
+    MinimizationNotPreserved,
+}
+
+impl PromotionBlocker {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MissingAuthority => "missing-authority",
+            Self::NoViolation => "no-violation",
+            Self::EvaluationAbstained => "evaluation-abstained",
+            Self::ReplayNotReproduced => "replay-not-reproduced",
+            Self::ReplayIdentityMismatch => "replay-identity-mismatch",
+            Self::MinimizationNotPreserved => "minimization-not-preserved",
+        }
+    }
+}
+
+/// Immutable projection of the proof stages required to promote a candidate.
+/// Search and detector output cannot construct a confirmed ledger by itself.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProofLedger {
+    pub finding_identities: Vec<String>,
+    pub authority: Vec<AuthoritySource>,
+    pub evaluation: EvaluationStatus,
+    pub evaluation_reasons: Vec<ReasonCode>,
+    pub confirmation: ConfirmationStatus,
+    pub replay_identity_matched: bool,
+    pub minimization: MinimizationStatus,
+    pub promotion: PromotionStatus,
+    pub blockers: Vec<PromotionBlocker>,
+}
+
+impl ProofLedger {
+    pub fn from_stages(
+        mut finding_identities: Vec<String>,
+        mut authority: Vec<AuthoritySource>,
+        evaluation: EvaluationStatus,
+        mut evaluation_reasons: Vec<ReasonCode>,
+        confirmation: ConfirmationStatus,
+        replay_identity_matched: bool,
+        minimization: MinimizationStatus,
+    ) -> Result<Self, ProtocolError> {
+        finding_identities.sort();
+        finding_identities.dedup();
+        authority.sort();
+        authority.dedup();
+        evaluation_reasons.sort();
+        evaluation_reasons.dedup();
+        let (promotion, blockers) = Self::derive_promotion(
+            &authority,
+            evaluation,
+            confirmation,
+            replay_identity_matched,
+            minimization,
+        );
+        let ledger = Self {
+            finding_identities,
+            authority,
+            evaluation,
+            evaluation_reasons,
+            confirmation,
+            replay_identity_matched,
+            minimization,
+            promotion,
+            blockers,
+        };
+        ledger.validate()?;
+        Ok(ledger)
+    }
+
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if self.finding_identities.is_empty() || self.finding_identities.len() > 256 {
+            return Err(ProtocolError::new(ReasonCode::InvalidArtifact));
+        }
+        for identity in &self.finding_identities {
+            validate_text(identity, MAX_TEXT_BYTES)?;
+        }
+        if self.authority.len() > 8 || self.evaluation_reasons.len() > 256 {
+            return Err(ProtocolError::new(ReasonCode::InvalidArtifact));
+        }
+        if self.evaluation == EvaluationStatus::Abstain && self.evaluation_reasons.is_empty() {
+            return Err(ProtocolError::new(ReasonCode::InvalidArtifact));
+        }
+        if !is_strictly_sorted(&self.finding_identities)
+            || !is_strictly_sorted(&self.authority)
+            || !is_strictly_sorted(&self.evaluation_reasons)
+        {
+            return Err(ProtocolError::new(ReasonCode::InvalidArtifact));
+        }
+        let expected = Self::derive_promotion(
+            &self.authority,
+            self.evaluation,
+            self.confirmation,
+            self.replay_identity_matched,
+            self.minimization,
+        );
+        if self.promotion != expected.0 || self.blockers != expected.1 {
+            return Err(ProtocolError::new(ReasonCode::InvalidArtifact));
+        }
+        Ok(())
+    }
+
+    fn derive_promotion(
+        authority: &[AuthoritySource],
+        evaluation: EvaluationStatus,
+        confirmation: ConfirmationStatus,
+        replay_identity_matched: bool,
+        minimization: MinimizationStatus,
+    ) -> (PromotionStatus, Vec<PromotionBlocker>) {
+        let mut blockers = BTreeSet::new();
+        if authority.is_empty() {
+            blockers.insert(PromotionBlocker::MissingAuthority);
+        }
+        match evaluation {
+            EvaluationStatus::Violation => {}
+            EvaluationStatus::Satisfied => {
+                blockers.insert(PromotionBlocker::NoViolation);
+            }
+            EvaluationStatus::Abstain => {
+                blockers.insert(PromotionBlocker::EvaluationAbstained);
+            }
+        }
+        if confirmation != ConfirmationStatus::Reproduced {
+            blockers.insert(PromotionBlocker::ReplayNotReproduced);
+        }
+        if !replay_identity_matched {
+            blockers.insert(PromotionBlocker::ReplayIdentityMismatch);
+        }
+        if minimization != MinimizationStatus::Preserved {
+            blockers.insert(PromotionBlocker::MinimizationNotPreserved);
+        }
+        let blockers = blockers.into_iter().collect::<Vec<_>>();
+        let promotion = if blockers.is_empty() {
+            PromotionStatus::Confirmed
+        } else {
+            PromotionStatus::Candidate
+        };
+        (promotion, blockers)
+    }
+}
+
+fn is_strictly_sorted<T: Ord>(values: &[T]) -> bool {
+    values.windows(2).all(|pair| pair[0] < pair[1])
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum ReasonCode {
     FrameTooLarge,
     BatchTooLarge,
@@ -392,6 +580,7 @@ pub enum ReasonCode {
     InvalidEvent,
     IncompleteStream,
     NoObservations,
+    AuthorityUnavailable,
     InvalidArtifact,
 }
 
@@ -407,6 +596,7 @@ impl ReasonCode {
             Self::InvalidEvent => "invalid-event",
             Self::IncompleteStream => "incomplete-stream",
             Self::NoObservations => "no-observations",
+            Self::AuthorityUnavailable => "authority-unavailable",
             Self::InvalidArtifact => "invalid-artifact",
         }
     }
@@ -438,6 +628,7 @@ pub enum ArtifactKind {
     Evaluation,
     Replay,
     MinimizedTrace,
+    ProofLedger,
 }
 
 impl ArtifactKind {
@@ -448,6 +639,7 @@ impl ArtifactKind {
             Self::Evaluation => "evaluation",
             Self::Replay => "replay",
             Self::MinimizedTrace => "minimized-trace",
+            Self::ProofLedger => "proof-ledger",
         }
     }
 }
@@ -479,6 +671,11 @@ impl ArtifactNode {
     fn validate(&self) -> Result<(), ProtocolError> {
         if self.id != artifact_id(self.kind, &self.parents, &self.payload)? {
             return Err(ProtocolError::new(ReasonCode::InvalidArtifact));
+        }
+        if self.kind == ArtifactKind::ProofLedger {
+            let ledger: ProofLedger = serde_json::from_value(self.payload.clone())
+                .map_err(|_| ProtocolError::new(ReasonCode::InvalidArtifact))?;
+            ledger.validate()?;
         }
         Ok(())
     }
@@ -512,6 +709,19 @@ impl EvidenceGraph {
             return Err(ProtocolError::new(ReasonCode::InvalidArtifact));
         }
         Ok(())
+    }
+
+    pub fn proof_ledger(&self) -> Result<Option<ProofLedger>, ProtocolError> {
+        self.validate()?;
+        let Some(root) = self.nodes.iter().find(|node| node.id == self.root) else {
+            return Err(ProtocolError::new(ReasonCode::InvalidArtifact));
+        };
+        if root.kind != ArtifactKind::ProofLedger {
+            return Ok(None);
+        }
+        serde_json::from_value(root.payload.clone())
+            .map(Some)
+            .map_err(|_| ProtocolError::new(ReasonCode::InvalidArtifact))
     }
 }
 
@@ -669,54 +879,4 @@ fn validate_value(value: &Value, max_bytes: usize) -> Result<(), ProtocolError> 
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn action_frame() -> EventFrame {
-        EventFrame {
-            run_id: "run-1".into(),
-            sequence: 1,
-            scope: EvidenceScope::Shared,
-            event: Event::Action {
-                actor: Some("alice".into()),
-                action: "tap:key:send".into(),
-            },
-        }
-    }
-
-    #[test]
-    fn frame_round_trip_is_exact() {
-        let frame = action_frame();
-        let line = frame.encode_line().unwrap();
-        assert_eq!(decode_frame_line(&line).unwrap(), frame);
-    }
-
-    #[test]
-    fn oversized_scoped_frame_retains_only_bounded_attribution() {
-        let line = format!(
-            "REPROIT/1 contract 0123456789abcdef 7 run-1 {}",
-            "x".repeat(MAX_FRAME_BYTES)
-        );
-        let defect = decode_frame_line(&line).unwrap_err();
-        assert_eq!(defect.reason, ReasonCode::FrameTooLarge);
-        assert!(defect.scope.affects_contract("0123456789abcdef"));
-        assert!(!defect.scope.affects_contract("fedcba9876543210"));
-    }
-
-    #[test]
-    fn evidence_graph_rejects_forward_parent_references() {
-        let parent = ArtifactNode::new(ArtifactKind::RawCapture, vec![], Value::Null).unwrap();
-        let child = ArtifactNode::new(
-            ArtifactKind::NormalizedTrace,
-            vec![parent.id.clone()],
-            Value::Null,
-        )
-        .unwrap();
-        let graph = EvidenceGraph {
-            run_id: "run-1".into(),
-            root: child.id.clone(),
-            nodes: vec![child, parent],
-        };
-        assert!(graph.validate().is_err());
-    }
-}
+mod tests;

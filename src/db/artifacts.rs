@@ -1,8 +1,39 @@
 //! Atomic persistence for validated, content-addressed evidence graphs.
 
+use super::tenant::TenantStore;
 use reproit_protocol::EvidenceGraph;
 use serde_json::Value;
-use sqlx::{Postgres, Transaction};
+use sqlx::{Postgres, Row, Transaction};
+
+impl TenantStore {
+    pub async fn proof_ledger(
+        &self,
+        app_id: &str,
+        run_id: &str,
+    ) -> anyhow::Result<Option<(String, reproit_protocol::ProofLedger)>> {
+        let row = sqlx::query(
+            "SELECT roots.root_id, nodes.payload
+             FROM artifact_roots roots
+             JOIN artifact_nodes nodes
+               ON nodes.app_id = roots.app_id AND nodes.node_id = roots.root_id
+             WHERE roots.app_id = $1 AND roots.run_id = $2 AND nodes.kind = 'proof-ledger'
+             ORDER BY roots.created_at DESC, roots.root_id
+             LIMIT 1",
+        )
+        .bind(app_id)
+        .bind(run_id)
+        .fetch_optional(self.pool.as_ref())
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let root: String = row.try_get("root_id")?;
+        let payload: Value = row.try_get("payload")?;
+        let ledger: reproit_protocol::ProofLedger = serde_json::from_value(payload)?;
+        ledger.validate()?;
+        Ok(Some((root, ledger)))
+    }
+}
 
 pub(super) async fn store_graphs(
     transaction: &mut Transaction<'_, Postgres>,

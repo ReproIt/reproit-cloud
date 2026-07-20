@@ -502,6 +502,33 @@ pub async fn get_graph(
     ))
 }
 
+/// Return the independently validated immutable proof ledger for one run.
+pub async fn get_run_proof(
+    State(app): State<App>,
+    Extension(auth): Extension<crate::AuthCtx>,
+    headers: HeaderMap,
+    Path((app_id, run_id)): Path<(String, String)>,
+) -> ApiResult {
+    let tenant = tenant_for(&app, auth, &headers, &app_id).await?;
+    let Some((root, ledger)) = tenant
+        .store
+        .proof_ledger(&app_id, &run_id)
+        .await
+        .map_err(err500)?
+    else {
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "proof ledger not found" })),
+        ));
+    };
+    Ok(Json(json!({
+        "appId": app_id,
+        "runId": run_id,
+        "graphRoot": root,
+        "ledger": ledger,
+    })))
+}
+
 /// Default page size for the flat `/errors` list when the caller doesn't pass an
 /// explicit `limit`, and the ceiling we clamp any caller-supplied `limit` to, so
 /// this endpoint can never be asked to materialize an unbounded result set.

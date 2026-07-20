@@ -25,7 +25,7 @@ use std::sync::Arc;
 /// underlying pool). Handlers receive this, never a global store.
 #[derive(Clone)]
 pub struct TenantStore {
-    pool: Arc<PgPool>,
+    pub(super) pool: Arc<PgPool>,
 }
 
 /// A ticket link read back from a tenant DB (was `db::integrations::TicketLink`).

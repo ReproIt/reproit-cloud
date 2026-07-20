@@ -1,0 +1,37 @@
+[
+  {
+    "name": "shared action",
+    "line": "REPROIT/1 shared - 1 run-1 {\"kind\":\"action\",\"actor\":\"alice\",\"action\":\"tap:key:send\"}",
+    "outcome": "accepted"
+  },
+  {
+    "name": "contract action",
+    "line": "REPROIT/1 contract 0123456789abcdef 2 run-1 {\"kind\":\"action\",\"actor\":null,\"action\":\"back\"}",
+    "outcome": "accepted"
+  },
+  {
+    "name": "unsupported version",
+    "line": "REPROIT/2 shared - 1 run-1 {\"kind\":\"action\",\"actor\":null,\"action\":\"back\"}",
+    "outcome": "unsupported-version"
+  },
+  {
+    "name": "missing header fields",
+    "line": "REPROIT/1 shared - 1",
+    "outcome": "malformed-frame"
+  },
+  {
+    "name": "invalid sequence",
+    "line": "REPROIT/1 shared - later run-1 {\"kind\":\"action\",\"actor\":null,\"action\":\"back\"}",
+    "outcome": "invalid-sequence"
+  },
+  {
+    "name": "invalid event payload",
+    "line": "REPROIT/1 shared - 3 run-1 {\"kind\":\"action\",\"action\":\"back\",\"extra\":true}",
+    "outcome": "invalid-event"
+  },
+  {
+    "name": "unattributable contract header",
+    "line": "REPROIT/1 contract not-a-hash 4 run-1 {\"kind\":\"action\",\"actor\":null,\"action\":\"back\"}",
+    "outcome": "malformed-frame"
+  }
+]

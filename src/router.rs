@@ -90,6 +90,7 @@ pub(crate) fn build(app: App) -> Router {
         // Stable, content-addressed buckets are the public replay package API:
         // indices shift as new errors arrive, bucket ids do not.
         .route("/v1/apps/:app/buckets", get(ingest::get_buckets))
+        .route("/v1/apps/:app/runs/:run/proof", get(ingest::get_run_proof))
         // Mint/rotate the write-only browser key from an authenticated secret
         // key. This lets account setup obtain SDK credentials without
         // ever putting the management key in application code.
