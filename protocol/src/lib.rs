@@ -5,6 +5,17 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
+mod causal;
+mod environment;
+pub use causal::{
+    CausalEdge, CausalEdgeKind, CausalGraph, CausalNode, CausalNodeKind, CausalTarget,
+    CAUSAL_GRAPH_VERSION, MAX_CAUSAL_EDGES, MAX_CAUSAL_NODES,
+};
+pub use environment::{
+    EnvironmentEnvelope, EnvironmentOutcome, EnvironmentProof, EnvironmentTrial,
+    ENVIRONMENT_ENVELOPE_VERSION, MAX_ENVIRONMENT_TRIALS,
+};
+
 pub const VERSION: u16 = 1;
 pub const FRAME_PREFIX: &str = "REPROIT/1 ";
 pub const MAX_FRAME_BYTES: usize = 1024 * 1024;
@@ -628,6 +639,8 @@ pub enum ArtifactKind {
     Evaluation,
     Replay,
     MinimizedTrace,
+    CausalGraph,
+    EnvironmentEnvelope,
     ProofLedger,
 }
 
@@ -639,6 +652,8 @@ impl ArtifactKind {
             Self::Evaluation => "evaluation",
             Self::Replay => "replay",
             Self::MinimizedTrace => "minimized-trace",
+            Self::CausalGraph => "causal-graph",
+            Self::EnvironmentEnvelope => "environment-envelope",
             Self::ProofLedger => "proof-ledger",
         }
     }
@@ -672,10 +687,23 @@ impl ArtifactNode {
         if self.id != artifact_id(self.kind, &self.parents, &self.payload)? {
             return Err(ProtocolError::new(ReasonCode::InvalidArtifact));
         }
-        if self.kind == ArtifactKind::ProofLedger {
-            let ledger: ProofLedger = serde_json::from_value(self.payload.clone())
-                .map_err(|_| ProtocolError::new(ReasonCode::InvalidArtifact))?;
-            ledger.validate()?;
+        match self.kind {
+            ArtifactKind::CausalGraph => {
+                let graph: CausalGraph = serde_json::from_value(self.payload.clone())
+                    .map_err(|_| ProtocolError::new(ReasonCode::InvalidArtifact))?;
+                graph.validate()?;
+            }
+            ArtifactKind::EnvironmentEnvelope => {
+                let proof: EnvironmentProof = serde_json::from_value(self.payload.clone())
+                    .map_err(|_| ProtocolError::new(ReasonCode::InvalidArtifact))?;
+                proof.validate()?;
+            }
+            ArtifactKind::ProofLedger => {
+                let ledger: ProofLedger = serde_json::from_value(self.payload.clone())
+                    .map_err(|_| ProtocolError::new(ReasonCode::InvalidArtifact))?;
+                ledger.validate()?;
+            }
+            _ => {}
         }
         Ok(())
     }
