@@ -50,37 +50,20 @@ fn safe_key_rejects_traversal_and_absolute() {
 }
 
 #[test]
-fn error_context_accepts_only_the_canonical_context_field() {
-    let mut batch = Map::new();
-    batch.insert("locale".into(), json!("en-US"));
-    let ev = json!({
-        "ctx": { "ignored": true },
-        "context": { "plan": "pro", "route": "/checkout" }
-    });
-    let merged = merge_context(&batch, &ev);
-    assert_eq!(merged["locale"], json!("en-US"));
-    assert_eq!(merged["plan"], json!("pro"));
-    assert_eq!(merged["route"], json!("/checkout"));
-    assert!(merged.get("ignored").is_none());
-}
-
-#[test]
 fn event_context_fingerprint_feeds_fixture_spec() {
-    let ev = json!({
-        "context": {
-            "fingerprint": [{
-                "field": "name",
-                "len": 18,
-                "bytes": 90,
-                "graphemes": 12,
-                "charset": "unicode",
-                "scripts": ["Latin", "Arabic"],
-                "hasNewline": true
-            }]
-        }
-    });
-    let merged = merge_context(&Map::new(), &ev);
-    let spec = fixture_spec(&merged, &[]);
+    let context = serde_json::from_value(json!({
+        "fingerprint": [{
+            "field": "name",
+            "len": 18,
+            "bytes": 90,
+            "graphemes": 12,
+            "charset": "unicode",
+            "scripts": ["Latin", "Arabic"],
+            "hasNewline": true
+        }]
+    }))
+    .unwrap();
+    let spec = fixture_spec(&context, &[]);
     let generate = &spec["inputs"][0]["generate"];
     assert_eq!(generate["minLen"], json!(18));
     assert_eq!(generate["minBytes"], json!(90));
@@ -169,122 +152,85 @@ fn bucket_package_exposes_bucket_first_replay_shape() {
     assert_eq!(pkg["repro"]["status"], "reproduced");
 }
 
-#[test]
-fn oracle_gate_admits_tagged_error_and_forms_bucket() {
-    // A crash is an oracle bug (SDKs tag uncaught crashes oracle:"crash"), so
-    // it passes the gate, becomes an occurrence, and opens a bucket.
-    let events = vec![json!({
-        "kind": "error",
-        "sig": "crashA",
-        "message": "boom",
-        "oracle": "crash",
-    })];
-    let agg = aggregate_events(&events, &Map::new());
-    assert_eq!(agg.error_recs.len(), 1);
-    assert_eq!(agg.dropped_untagged, 0);
-    assert_eq!(agg.error_recs[0].context["oracle"], json!("crash"));
-    // A bucket id is derivable for the accepted occurrence.
-    assert!(!buckets::bucket_id(&agg.error_recs[0]).is_empty());
+fn frame(sequence: u64, event: reproit_protocol::Event) -> reproit_protocol::EventFrame {
+    reproit_protocol::EventFrame {
+        run_id: "run-1".into(),
+        sequence,
+        scope: reproit_protocol::EvidenceScope::Shared,
+        event,
+    }
 }
 
 #[test]
-fn ingest_preserves_bounded_structural_identity_and_recomputes_bug_id() {
-    let identity = json!({
-        "oracle": "crash",
-        "invariant": "no-exception",
-        "kind": "exception",
-        "message": "boom at #",
-        "frame": "",
-        "trigger": ""
-    });
-    let events = vec![json!({
-        "kind": "error",
-        "sig": "screen",
-        "message": "boom at 42",
-        "oracle": "crash",
-        "findingIdentity": identity,
-        "bugId": "bug_attacker_controlled"
-    })];
-    let agg = aggregate_events(&events, &Map::new());
-    let rec = &agg.error_recs[0];
-    assert_eq!(rec.context["findingIdentity"], identity);
-    assert_ne!(buckets::bug_id(rec), "bug_attacker_controlled");
+fn typed_finding_preserves_identity_and_recomputes_bug_id() {
+    let identity = reproit_protocol::FindingIdentity {
+        oracle: "crash".into(),
+        invariant: "no-exception".into(),
+        kind: "exception".into(),
+        message: "boom at #".into(),
+        frame: String::new(),
+        trigger: String::new(),
+        boundary: None,
+    };
+    let frames = vec![frame(
+        1,
+        reproit_protocol::Event::Finding {
+            signature: "screen".into(),
+            message: "boom at 42".into(),
+            identity: identity.clone(),
+            path: vec![],
+            context: Default::default(),
+        },
+    )];
+    let agg = aggregate_events(&frames);
+    let record = &agg.error_recs[0];
+    assert_eq!(record.context["findingIdentity"], json!(identity));
+    assert_eq!(record.context["oracle"], json!("crash"));
     assert_eq!(
-        buckets::bucket_id(rec).trim_start_matches("bkt_"),
-        buckets::bug_id(rec).trim_start_matches("bug_")
+        buckets::bucket_id(record).trim_start_matches("bkt_"),
+        buckets::bug_id(record).trim_start_matches("bug_")
     );
 }
 
 #[test]
-fn oracle_gate_drops_untagged_error_and_forms_no_bucket() {
-    // A general error report with no oracle tag is not a product finding: it
-    // is dropped before any ErrorRec forms and counted for the response.
-    let events = vec![json!({
-        "kind": "error",
-        "sig": "crashA",
-        "message": "boom",
-    })];
-    let agg = aggregate_events(&events, &Map::new());
-    assert!(agg.error_recs.is_empty());
-    assert_eq!(agg.dropped_untagged, 1);
-}
-
-#[test]
-fn oracle_gate_rejects_malformed_ids() {
-    // Uppercase, spaces, punctuation, empty, and over-length are all malformed.
-    assert!(!oracle_well_formed("Crash"));
-    assert!(!oracle_well_formed("blank screen"));
-    assert!(!oracle_well_formed("sql;drop"));
-    assert!(!oracle_well_formed("crash!"));
-    assert!(!oracle_well_formed(""));
-    assert!(!oracle_well_formed(&"x".repeat(MAX_ORACLE_ID_BYTES + 1)));
-    // Exactly at the cap is still a token.
-    assert!(oracle_well_formed(&"x".repeat(MAX_ORACLE_ID_BYTES)));
-    // Every canonical registry id passes the gate (choice-anomaly et al).
-    for (id, _) in impact::KNOWN_ORACLES {
-        assert!(oracle_well_formed(id), "registry id must pass gate: {id}");
-    }
-    // Through the loop, each malformed error is dropped, none bucketed.
-    let events = vec![
-        json!({ "kind": "error", "sig": "s", "oracle": "UPPER" }),
-        json!({ "kind": "error", "sig": "s", "oracle": "has space" }),
-        json!({ "kind": "error", "sig": "s", "oracle": "x".repeat(MAX_ORACLE_ID_BYTES + 1) }),
+fn typed_edges_sum_and_nonpersistent_frames_are_ignored() {
+    let frames = vec![
+        frame(
+            1,
+            reproit_protocol::Event::GraphEdge {
+                from: "a".into(),
+                action: "tap".into(),
+                to: "b".into(),
+            },
+        ),
+        frame(
+            2,
+            reproit_protocol::Event::GraphEdge {
+                from: "a".into(),
+                action: "tap".into(),
+                to: "b".into(),
+            },
+        ),
+        frame(
+            3,
+            reproit_protocol::Event::Action {
+                actor: None,
+                action: "tap".into(),
+            },
+        ),
     ];
-    let agg = aggregate_events(&events, &Map::new());
-    assert!(agg.error_recs.is_empty());
-    assert_eq!(agg.dropped_untagged, 3);
-}
-
-#[test]
-fn oracle_gate_admits_wellformed_unknown_id() {
-    // An id this cloud build does not recognize (from a newer CLI/SDK) still
-    // passes: the gate is presence + well-formedness, not registry membership.
-    let unknown = "time-travel-9000";
-    assert!(!impact::KNOWN_ORACLES.iter().any(|(k, _)| *k == unknown));
-    assert!(oracle_well_formed(unknown));
-    let events = vec![json!({
-        "kind": "error", "sig": "s", "message": "m", "oracle": unknown,
-    })];
-    let agg = aggregate_events(&events, &Map::new());
-    assert_eq!(agg.error_recs.len(), 1);
-    assert_eq!(agg.dropped_untagged, 0);
-    assert_eq!(agg.error_recs[0].context["oracle"], json!(unknown));
-}
-
-#[test]
-fn oracle_gate_leaves_edges_and_other_kinds_untouched() {
-    // The gate touches only the error kind: edges still sum by key and an
-    // unrelated kind is ignored, exactly as before.
-    let events = vec![
-        json!({ "kind": "edge", "from": "a", "action": "tap", "to": "b" }),
-        json!({ "kind": "edge", "from": "a", "action": "tap", "to": "b" }),
-        json!({ "kind": "error", "sig": "s" }),
-        json!({ "kind": "screenshot" }),
-    ];
-    let agg = aggregate_events(&events, &Map::new());
+    let agg = aggregate_events(&frames);
     assert_eq!(agg.edge_counts.get("a|tap|b"), Some(&2));
     assert!(agg.error_recs.is_empty());
-    assert_eq!(agg.dropped_untagged, 1);
+}
+
+#[test]
+fn legacy_untyped_batch_is_rejected() {
+    let legacy = json!({
+        "appId": "app",
+        "events": [{ "kind": "edge", "from": "a", "action": "tap", "to": "b" }]
+    });
+    assert!(serde_json::from_value::<reproit_protocol::EventBatch>(legacy).is_err());
 }
 
 #[test]

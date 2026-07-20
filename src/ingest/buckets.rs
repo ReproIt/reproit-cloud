@@ -14,25 +14,9 @@
 //! in the handlers.
 
 use super::{ErrorRec, ReplayResult};
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 
-/// Framework-independent defect identity shared with the CLI causal capsule.
-/// It contains only structural cause coordinates, never a seed, action path,
-/// build, machine, occurrence, or raw user value.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct FindingIdentity {
-    pub oracle: String,
-    pub invariant: String,
-    pub kind: String,
-    #[serde(default)]
-    pub message: String,
-    pub frame: String,
-    pub trigger: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub boundary: Option<String>,
-}
+pub use reproit_protocol::FindingIdentity;
 
 pub fn structural_bug_id(identity: &FindingIdentity) -> String {
     use sha2::{Digest, Sha256};

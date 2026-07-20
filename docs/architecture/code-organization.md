@@ -24,6 +24,9 @@ process startup -> HTTP routing/middleware -> handlers -> domain services
 - `jobs/` and `integrations/` own external execution and delivery adapters.
 - `ingest/aggregation.rs`, `evidence.rs`, `export.rs`, and `replay.rs` own their named trust
   boundaries; `ingest/mod.rs` coordinates handlers and bucket presentation.
+- `protocol/` is the IO-free event, tri-state, reason-code, and content-addressed evidence package.
+  Its source is byte-identical to the CLI package. Ingest validates it before tenant resolution or
+  persistence.
 
 Dependencies point inward. Domain calculations receive explicit inputs and do not depend on Axum,
 SQLx, process state, or dashboard presentation.
@@ -39,8 +42,8 @@ The bug feed is a claim, not a collection of suspicions. A surfaced bug must hav
 
 Internally, evaluation may abstain when evidence is missing, ambiguous, stale, unsupported, or from
 an unrecognized taxonomy. Abstention is diagnostic state; it is not a bug, a successful check, or a
-third user-facing finding class. Cloud may retain such input for compatibility and investigation,
-but it must not promote or rank it as a confirmed bug.
+third user-facing finding class. Cloud may persist a typed abstention and its reason code, but it
+must not promote or rank it as a confirmed bug.
 
 ## Correctness rules
 
@@ -49,8 +52,8 @@ but it must not promote or rank it as a confirmed bug.
 2. Treat every wire, database, worker, integration, and artifact value as fallible.
 3. Keep deterministic transforms pure and pass time, configuration, and storage in explicitly.
 4. Prefer enums and state machines where correlated flags permit invalid states.
-5. Preserve wire formats, stable identities, ordering, tenant boundaries, and abstention behavior
-   with characterization tests before refactoring.
+5. Change protocol versions explicitly. Never guess, truncate, or reinterpret an invalid frame.
+   Preserve stable identities, ordering, tenant boundaries, and abstention behavior with tests.
 6. Keep one canonical implementation for routes, bucket identity, oracle taxonomy, artifact paths,
    tenant resolution, and replay status.
 7. Unclassified future wire values degrade safely; they never inherit crash severity or confirmed state.

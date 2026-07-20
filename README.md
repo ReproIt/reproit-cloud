@@ -61,8 +61,10 @@ You provide runner capacity, backups, network access, retention, and storage.
 
 ## Core API
 
-All `/v1/*` management routes require a secret project key. Browser SDK ingest
-uses a project-pinned, write-only publishable key.
+All `/v1/*` management routes require a secret project key. Event producers may use a
+project-pinned, write-only publishable key. `POST /v1/events` accepts only a validated
+`reproit-protocol` version 1 batch with a required idempotency id, strictly ordered frames, and
+validated evidence graphs. The earlier permissive `{appId, events}` body is rejected.
 
 ```text
 POST /v1/events

@@ -848,26 +848,25 @@ impl TenantStore {
         app_id: &str,
         edges: &[(String, i64)],
         errors: &[ErrorRec],
-        batch_id: Option<&str>,
+        evidence: &[reproit_protocol::EvidenceGraph],
+        batch_id: &str,
     ) -> anyhow::Result<bool> {
-        if edges.is_empty() && errors.is_empty() {
+        if edges.is_empty() && errors.is_empty() && evidence.is_empty() {
             return Ok(false);
         }
         let mut tx = self.pool.begin().await?;
 
-        if let Some(bid) = batch_id {
-            let r = sqlx::query(
-                "INSERT INTO processed_batches (app_id, batch_id) VALUES ($1,$2)
-                 ON CONFLICT DO NOTHING",
-            )
-            .bind(app_id)
-            .bind(bid)
-            .execute(&mut *tx)
-            .await?;
-            if r.rows_affected() == 0 {
-                tx.rollback().await?;
-                return Ok(true);
-            }
+        let r = sqlx::query(
+            "INSERT INTO processed_batches (app_id, batch_id) VALUES ($1,$2)
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(app_id)
+        .bind(batch_id)
+        .execute(&mut *tx)
+        .await?;
+        if r.rows_affected() == 0 {
+            tx.rollback().await?;
+            return Ok(true);
         }
 
         if !edges.is_empty() {
@@ -924,6 +923,8 @@ impl TenantStore {
             .execute(&mut *tx)
             .await?;
         }
+
+        crate::db::artifacts::store_graphs(&mut tx, app_id, evidence).await?;
 
         tx.commit().await?;
         Ok(false)

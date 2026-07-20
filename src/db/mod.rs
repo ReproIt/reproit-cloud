@@ -14,6 +14,7 @@
 //! control schema on boot). This module holds the shared row types and the
 //! key-hash helper both stores use.
 
+mod artifacts;
 pub mod control;
 pub mod schema;
 pub mod secrets;

@@ -1,8 +1,8 @@
 //! Production telemetry ingestion.
 //!
-//! Receives the marker-protocol graph the `reproit-web` SDK emits from REAL
-//! users, merges it into a usage graph (edges + traversal counts) in Postgres,
-//! and stores errors WITH the graph path that produced them. The payoff is the
+//! Receives strict versioned event batches, merges graph-edge frames into a usage
+//! graph in Postgres, persists typed findings, and stores immutable evidence
+//! graphs by content hash. The payoff is the
 //! bucket package endpoint: it converts a production error bucket into a
 //! deterministic replay the runner can execute, turning a prod "cannot
 //! reproduce" into a reproducible test.
@@ -30,8 +30,6 @@ use serde_json::{json, Map, Value};
 
 // Cohort/discriminator analysis lives in `cohorts`; handlers reach for these two.
 // `fixture_spec` is part of the public API, so re-export it at `crate::ingest`.
-#[cfg(test)]
-use aggregation::oracle_well_formed;
 use aggregation::{aggregate_events, BatchAgg};
 pub(crate) use bucket_api::bucket_list_for_tenant;
 #[cfg(test)]
@@ -46,42 +44,9 @@ pub use evidence::{get_blob, get_bucket_evidence, post_bucket_evidence};
 pub use export::get_export;
 pub use replay::{get_cloud_runs, get_replay_results, post_replay_results, post_reproduce};
 
-/// Largest event batch we ingest in one POST /v1/events. Past this we reject
-/// before touching the DB: an oversized array is abuse, not a real session.
-const MAX_EVENTS_PER_BATCH: usize = 5000;
-
 /// Per-file cap on a multipart evidence part. field.bytes() buffers the whole
 /// part, so an oversize part is rejected with 413 rather than read into memory.
 const MAX_EVIDENCE_FIELD_BYTES: usize = 25 * 1024 * 1024;
-
-/// Per-field caps inside an ingested event. The 32MB body limit bounds the
-/// request, but without these one hostile event could still park megabytes in a
-/// single error row (message/context/path) and every later read pays for it.
-/// Oversized strings are TRUNCATED (a clipped crash message still buckets and
-/// displays); an oversized context is dropped to a marker (a partial context is
-/// worse than none for fixture synthesis).
-const MAX_ERROR_MESSAGE_BYTES: usize = 16 * 1024;
-const MAX_STEP_FIELD_BYTES: usize = 1024;
-const MAX_LABEL_BYTES: usize = 256;
-const MAX_PATH_STEPS: usize = 256;
-const MAX_CONTEXT_BYTES: usize = 64 * 1024;
-
-/// Cap on an accepted oracle id at the ingest gate. Registry ids are short
-/// structural tokens (`choice-anomaly`, `blank-screen`); anything longer is not a
-/// real category and is dropped rather than allowed to open a bucket.
-const MAX_ORACLE_ID_BYTES: usize = 64;
-
-/// Truncate to at most `max` bytes on a char boundary.
-fn clipped(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        return s.to_string();
-    }
-    let mut end = max;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    s[..end].to_string()
-}
 
 /// Default aggregate evidence cap per app, including human original captures.
 /// This is a product guardrail against one tenant/API key filling shared object
@@ -124,16 +89,6 @@ pub(crate) fn max_evidence_bytes_per_app() -> Option<i64> {
         .and_then(|v| v.parse::<i64>().ok())
         .map(|n| (n > 0).then_some(n))
         .unwrap_or(Some(DEFAULT_MAX_EVIDENCE_BYTES_PER_APP))
-}
-
-fn merge_context(base: &Map<String, Value>, event: &Value) -> Map<String, Value> {
-    let mut context = base.clone();
-    if let Some(ectx) = event.get("context").and_then(Value::as_object) {
-        for (k, v) in ectx {
-            context.insert(k.clone(), v.clone());
-        }
-    }
-    context
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -373,19 +328,21 @@ pub async fn post_publishable_key(
 /// Page size for the export's keyset reads: big enough that a large tenant is
 /// a few hundred round-trips, small enough that one page is never a memory
 /// event.
-/// POST /v1/events, ingest a batch from the SDK.
+/// POST /v1/events, ingest one strict protocol batch.
 pub async fn post_events(
     State(app): State<App>,
     Extension(auth): Extension<crate::AuthCtx>,
     Extension(scope): Extension<crate::KeyScope>,
     headers: HeaderMap,
-    Json(batch): Json<Value>,
+    Json(batch): Json<reproit_protocol::EventBatch>,
 ) -> ApiResult {
-    let app_id = batch
-        .get("appId")
-        .and_then(|v| v.as_str())
-        .unwrap_or("app")
-        .to_string();
+    batch.validate().map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": error.reason.as_str() })),
+        )
+    })?;
+    let app_id = batch.app_id.clone();
     // Resolve the caller's tenant DB; the app_id is caller-supplied (body), so it
     // must be a project that exists in this tenant.
     let tenant = tenant_for(&app, auth, &headers, &app_id).await?;
@@ -414,39 +371,16 @@ pub async fn post_events(
             ));
         }
     }
-    let events = batch
-        .get("events")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-    // Cap the batch before processing: reject an oversized array up front rather
-    // than fan it out into thousands of DB writes.
-    if events.len() > MAX_EVENTS_PER_BATCH {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "event batch too large" })),
-        ));
-    }
-    // Session-level context applies to every event in the batch; an error may
-    // override/extend it with its own `ctx` (context at error time).
-    let batch_ctx = batch
-        .get("ctx")
-        .and_then(|v| v.as_object())
-        .cloned()
-        .unwrap_or_default();
     let app_configured = crate::integrations::is_configured_for(&tenant.store, &app_id).await;
     // Collect the whole batch in memory FIRST, then write it in one transaction.
     // Edges are pre-aggregated by key (the `edges` PK is (app_id, edge_key), so a
     // single multi-row upsert can only touch each row once; duplicate keys within
     // the batch must be summed here and applied as one delta). Errors are gathered
     // in arrival order so the in-batch bucket grouping below sees oldest-first.
-    // The oracle gate lives in aggregate_events: an untagged/malformed error is
-    // dropped and counted before any ErrorRec (and thus any bucket) forms.
     let BatchAgg {
         edge_counts,
         error_recs,
-        dropped_untagged,
-    } = aggregate_events(&events, &batch_ctx);
+    } = aggregate_events(&batch.frames);
     let n_edges = edge_counts.values().map(|c| *c as u64).sum::<u64>();
     let n_errors = error_recs.len() as u64;
     // ONE atomic transaction for the whole batch: a multi-row edge upsert plus a
@@ -454,24 +388,15 @@ pub async fn post_events(
     // auto-commit statements. The edge deltas carry the in-batch sums computed
     // above so a key repeated in the batch lands as a single increment.
     let edges: Vec<(String, i64)> = edge_counts.into_iter().collect();
-    // Optional client idempotency key: body `batchId` or the Idempotency-Key
-    // header. Consumed atomically with the write; a retried batch answers 200
-    // with deduped=true and counts nothing twice.
-    let batch_id = batch
-        .get("batchId")
-        .and_then(|v| v.as_str())
-        .map(|s| clipped(s.trim(), 128))
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            headers
-                .get("idempotency-key")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| clipped(s.trim(), 128))
-                .filter(|s| !s.is_empty())
-        });
     let deduped = tenant
         .store
-        .ingest_batch(&app_id, &edges, &error_recs, batch_id.as_deref())
+        .ingest_batch(
+            &app_id,
+            &edges,
+            &error_recs,
+            &batch.evidence,
+            &batch.batch_id,
+        )
         .await
         .map_err(err500)?;
     if deduped {
@@ -481,7 +406,6 @@ pub async fn post_events(
     metrics::counter!("ingest_batches_total").increment(1);
     metrics::counter!("ingest_errors_total").increment(n_errors);
     metrics::counter!("ingest_edges_total").increment(n_edges);
-    metrics::counter!("ingest_dropped_untagged_total").increment(dropped_untagged);
     // file-on-form: for a configured app, file an issue for any bucket this batch
     // touched that doesn't already have a linked ticket. We derive the touched
     // buckets and their oldest/newest occurrence from THIS batch's errors (already
@@ -492,20 +416,21 @@ pub async fn post_events(
     if app_configured && !error_recs.is_empty() {
         maybe_file_new_buckets(&tenant, &app_id, &error_recs).await;
     }
-    // Surface the gate's drop count only when it fired, so a normal batch's
-    // response shape is unchanged; a client shipping untagged errors sees them
-    // rejected here rather than silently vanishing.
     let captures: Vec<String> = error_recs
         .iter()
         .filter(|record| buckets::is_tester_capture(record))
         .map(buckets::bucket_id)
         .collect();
-    let mut body = json!({ "ok": true, "ingested": { "edges": n_edges, "errors": n_errors } });
+    let mut body = json!({
+        "ok": true,
+        "ingested": {
+            "edges": n_edges,
+            "errors": n_errors,
+            "evidenceGraphs": batch.evidence.len(),
+        }
+    });
     if !captures.is_empty() {
         body["captures"] = json!(captures);
-    }
-    if dropped_untagged > 0 {
-        body["droppedUntagged"] = json!(dropped_untagged);
     }
     Ok(Json(body))
 }

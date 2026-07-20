@@ -88,6 +88,27 @@ CREATE TABLE IF NOT EXISTS evidence (
 );
 CREATE INDEX IF NOT EXISTS evidence_error ON evidence(error_id, id);
 
+-- Immutable evidence graphs. Node ids are hashes of kind, parents, and payload;
+-- roots attach a validated graph to a run without copying node content.
+CREATE TABLE IF NOT EXISTS artifact_nodes (
+  app_id     TEXT  NOT NULL,
+  node_id    TEXT  NOT NULL,
+  kind       TEXT  NOT NULL,
+  parents    JSONB NOT NULL,
+  payload    JSONB NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (app_id, node_id)
+);
+CREATE TABLE IF NOT EXISTS artifact_roots (
+  app_id     TEXT NOT NULL,
+  run_id     TEXT NOT NULL,
+  root_id    TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (app_id, run_id, root_id),
+  FOREIGN KEY (app_id, root_id) REFERENCES artifact_nodes(app_id, node_id)
+);
+CREATE INDEX IF NOT EXISTS artifact_roots_run ON artifact_roots(app_id, run_id);
+
 -- ---- ingest idempotency: consumed batch ids ------------------------------------
 -- An SDK retry after a network timeout re-POSTs the same batch; the batchId
 -- (client-generated, optional) makes the second write a no-op instead of
