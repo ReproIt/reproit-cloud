@@ -951,7 +951,7 @@
       <div class="hd">Occurrences over time</div>
       <div class="bd">
         <div class="tl-wrap">${body}</div>
-        ${v ? `<div class="verdict ${v.cls}" role="status">
+        ${v ? `<div id="resolution-verdict" class="verdict ${v.cls}" role="status" data-reproit-contain>
           <span class="v-dot" aria-hidden="true"></span><span>${v.text}</span>
         </div>` : ""}
       </div>

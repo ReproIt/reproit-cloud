@@ -137,6 +137,7 @@ pub const KNOWN_ORACLES: &[(&str, Severity)] = &[
     ("hang", Severity::Crash),
     ("leak", Severity::Leak),
     ("occlusion", Severity::Operability),
+    ("overflow", Severity::Operability),
     ("detached-indicator", Severity::Operability),
     ("choice-anomaly", Severity::Operability),
     ("broken-route", Severity::Operability),
@@ -438,7 +439,7 @@ mod tests {
         assert_eq!(severity_for_oracle("stuck-keyboard"), Severity::Operability);
         assert_eq!(severity_for_oracle("occlusion"), Severity::Operability);
         assert_eq!(severity_for_oracle("graph"), Severity::Unclassified);
-        assert_eq!(severity_for_oracle("overflow"), Severity::Unclassified);
+        assert_eq!(severity_for_oracle("overflow"), Severity::Operability);
         assert_eq!(severity_for_oracle("dynamic-type"), Severity::Unclassified);
         assert_eq!(severity_for_oracle("undo-inverse"), Severity::Unclassified);
         // An id the cloud does not recognize remains Unclassified. It is retained
