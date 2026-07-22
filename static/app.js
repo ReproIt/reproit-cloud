@@ -747,8 +747,8 @@ function renderPhone() {
       <div class="phone-noev">
         <span class="ico" aria-hidden="true">[ ]</span>
         No evidence artifact captured for this production finding yet.
-        Replay it with the runner to record a video to R2:
-        <code>reproit run explore --warm</code>
+        Replay the bucket with recording enabled to save a video to R2:
+        <code>reproit &lt;bucket-id&gt; --record-video</code>
       </div></div></div>
       <div class="phone-caption">no recording attached</div>`;
   }
@@ -798,11 +798,11 @@ function renderClipHint(cluster) {
   const app = CFG.app;
   const bkt = bucketForSig(cluster.sig);
   const cmd = bkt
-    ? `reproit ${bkt} && reproit record ${bkt}`
+    ? `reproit ${bkt} --record-video`
     : `reproit bugs`;
   return `<div class="clip-hint">
     <span class="ch-ico" aria-hidden="true">&#9654;</span>
-    <span>No reproduction clip. A clip records the deterministic reproduction on synthetic, PII-safe data, never a user session. Reproduce the bug, then record it: <code>${esc(cmd)}</code>.</span>
+    <span>No reproduction clip. A clip records the deterministic reproduction on synthetic, PII-safe data, never a user session. Reproduce and record it: <code>${esc(cmd)}</code>.</span>
   </div>`;
 }
 

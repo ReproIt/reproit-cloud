@@ -18,6 +18,10 @@ CLI/CI findings into stable bugs with reproducible evidence.
 The server never needs application source code. Reproduction jobs are dispatched
 to your CI checkout, and workers run the same `reproit` binary as developers.
 
+The CLI commit in `.reproit-cli-commit` is the source of truth for the shared
+wire protocol, oracle registry, and fixture contract. Run
+`scripts/cli-contracts.sh --check` to verify the vendored Cloud copy.
+
 ## Quick start
 
 ```bash
@@ -101,7 +105,7 @@ See [self-hosted architecture](docs/architecture/self-hosted.md) and
 
 ## Original captures
 
-`reproit record --upload` creates a short-lived Cloud review session. The signed-in user chooses
+`reproit create --push` creates a short-lived Cloud review session. The signed-in user chooses
 the destination project and report details in the browser, then the CLI streams the immutable
 manifest, video, and structural evidence. Cloud verifies the declared SHA-256 hashes before the
 capture becomes complete. Capture rows and blobs are tenant-scoped, project deletion removes their

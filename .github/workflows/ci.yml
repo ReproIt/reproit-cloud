@@ -23,6 +23,15 @@ jobs:
           --health-retries 20
     steps:
       - uses: actions/checkout@v6
+      - uses: actions/checkout@v6
+        with:
+          repository: ReproIt/reproit
+          ref: 4a60ed45fcfc494b161f966217a0d46180fa4267
+          path: _upstream/reproit-cli
+      - name: Verify canonical CLI contracts
+        env:
+          REPROIT_CLI_ROOT: ${{ github.workspace }}/_upstream/reproit-cli
+        run: ./scripts/cli-contracts.sh --check
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt

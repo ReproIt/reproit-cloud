@@ -6,3 +6,4 @@
 .env
 # Local scratch: throwaway demo apps + compose overrides for manual replay runs.
 /experiments
+/_upstream

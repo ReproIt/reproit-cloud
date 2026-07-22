@@ -895,12 +895,16 @@ mod tests {
             include_str!("../static/app.js"),
             include_str!("../static/triage.js"),
             include_str!("../docs/ci/reproit-repro.yml"),
+            include_str!("../README.md"),
         ];
         for surface in surfaces {
             assert!(!surface.contains("reproit cloud reproduce"));
             assert!(!surface.contains("reproit cloud pull"));
             assert!(!surface.contains("reproit cloud login"));
             assert!(!surface.contains("reproit check ${job.id}"));
+            assert!(!surface.contains("reproit run explore"));
+            assert!(!surface.contains("reproit record"));
+            assert!(!surface.contains("record --upload"));
         }
         assert!(surfaces[0].contains("reproit ${bktArg}"));
         assert!(!surfaces[0].contains("--app ${app}"));
