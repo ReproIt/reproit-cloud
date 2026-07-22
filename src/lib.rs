@@ -63,7 +63,11 @@ const DEFAULT_DB_URL: &str = "postgres://reproit:reproit@localhost:5433/reproit"
 static ALLOWED_HOSTS: OnceLock<HashSet<String>> = OnceLock::new();
 
 #[derive(Parser)]
-#[command(name = "reproit-cloud", about = "ReproIt cloud control plane")]
+#[command(
+    name = "reproit-cloud",
+    version = env!("CARGO_PKG_VERSION"),
+    about = "ReproIt cloud control plane"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Option<Cmd>,

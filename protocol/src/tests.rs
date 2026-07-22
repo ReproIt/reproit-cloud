@@ -41,6 +41,15 @@ fn canonical_line_corpus_has_exact_outcomes() {
 }
 
 #[test]
+fn canonical_line_corpus_is_the_frozen_v1_contract() {
+    let actual = Sha256::digest(include_bytes!("../fixtures/event-lines-v1.json"));
+    assert_eq!(
+        hex::encode(actual),
+        "4fc2e740e7e2a4f10d04ec58cfee272e50216fb13f59e4855e31091992376c36"
+    );
+}
+
+#[test]
 fn oversized_scoped_frame_retains_only_bounded_attribution() {
     let line = format!(
         "REPROIT/1 contract 0123456789abcdef 7 run-1 {}",

@@ -1,0 +1,145 @@
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to release, with or without the v prefix
+        required: true
+        default: 1.0.0
+      publish:
+        description: Publish the validated source release
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - id: version
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+          PUBLISH: ${{ inputs.publish }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          VERSION="${REQUESTED_VERSION#v}"
+          TAG="v${VERSION}"
+          sh scripts/check-release-version.sh "$VERSION"
+          if [[ "$PUBLISH" == "true" ]]; then
+            grep -Eq "^## ${VERSION} - [0-9]{4}-[0-9]{2}-[0-9]{2}$" CHANGELOG.md || {
+              echo "CHANGELOG.md must date the ${VERSION} release before publication" >&2
+              exit 1
+            }
+            endpoint="repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs"
+            run_id=$(gh api \
+              "${endpoint}?head_sha=${GITHUB_SHA}&status=completed&per_page=20" \
+              --jq '.workflow_runs | map(select(.conclusion == "success")) | first | .id // empty')
+            test -n "$run_id" || {
+              echo "no successful exact-commit CI run exists for ${GITHUB_SHA}" >&2
+              exit 1
+            }
+            git rev-parse "$TAG" >/dev/null 2>&1 && {
+              echo "$TAG already exists" >&2
+              exit 1
+            }
+            gh release view "$TAG" >/dev/null 2>&1 && {
+              echo "release $TAG already exists" >&2
+              exit 1
+            }
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+  package:
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Create and inspect the immutable source archive
+        env:
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          set -euo pipefail
+          ARCHIVE="reproit-cloud-${TAG}-source.tar.gz"
+          git archive --format=tar.gz --prefix="reproit-cloud-${TAG}/" \
+            --output "$ARCHIVE" HEAD
+          sha256sum "$ARCHIVE" > "$ARCHIVE.sha256"
+          mkdir extracted
+          tar -xzf "$ARCHIVE" -C extracted
+          test -f "extracted/reproit-cloud-${TAG}/Cargo.lock"
+          test -f "extracted/reproit-cloud-${TAG}/Dockerfile"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: reproit-cloud-source
+          path: |
+            reproit-cloud-${{ needs.validate.outputs.tag }}-source.tar.gz
+            reproit-cloud-${{ needs.validate.outputs.tag }}-source.tar.gz.sha256
+          if-no-files-found: error
+
+  compose-smoke:
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build and smoke local and S3-compatible storage
+        env:
+          EXPECTED: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          local_project=reproit-release-${GITHUB_RUN_ID}-local
+          object_project=reproit-release-${GITHUB_RUN_ID}-object
+          cleanup() {
+            docker compose -p "$local_project" down -v --remove-orphans
+            docker compose -p "$object_project" \
+              -f compose.yml -f compose.object-store.yml \
+              down -v --remove-orphans
+          }
+          trap cleanup EXIT
+          docker compose -p "$local_project" up --build --detach
+          COMPOSE_PROJECT_NAME="$local_project" ./scripts/smoke-self-hosted.sh
+          image=$(docker compose -p "$local_project" images -q cloud | head -1)
+          test -n "$image"
+          test "$(docker run --rm --entrypoint reproit-cloud "$image" --version)" = \
+            "reproit-cloud ${EXPECTED#v}"
+          docker compose -p "$local_project" down -v --remove-orphans
+          docker compose -p "$object_project" \
+            -f compose.yml -f compose.object-store.yml up --build --detach
+          COMPOSE_PROJECT_NAME="$object_project" \
+            COMPOSE_FILE=compose.yml:compose.object-store.yml \
+            ./scripts/smoke-self-hosted.sh
+
+  publish:
+    if: inputs.publish
+    needs: [validate, package, compose-smoke]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: reproit-cloud-source
+          path: dist
+      - name: Publish immutable source release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.validate.outputs.tag }}
+        run: |
+          gh release create "$TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "ReproIt Cloud ${TAG#v}" \
+            --generate-notes \
+            --latest

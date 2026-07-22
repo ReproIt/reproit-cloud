@@ -46,7 +46,9 @@ Copy [.env.example](.env.example) for bootstrap and S3-compatible storage
 options. Remove `REPROIT_DEV_OPEN` before exposing the service publicly.
 Read [upgrading](docs/upgrading.md),
 [backup and restore](docs/operations/backup-restore.md), and
-[security](SECURITY.md) before operating a production installation.
+[security](SECURITY.md) before operating a production installation. Immutable
+source releases and their exact validation contract are documented in
+[release](docs/release.md).
 
 ## Execution model
 
