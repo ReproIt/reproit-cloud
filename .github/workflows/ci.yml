@@ -46,3 +46,40 @@ jobs:
           fi
       - name: check full feature set (Docker build parity)
         run: cargo check --features r2
+      - name: audit production dependencies
+        run: |
+          cargo install cargo-audit --locked
+          # SQLx locks its optional MySQL driver even though this build enables
+          # PostgreSQL only. `cargo tree --target all -i rsa` is empty, so the
+          # unfixed RSA advisory is unreachable in every supported artifact.
+          cargo audit --ignore RUSTSEC-2023-0071
+      - name: build and smoke the documented self-hosted stack
+        run: |
+          set -euo pipefail
+          local_project=reproit-ci-${GITHUB_RUN_ID}-local
+          object_project=reproit-ci-${GITHUB_RUN_ID}-object
+          cleanup() {
+            docker compose -p "$local_project" down -v --remove-orphans
+            docker compose -p "$object_project" \
+              -f compose.yml -f compose.object-store.yml \
+              down -v --remove-orphans
+          }
+          trap cleanup EXIT
+          docker compose -p "$local_project" up --build --detach
+          if ! COMPOSE_PROJECT_NAME="$local_project" \
+            ./scripts/smoke-self-hosted.sh; then
+            docker compose -p "$local_project" logs --no-color
+            exit 1
+          fi
+          docker compose -p "$local_project" down -v --remove-orphans
+
+          docker compose -p "$object_project" \
+            -f compose.yml -f compose.object-store.yml \
+            up --build --detach
+          if ! COMPOSE_PROJECT_NAME="$object_project" \
+            COMPOSE_FILE=compose.yml:compose.object-store.yml \
+            ./scripts/smoke-self-hosted.sh; then
+            docker compose -p "$object_project" \
+              -f compose.yml -f compose.object-store.yml logs --no-color
+            exit 1
+          fi

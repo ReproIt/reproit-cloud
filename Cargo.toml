@@ -1,6 +1,6 @@
 [package]
 name = "reproit-cloud"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 license = "Elastic-2.0"
 description = "Self-hosted Reproit control plane for reproducible production bugs"
@@ -48,24 +48,23 @@ tower_governor = "0.4"
 # an export streams page by page instead of materializing in memory.
 tokio-stream = "0.1"
 metrics = "0.24"
-metrics-exporter-prometheus = { version = "0.16", default-features = false, features = ["http-listener"] }
+metrics-exporter-prometheus = { version = "0.18", default-features = false, features = ["http-listener"] }
 # Ops: structured logging.
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-# rustls 0.23 (used by sqlx Postgres TLS and rust-s3) needs a process-wide
+# rustls 0.23 (used by sqlx Postgres TLS and object storage) needs a process-wide
 # default CryptoProvider installed before any TLS handshake. We install `ring`
 # explicitly in main(); pin it here so the provider is unambiguous.
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 # R2 / S3-compatible artifact storage (videos, screenshots, reports). Optional:
 # the default build uses local-filesystem artifacts; enable `r2` for production.
-rust-s3 = { version = "0.35", default-features = false, features = [
-    "tokio-rustls-tls",
-], optional = true }
+object_store = { version = "0.14.1", default-features = false, features = ["aws"], optional = true }
+futures-util = { version = "0.3", optional = true }
 
 [features]
 default = []
 # R2 / S3-compatible per-tenant blob storage (the default build uses local-fs).
-r2 = ["dep:rust-s3"]
+r2 = ["dep:futures-util", "dep:object_store"]
 
 # Small, fast release binary for distribution.
 [profile.release]

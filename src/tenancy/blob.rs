@@ -309,8 +309,11 @@ impl BlobBackend for LocalBackend {
 /// one installation namespace and never calls a provider control-plane API.
 #[cfg(feature = "r2")]
 pub struct R2Backend {
-    bucket: Box<s3::Bucket>,
+    store: object_store::aws::AmazonS3,
 }
+
+#[cfg(feature = "r2")]
+const MAX_DELETE_PREFIX_OBJECTS: u64 = 100_000;
 
 #[cfg(feature = "r2")]
 impl R2Backend {
@@ -330,42 +333,43 @@ impl R2Backend {
     /// both shapes.
     ///
     fn from_env() -> Option<Self> {
-        use s3::{creds::Credentials, Bucket, Region};
         let (key, secret, bucket) = (
             std::env::var("R2_ACCESS_KEY_ID").ok()?,
             std::env::var("R2_SECRET_ACCESS_KEY").ok()?,
             std::env::var("R2_BUCKET").ok()?,
         );
-        let creds = Credentials::new(Some(&key), Some(&secret), None, None, None).ok()?;
-        let b = match std::env::var("R2_ENDPOINT").ok() {
+        let (endpoint, virtual_hosted_style) = match std::env::var("R2_ENDPOINT").ok() {
             // Custom endpoint (local MinIO / any R2-compatible store): account id is
             // optional, path-style addressing is required.
-            Some(endpoint) => {
-                let region = Region::Custom {
-                    region: "auto".into(),
-                    endpoint,
-                };
-                Bucket::new(&bucket, region, creds).ok()?.with_path_style()
-            }
+            Some(endpoint) => (endpoint, false),
             // Default Cloudflare R2: derive the endpoint from the account id
             // (required) and use virtual-host addressing.
             None => {
                 let account = std::env::var("R2_ACCOUNT_ID").ok()?;
-                let region = Region::Custom {
-                    region: "auto".into(),
-                    endpoint: format!("https://{account}.r2.cloudflarestorage.com"),
-                };
-                Bucket::new(&bucket, region, creds).ok()?
+                (format!("https://{account}.r2.cloudflarestorage.com"), true)
             }
         };
-        Some(Self { bucket: b })
+        let allow_http = endpoint.starts_with("http://");
+        let store = object_store::aws::AmazonS3Builder::new()
+            .with_region("auto")
+            .with_bucket_name(bucket)
+            .with_access_key_id(key)
+            .with_secret_access_key(secret)
+            .with_endpoint(endpoint)
+            .with_virtual_hosted_style_request(virtual_hosted_style)
+            .with_allow_http(allow_http)
+            .build()
+            .ok()?;
+        Some(Self { store })
     }
 }
 
 #[cfg(feature = "r2")]
 impl BlobBackend for R2Backend {
     async fn put(&self, _scope: &str, key: &str, bytes: &[u8]) -> anyhow::Result<String> {
-        self.bucket.put_object(format!("/{key}"), bytes).await?;
+        use object_store::ObjectStoreExt;
+        let location = object_store::path::Path::from(key);
+        self.store.put(&location, bytes.to_vec().into()).await?;
         Ok(format!("r2://{key}"))
     }
     async fn put_path(
@@ -375,47 +379,63 @@ impl BlobBackend for R2Backend {
         path: &std::path::Path,
         content_type: &str,
     ) -> anyhow::Result<String> {
-        let mut file = fs::File::open(path).await?;
-        self.bucket
-            .put_object_stream_with_content_type(
-                &mut file,
-                format!("/{key}"),
-                content_type.to_string(),
-            )
-            .await?;
+        use object_store::{Attribute, Attributes, ObjectStore};
+        use tokio::io::AsyncWriteExt;
+        let location = object_store::path::Path::from(key);
+        let store: Arc<dyn ObjectStore> = Arc::new(self.store.clone());
+        let attributes: Attributes = [(
+            Attribute::ContentType,
+            object_store::AttributeValue::from(content_type.to_string()),
+        )]
+        .into_iter()
+        .collect();
+        let mut writer =
+            object_store::buffered::BufWriter::new(store, location).with_attributes(attributes);
+        let mut source = fs::File::open(path).await?;
+        tokio::io::copy(&mut source, &mut writer).await?;
+        writer.shutdown().await?;
         Ok(format!("r2://{key}"))
     }
     async fn get(&self, _scope: &str, key: &str) -> anyhow::Result<Vec<u8>> {
-        Ok(self.bucket.get_object(format!("/{key}")).await?.to_vec())
+        use object_store::ObjectStoreExt;
+        let location = object_store::path::Path::from(key);
+        Ok(self.store.get(&location).await?.bytes().await?.to_vec())
     }
     async fn url_for(&self, _scope: &str, key: &str) -> anyhow::Result<String> {
+        use object_store::signer::Signer;
+        let location = object_store::path::Path::from(key);
         Ok(self
-            .bucket
-            .presign_get(format!("/{key}"), PRESIGN_EXPIRY_SECS, None)
-            .await?)
+            .store
+            .signed_url(
+                axum::http::Method::GET,
+                &location,
+                std::time::Duration::from_secs(PRESIGN_EXPIRY_SECS.into()),
+            )
+            .await?
+            .to_string())
     }
     async fn delete(&self, _scope: &str, key: &str) -> anyhow::Result<()> {
+        use object_store::ObjectStoreExt;
         // S3/R2 DELETE is idempotent: deleting a missing key answers 204.
-        self.bucket.delete_object(format!("/{key}")).await?;
+        self.store
+            .delete(&object_store::path::Path::from(key))
+            .await?;
         Ok(())
     }
     async fn delete_prefix(&self, prefix: &str) -> anyhow::Result<u64> {
-        // List-then-delete pages until the installation prefix is empty.
+        use futures_util::StreamExt;
+        use object_store::{ObjectStore, ObjectStoreExt};
         let mut removed = 0u64;
-        loop {
-            let pages = self.bucket.list(format!("{prefix}/"), None).await?;
-            let keys: Vec<String> = pages
-                .iter()
-                .flat_map(|p| p.contents.iter().map(|o| o.key.clone()))
-                .collect();
-            if keys.is_empty() {
-                return Ok(removed);
+        let location = object_store::path::Path::from(format!("{prefix}/"));
+        let mut objects = self.store.list(Some(&location));
+        while let Some(object) = objects.next().await {
+            if removed >= MAX_DELETE_PREFIX_OBJECTS {
+                anyhow::bail!("object deletion exceeded {MAX_DELETE_PREFIX_OBJECTS} keys");
             }
-            for key in keys {
-                self.bucket.delete_object(format!("/{key}")).await?;
-                removed += 1;
-            }
+            self.store.delete(&object?.location).await?;
+            removed += 1;
         }
+        Ok(removed)
     }
 }
 

@@ -9,10 +9,11 @@
 # production default) the control plane needs no engine binary at all.
 #
 # Pin to bookworm so the build-stage glibc matches the bookworm-slim runtime.
-FROM rust:1-slim-bookworm AS build
+FROM rust:1-slim-bookworm@sha256:99e09cb2284e2ddbb73a995deee3e91783fd04d177602ccf6eab326d778ee777 AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY experimental/reproit-backend ./experimental/reproit-backend
+COPY protocol ./protocol
 COPY contracts ./contracts
 COPY src ./src
 COPY static ./static
@@ -20,13 +21,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends pkg-config \
     && rm -rf /var/lib/apt/lists/*
 # Build with optional S3-compatible artifact storage. Selection is at runtime:
 # R2_* present selects object storage, otherwise local filesystem storage under
-# REPROIT_ARTIFACT_DIR. pkg-config is
-# installed above; rust-s3 uses rustls (tokio-rustls-tls), so no OpenSSL system
-# dependency is needed.
+# REPROIT_ARTIFACT_DIR. The object-store client uses rustls, so no OpenSSL
+# runtime dependency is needed.
 ARG CARGO_FEATURES="r2"
 RUN cargo build --release --features "$CARGO_FEATURES"
 
-FROM debian:bookworm-slim
+FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/target/release/reproit-cloud /usr/local/bin/reproit-cloud

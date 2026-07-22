@@ -44,6 +44,9 @@ REPROIT_API_KEY=<long-random-operations-key>
 
 Copy [.env.example](.env.example) for bootstrap and S3-compatible storage
 options. Remove `REPROIT_DEV_OPEN` before exposing the service publicly.
+Read [upgrading](docs/upgrading.md),
+[backup and restore](docs/operations/backup-restore.md), and
+[security](SECURITY.md) before operating a production installation.
 
 ## Execution model
 
@@ -104,11 +107,23 @@ object keys, and portability exports include both capture metadata and immutable
 
 ## Validation
 
+The smoke script bootstraps a project and therefore expects a fresh disposable
+Compose project.
+
 ```bash
 cargo fmt --all --check
 cargo test
 docker compose up -d
 ./scripts/smoke-self-hosted.sh
+
+# Exercise the S3-compatible evidence path in a disposable MinIO stack.
+docker compose -p reproit-object-smoke \
+  -f compose.yml -f compose.object-store.yml up --build -d
+COMPOSE_PROJECT_NAME=reproit-object-smoke \
+  COMPOSE_FILE=compose.yml:compose.object-store.yml \
+  ./scripts/smoke-self-hosted.sh
+docker compose -p reproit-object-smoke \
+  -f compose.yml -f compose.object-store.yml down -v
 ```
 
 The experimental backend-contract dogfood path is opt-in and limited to five
