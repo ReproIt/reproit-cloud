@@ -12,7 +12,8 @@ until curl --fail --silent --show-error "$base_url/health" >/dev/null; do
 done
 
 curl --fail --silent --show-error "$base_url/ready" >/dev/null
-curl --fail --silent --show-error "$base_url/login" | rg -q 'Sign in'
+login=$(curl --fail --silent --show-error "$base_url/login")
+grep -q 'Sign in' <<<"$login"
 
 bootstrap=$(
   docker compose exec -T cloud reproit-cloud init \
@@ -61,7 +62,9 @@ ingest=$(
       "evidence": []
     }'
 )
-printf '%s\n' "$ingest" | rg -q '"errors":1'
+python3 -c \
+  'import json,sys; raise SystemExit(json.load(sys.stdin).get("errors") != 1)' \
+  <<<"$ingest"
 
 bucket_id=$(
   curl --fail --silent --show-error \
@@ -81,10 +84,14 @@ upload=$(
     -F "file=@$evidence_file;type=text/plain;filename=smoke.txt" \
     "$base_url/v1/apps/$app_id/buckets/$bucket_id/evidence"
 )
-printf '%s\n' "$upload" | rg -q '"stored":1'
-curl --fail --silent --show-error \
+python3 -c \
+  'import json,sys; raise SystemExit(json.load(sys.stdin).get("stored") != 1)' \
+  <<<"$upload"
+evidence=$(curl --fail --silent --show-error \
   -H "authorization: Bearer $api_key" \
-  "$base_url/v1/apps/$app_id/buckets/$bucket_id/evidence" |
-  rg -q '"count":1'
+  "$base_url/v1/apps/$app_id/buckets/$bucket_id/evidence")
+python3 -c \
+  'import json,sys; raise SystemExit(json.load(sys.stdin).get("count") != 1)' \
+  <<<"$evidence"
 
 echo "self-hosted smoke test passed"
