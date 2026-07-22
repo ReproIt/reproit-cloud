@@ -1,6 +1,25 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+expect_json_integer() {
+  local field="$1"
+  local expected="$2"
+  local document="$3"
+  python3 -c '
+import json
+import sys
+
+field = sys.argv[1]
+expected = int(sys.argv[2])
+actual = json.load(sys.stdin)
+for segment in field.split("."):
+    actual = actual.get(segment) if isinstance(actual, dict) else None
+if actual != expected:
+    print(f"expected JSON field {field!r} to equal {expected}, got {actual!r}", file=sys.stderr)
+    raise SystemExit(1)
+' "$field" "$expected" <<<"$document"
+}
+
 base_url="${REPROIT_SMOKE_URL:-http://127.0.0.1:8080}"
 deadline=$((SECONDS + 90))
 until curl --fail --silent --show-error "$base_url/health" >/dev/null; do
@@ -13,7 +32,10 @@ done
 
 curl --fail --silent --show-error "$base_url/ready" >/dev/null
 login=$(curl --fail --silent --show-error "$base_url/login")
-grep -q 'Sign in' <<<"$login"
+if ! grep -q 'Sign in' <<<"$login"; then
+  echo "Login page did not contain the expected sign-in form" >&2
+  exit 1
+fi
 
 bootstrap=$(
   docker compose exec -T cloud reproit-cloud init \
@@ -62,9 +84,7 @@ ingest=$(
       "evidence": []
     }'
 )
-python3 -c \
-  'import json,sys; raise SystemExit(json.load(sys.stdin).get("errors") != 1)' \
-  <<<"$ingest"
+expect_json_integer ingested.errors 1 "$ingest"
 
 bucket_id=$(
   curl --fail --silent --show-error \
@@ -84,14 +104,10 @@ upload=$(
     -F "file=@$evidence_file;type=text/plain;filename=smoke.txt" \
     "$base_url/v1/apps/$app_id/buckets/$bucket_id/evidence"
 )
-python3 -c \
-  'import json,sys; raise SystemExit(json.load(sys.stdin).get("stored") != 1)' \
-  <<<"$upload"
+expect_json_integer stored 1 "$upload"
 evidence=$(curl --fail --silent --show-error \
   -H "authorization: Bearer $api_key" \
   "$base_url/v1/apps/$app_id/buckets/$bucket_id/evidence")
-python3 -c \
-  'import json,sys; raise SystemExit(json.load(sys.stdin).get("count") != 1)' \
-  <<<"$evidence"
+expect_json_integer count 1 "$evidence"
 
 echo "self-hosted smoke test passed"
