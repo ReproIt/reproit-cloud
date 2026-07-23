@@ -159,6 +159,8 @@ pub const KNOWN_ORACLES: &[(&str, Severity)] = &[
     // Invisible selected/emphasized content: the user cannot read or operate
     // what is rendered, so it ranks with the operability family.
     ("zero-contrast", Severity::Operability),
+    // A swallowed input is inoperable UI by definition.
+    ("dead-input", Severity::Operability),
     ("wakelock", Severity::Leak),
     ("broken-asset", Severity::Jank),
     ("jank", Severity::Jank),

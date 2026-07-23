@@ -17,7 +17,8 @@
     "broken-route",
     "blank-screen",
     "broken-asset",
-    "zero-contrast"
+    "zero-contrast",
+    "dead-input"
   ],
   "confidence": {
     "confirmed_proof": [
@@ -57,7 +58,8 @@
       "broken-asset",
       "zoom-reflow",
       "accessibility-state",
-      "zero-contrast"
+      "zero-contrast",
+      "dead-input"
     ]
   },
   "authoritative_exact_replay": [
@@ -97,6 +99,7 @@
     "wakelock",
     "safe-area",
     "permission-walk",
-    "zero-contrast"
+    "zero-contrast",
+    "dead-input"
   ]
 }
