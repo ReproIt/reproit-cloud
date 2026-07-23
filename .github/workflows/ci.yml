@@ -23,10 +23,15 @@ jobs:
           --health-retries 20
     steps:
       - uses: actions/checkout@v6
+      # The CLI checkout ref is the pin file, never a second hardcoded copy:
+      # cli-contracts.sh --check requires the checkout to be AT the pin, so a
+      # duplicated ref breaks CI on every repin.
+      - id: cli-pin
+        run: echo "commit=$(tr -d '[:space:]' < .reproit-cli-commit)" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v6
         with:
           repository: ReproIt/reproit
-          ref: 4a60ed45fcfc494b161f966217a0d46180fa4267
+          ref: ${{ steps.cli-pin.outputs.commit }}
           path: _upstream/reproit-cli
       - name: Verify canonical CLI contracts
         env:
