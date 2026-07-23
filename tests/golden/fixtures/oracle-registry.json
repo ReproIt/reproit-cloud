@@ -16,7 +16,8 @@
     "hang",
     "broken-route",
     "blank-screen",
-    "broken-asset"
+    "broken-asset",
+    "zero-contrast"
   ],
   "confidence": {
     "confirmed_proof": [
@@ -55,7 +56,8 @@
       "blank-screen",
       "broken-asset",
       "zoom-reflow",
-      "accessibility-state"
+      "accessibility-state",
+      "zero-contrast"
     ]
   },
   "authoritative_exact_replay": [
@@ -94,6 +96,7 @@
     "scroll-round-trip",
     "wakelock",
     "safe-area",
-    "permission-walk"
+    "permission-walk",
+    "zero-contrast"
   ]
 }

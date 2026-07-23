@@ -156,6 +156,9 @@ pub const KNOWN_ORACLES: &[(&str, Severity)] = &[
     ("scroll-round-trip", Severity::Operability),
     ("safe-area", Severity::Operability),
     ("permission-walk", Severity::Operability),
+    // Invisible selected/emphasized content: the user cannot read or operate
+    // what is rendered, so it ranks with the operability family.
+    ("zero-contrast", Severity::Operability),
     ("wakelock", Severity::Leak),
     ("broken-asset", Severity::Jank),
     ("jank", Severity::Jank),
