@@ -23,9 +23,9 @@ jobs:
           --health-retries 20
     steps:
       - uses: actions/checkout@v6
-      # The CLI checkout ref is the pin file, never a second hardcoded copy:
-      # cli-contracts.sh --check requires the checkout to be AT the pin, so a
-      # duplicated ref breaks CI on every repin.
+      # The CLI checkout ref is the pin file, never a second hardcoded copy.
+      # cli-contracts.sh --check is content-based against that checkout; the
+      # pin only records which CLI commit the vendored contracts came from.
       - id: cli-pin
         run: echo "commit=$(tr -d '[:space:]' < .reproit-cli-commit)" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@v6

@@ -18,9 +18,10 @@ CLI/CI findings into stable bugs with reproducible evidence.
 The server never needs application source code. Reproduction jobs are dispatched
 to your CI checkout, and workers run the same `reproit` binary as developers.
 
-The CLI commit in `.reproit-cli-commit` is the source of truth for the shared
-wire protocol, oracle registry, and fixture contract. Run
-`scripts/cli-contracts.sh --check` to verify the vendored Cloud copy.
+The reproit-cli checkout is the source of truth for the shared wire protocol,
+oracle registry, and fixture contract; `.reproit-cli-commit` records which CLI
+commit the vendored copies came from. `scripts/cli-contracts.sh --check`
+verifies the vendored Cloud copy by content; `--sync` refreshes it and the pin.
 
 ## Quick start
 
@@ -130,6 +131,17 @@ COMPOSE_PROJECT_NAME=reproit-object-smoke \
   ./scripts/smoke-self-hosted.sh
 docker compose -p reproit-object-smoke \
   -f compose.yml -f compose.object-store.yml down -v
+```
+
+### Prod-parity Postgres (Neon Local)
+
+Production runs on Neon, so `compose.neon.yml` swaps the bundled Postgres for
+the Neon Local proxy: each `up` opens an ephemeral branch in your Neon project
+and deletes it on stop. Needs `NEON_API_KEY` and `NEON_PROJECT_ID` (see
+`.env.example`); the default compose stays the offline, no-account path.
+
+```bash
+docker compose -f compose.yml -f compose.neon.yml up --build
 ```
 
 The experimental backend-contract dogfood path is opt-in and limited to five
