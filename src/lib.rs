@@ -823,7 +823,7 @@ pub(crate) fn server_error() -> serde_json::Value {
 mod tests {
     use super::{
         admin_target_result, csrf_origin_allowed, host_is_allowed, normalize_host, origin_of,
-        raw_jobs_enabled,
+        raw_jobs_enabled, resolve_db_config,
     };
     use axum::http::HeaderMap;
     use std::collections::HashSet;
