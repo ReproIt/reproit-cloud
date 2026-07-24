@@ -99,22 +99,22 @@ pub(super) async fn run_set_tenant_status(
 }
 
 /// List every tenant in the registry (Cmd::Tenants) as an aligned table: the
-/// ops "what is this installation" read. The name lives on `orgs`; a tenant row
+/// ops "what is this fleet" read. Name and plan live on `orgs`; a tenant row
 /// whose org is gone prints a placeholder rather than erroring the whole list.
 pub(super) async fn run_list_tenants(app: &App) -> anyhow::Result<()> {
     let tenants = app.control.all_tenants().await?;
     let mut rows: Vec<[String; 4]> = Vec::with_capacity(tenants.len());
     for t in &tenants {
-        let name = app
+        let (name, plan) = app
             .control
-            .org_name(t.org_id)
+            .org_name_plan(t.org_id)
             .await?
-            .unwrap_or_else(|| "<no org row>".to_string());
+            .unwrap_or_else(|| ("<no org row>".to_string(), "-".to_string()));
         rows.push([
             t.org_id.to_string(),
             name,
             t.status.as_str().to_string(),
-            "self-hosted".to_string(),
+            plan,
         ]);
     }
     app.control
@@ -125,7 +125,7 @@ pub(super) async fn run_list_tenants(app: &App) -> anyhow::Result<()> {
             serde_json::json!({ "count": rows.len() }),
         )
         .await;
-    print_table(["ORG", "NAME", "STATUS", "EDITION"], &rows);
+    print_table(["ORG", "NAME", "STATUS", "PLAN"], &rows);
     Ok(())
 }
 
@@ -222,7 +222,7 @@ pub(super) async fn run_requeue(app: &App, org_id: i64) -> anyhow::Result<()> {
 /// (evidence-first so a crash can only leave re-processable rows behind, never
 /// orphaned customer bytes in object storage). Batched; errors are logged and
 /// retried on the next hourly pass.
-#[allow(dead_code)] // Enabled when an operator configures a retention policy.
+#[allow(dead_code)] // Driven by the hosted retention loop; self-host owns retention.
 pub(super) async fn retention_pass(tenant: &tenancy::resolver::Tenant, org_id: i64, days: i64) {
     let mut blobs_deleted = 0u64;
     loop {

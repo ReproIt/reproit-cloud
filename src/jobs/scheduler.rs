@@ -67,13 +67,27 @@ const FAIRNESS_PENALTY: f64 = 30.0;
 /// to reacquire a host we just dropped.
 const DOWNSCALE_HYSTERESIS: u32 = 1;
 
+/// Default per-tenant Mac lane cap on the hosted pool when a plan/org sets none.
+pub const DEFAULT_LANE_CAP: u32 = 4;
+
+/// Default free Mac slots held for interactive work on the hosted pool.
+pub const DEFAULT_RESERVED_INTERACTIVE: u32 = 2;
+
 /// Deployment-level scheduler configuration.
 ///
 /// Rationing is a property of the POOL, not the deployment. It applies wherever a
 /// SHARED, FINITE pool executes shards:
-///   * A self-host deployment driving its own simulators does not ration:
+///   * Reproit's HOSTED control plane rations its own Mac pool (`hosted()`):
+///     per-tenant lane caps, interactive headroom, autoscale.
+///   * A SELF-HOST deployment driving its OWN simulators does not (`self_hosted()`):
 ///     that is the customer's capacity, and a pulling worker only claims when it
 ///     has a free slot, so the gates are inert and `pick` is plain least-slack.
+///   * A self-host customer who BURSTS iOS to reproit's pool is, for those shards,
+///     an ordinary tenant on reproit's HOSTED control plane, rationed there. No
+///     self-host code models it; those jobs are submitted to us and gated by our
+///     `hosted()` config.
+///
+/// Follows the existing "self-host removes commercial seat caps" rule (main.rs).
 #[derive(Debug, Clone, Copy)]
 pub struct SchedulerConfig {
     /// When false, the commercial gates are inert (unlimited lanes, no interactive
@@ -88,6 +102,16 @@ pub struct SchedulerConfig {
 }
 
 impl SchedulerConfig {
+    /// Reproit's hosted control plane: ration the shared pool.
+    pub fn hosted() -> Self {
+        Self {
+            rationed: true,
+            default_lane_cap: DEFAULT_LANE_CAP,
+            reserved_interactive: DEFAULT_RESERVED_INTERACTIVE,
+            target_util: TARGET_UTIL,
+        }
+    }
+
     /// A self-host deployment driving its own workers: no rationing, plain
     /// least-slack. Unlimited lanes, no interactive floor.
     pub fn self_hosted() -> Self {
@@ -99,9 +123,35 @@ impl SchedulerConfig {
         }
     }
 
-    /// This distribution has exactly one scheduler posture.
+    /// Select from the environment. `REPROIT_SELF_HOSTED` (the same flag that maps
+    /// `DATABASE_URL` to both planes and removes seat caps) selects `self_hosted`;
+    /// otherwise `hosted`, with optional numeric overrides for the pool knobs.
     pub fn from_env() -> Self {
-        Self::self_hosted()
+        let self_hosted = std::env::var("REPROIT_SELF_HOSTED")
+            .map(|v| !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(false);
+        if self_hosted {
+            return Self::self_hosted();
+        }
+        let mut cfg = Self::hosted();
+        if let Ok(v) = std::env::var("REPROIT_SCHED_LANE_CAP") {
+            if let Ok(n) = v.parse() {
+                cfg.default_lane_cap = n;
+            }
+        }
+        if let Ok(v) = std::env::var("REPROIT_SCHED_RESERVED_INTERACTIVE") {
+            if let Ok(n) = v.parse() {
+                cfg.reserved_interactive = n;
+            }
+        }
+        if let Ok(v) = std::env::var("REPROIT_SCHED_TARGET_UTIL") {
+            if let Ok(n) = v.parse::<f64>() {
+                if n > 0.0 && n <= 1.0 {
+                    cfg.target_util = n;
+                }
+            }
+        }
+        cfg
     }
 
     /// The lane cap to enforce for a tenant, honoring a per-org override. Unlimited
@@ -392,6 +442,16 @@ mod tests {
         let cands = [late, soon];
         let picked = pick(&cands, None, 0).unwrap();
         assert_eq!(picked.deadline_unix, 100);
+    }
+
+    #[test]
+    fn hosted_config_gates_and_honors_org_override() {
+        let cfg = SchedulerConfig::hosted();
+        assert!(cfg.rationed);
+        assert_eq!(cfg.lane_cap(None), DEFAULT_LANE_CAP);
+        assert_eq!(cfg.lane_cap(Some(12)), 12); // per-org override wins when rationed
+        let pool = cfg.pool_state(8, 6).unwrap();
+        assert_eq!(pool.mac_reserved_interactive, DEFAULT_RESERVED_INTERACTIVE);
     }
 
     #[test]

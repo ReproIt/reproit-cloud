@@ -176,32 +176,58 @@ pub fn spawn(app: App) {
     });
 }
 
-/// Run ONE sweep pass over every anchored bucket. Idempotent (re-running with no
-/// underlying change produces no new events), tolerant of an empty DB (the work
-/// list is simply empty), and crash-proof: any per-bucket error is logged and the
-/// pass continues. Public so a test/ops path can trigger a single pass.
+/// Run one bounded pass over tenants whose anchored buckets are due.
 pub async fn sweep_once(app: &App) {
-    // Database-per-org: the anchored buckets live in EACH tenant's db, so the sweep
-    // FANS over active tenants and sweeps each tenant's buckets in its own store.
-    // A tenant that errors (unresolvable / DB blip) is logged and skipped; the
-    // others proceed (failure isolated to one tenant).
-    let tenants = match app.control.all_tenants().await {
-        Ok(t) => t,
+    // Self-host has no edition policy feeding the due-work queue, so each pass
+    // schedules every registered tenant due NOW first. That preserves the
+    // historical sweep-everything-each-interval behavior through the same
+    // queue-driven loop the hosted edition runs.
+    if app.self_hosted {
+        match app.control.all_tenants().await {
+            Ok(tenants) => {
+                for t in tenants {
+                    if t.status != crate::db::TenantStatus::Active {
+                        continue;
+                    }
+                    if let Err(e) = app
+                        .control
+                        .schedule_tenant_work(t.org_id, "resolution", 0)
+                        .await
+                    {
+                        tracing::warn!(
+                            "resolution sweep: self-host enqueue for {} failed: {e}",
+                            t.org_id
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("resolution sweep: list tenants failed: {e}");
+                return;
+            }
+        }
+    }
+    let org_ids = match app.control.tenants_due_for("resolution", 128).await {
+        Ok(ids) => ids,
         Err(e) => {
-            tracing::warn!("resolution sweep: list tenants failed: {e}");
+            tracing::warn!("resolution sweep: due-work read failed: {e}");
             return;
         }
     };
     let now = chrono::Utc::now().to_rfc3339();
     let mut changes = 0u64;
-    for t in tenants {
-        if t.status != crate::db::TenantStatus::Active {
-            continue;
-        }
-        let Ok(tenant) = app.tenancy.resolve(t.org_id).await else {
+    for org_id in org_ids {
+        let Ok(tenant) = app.tenancy.resolve(org_id).await else {
             continue;
         };
-        changes += sweep_tenant(&tenant.store, t.org_id, &now).await;
+        changes += sweep_tenant(&tenant.store, org_id, &now).await;
+        if let Err(error) = app
+            .control
+            .reschedule_tenant_work(org_id, "resolution", interval_secs().unwrap_or(300) as i64)
+            .await
+        {
+            tracing::warn!("resolution sweep reschedule for tenant {org_id} failed: {error}");
+        }
     }
     if changes > 0 {
         tracing::info!("resolution sweep: {changes} status change(s) recorded");

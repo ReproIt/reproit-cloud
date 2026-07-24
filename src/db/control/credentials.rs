@@ -1,3 +1,5 @@
+//! API credential and CLI authorization operations.
+
 use super::*;
 
 impl ControlStore {
@@ -14,7 +16,7 @@ impl ControlStore {
         sqlx::query(
             "INSERT INTO api_keys (key, prefix, org_id, created_by, project_id) VALUES ($1,$2,$3,$4,$5)",
         )
-        .bind(super::key_hash(secret))
+        .bind(crate::db::key_hash(secret))
         .bind(prefix)
         .bind(org_id)
         .bind(created_by)
@@ -37,8 +39,8 @@ impl ControlStore {
             "INSERT INTO cli_authorizations (device_hash, user_code_hash, expires_at)
              VALUES ($1,$2,now() + ($3 || ' seconds')::interval)",
         )
-        .bind(super::key_hash(device_code))
-        .bind(super::key_hash(&user_code.to_ascii_uppercase()))
+        .bind(crate::db::key_hash(device_code))
+        .bind(crate::db::key_hash(&user_code.to_ascii_uppercase()))
         .bind(ttl_secs.to_string())
         .execute(&self.pool)
         .await?;
@@ -55,7 +57,7 @@ impl ControlStore {
             "UPDATE cli_authorizations SET approved=true, user_id=$2, org_id=$3
              WHERE user_code_hash=$1 AND expires_at > now() AND NOT consumed",
         )
-        .bind(super::key_hash(&user_code.to_ascii_uppercase()))
+        .bind(crate::db::key_hash(&user_code.to_ascii_uppercase()))
         .bind(user_id)
         .bind(org_id)
         .execute(&self.pool)
@@ -63,7 +65,6 @@ impl ControlStore {
         Ok(result.rows_affected() == 1)
     }
 
-    /// Return `(approved, consumed)` for a live device authorization.
     pub async fn cli_authorization_state(
         &self,
         device_code: &str,
@@ -72,14 +73,12 @@ impl ControlStore {
             "SELECT approved, consumed FROM cli_authorizations
              WHERE device_hash=$1 AND expires_at > now()",
         )
-        .bind(super::key_hash(device_code))
+        .bind(crate::db::key_hash(device_code))
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(|r| (r.get("approved"), r.get("consumed"))))
     }
 
-    /// Atomically consume an approved device grant and mint its account token.
-    /// Returns the selected org id, or `None` if the grant was not consumable.
     pub async fn consume_cli_authorization(
         &self,
         device_code: &str,
@@ -92,7 +91,7 @@ impl ControlStore {
              WHERE device_hash=$1 AND approved AND NOT consumed AND expires_at > now()
              FOR UPDATE",
         )
-        .bind(super::key_hash(device_code))
+        .bind(crate::db::key_hash(device_code))
         .fetch_optional(&mut *tx)
         .await?;
         let Some(row) = row else {
@@ -105,14 +104,14 @@ impl ControlStore {
             "INSERT INTO api_keys (key, prefix, org_id, created_by, project_id)
              VALUES ($1,$2,$3,$4,NULL)",
         )
-        .bind(super::key_hash(secret))
+        .bind(crate::db::key_hash(secret))
         .bind(prefix)
         .bind(org_id)
         .bind(user_id)
         .execute(&mut *tx)
         .await?;
         sqlx::query("UPDATE cli_authorizations SET consumed=true WHERE device_hash=$1")
-            .bind(super::key_hash(device_code))
+            .bind(crate::db::key_hash(device_code))
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
@@ -130,8 +129,8 @@ impl ControlStore {
             .collect())
     }
 
-    /// (org_id, plan, project_id, created_by) that owns an API key. This is the
-    /// hot per-request routing read: the org id it returns is
+    /// (org_id, plan, project_id, created_by) that owns an API key, for CLI/SDK auth + plan
+    /// gating. This is the hot per-request routing read: the org id it returns is
     /// what the resolver maps to a tenant database. `project_id` is the tenant-db
     /// project the key was minted for (None for org-wide keys); ingest uses it to
     /// pin a publishable key to its own app.
@@ -147,7 +146,7 @@ impl ControlStore {
                AND k.active
                AND (k.expires_at IS NULL OR k.expires_at > now())",
         )
-        .bind(super::key_hash(presented))
+        .bind(crate::db::key_hash(presented))
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(|r| {
@@ -164,7 +163,7 @@ impl ControlStore {
     /// half of a dual-key mint fails; the key was never returned to anyone).
     pub async fn delete_api_key(&self, secret: &str) -> anyhow::Result<()> {
         sqlx::query("DELETE FROM api_keys WHERE key = $1")
-            .bind(super::key_hash(secret))
+            .bind(crate::db::key_hash(secret))
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -200,6 +199,8 @@ impl ControlStore {
             .await
             .map_err(Into::into)
     }
+
+    // ---- stripe billing reconciliation ------------------------------------
 
     pub async fn org_exists(&self, org_id: i64) -> anyhow::Result<bool> {
         let row = sqlx::query_scalar::<_, i32>("SELECT 1 FROM orgs WHERE id = $1")

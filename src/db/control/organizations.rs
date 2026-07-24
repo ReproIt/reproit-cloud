@@ -1,3 +1,5 @@
+//! Organization, membership, invitation, and seat operations.
+
 use super::*;
 
 impl ControlStore {
@@ -25,11 +27,27 @@ impl ControlStore {
         Ok(())
     }
 
+    // Consumed by the hosted sign-in flow; self-host has no caller yet.
+    #[allow(dead_code)]
+    pub async fn primary_org(&self, user_id: i64) -> anyhow::Result<Option<Org>> {
+        let row = sqlx::query(
+            "SELECT o.id, o.name, o.plan, m.role
+             FROM org_members m JOIN orgs o ON o.id = m.org_id
+             WHERE m.user_id = $1
+             ORDER BY o.personal DESC, o.id ASC LIMIT 1",
+        )
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(row_to_org))
+    }
+
     pub async fn list_user_orgs(&self, user_id: i64) -> anyhow::Result<Vec<OrgSummary>> {
         let rows = sqlx::query(
             "SELECT o.id, o.name, o.plan, o.personal, m.role
              FROM org_members m JOIN orgs o ON o.id = m.org_id
-             WHERE m.user_id = $1 ORDER BY o.personal DESC, lower(o.name), o.id",
+             WHERE m.user_id = $1
+             ORDER BY o.personal DESC, lower(o.name), o.id",
         )
         .bind(user_id)
         .fetch_all(&self.pool)
@@ -37,11 +55,11 @@ impl ControlStore {
         Ok(rows
             .into_iter()
             .map(|r| OrgSummary {
-                id: r.get("id"),
-                name: r.get("name"),
-                plan: r.get("plan"),
-                role: r.get("role"),
-                personal: r.get("personal"),
+                id: r.get::<i64, _>("id"),
+                name: r.get::<String, _>("name"),
+                plan: r.get::<String, _>("plan"),
+                role: r.get::<String, _>("role"),
+                personal: r.get::<bool, _>("personal"),
             })
             .collect())
     }
@@ -126,6 +144,12 @@ impl ControlStore {
         Ok(())
     }
 
+    // ---- organization invitations -----------------------------------------
+
+    /// Create or replace one pending invitation while holding the org row lock,
+    /// so concurrent invites cannot overbook hosted seats. `seat_limit=None`
+    /// means self-hosted and therefore uncapped. Returns None when capacity is
+    /// exhausted; otherwise returns the durable invitation id.
     #[allow(clippy::too_many_arguments)]
     pub async fn upsert_org_invitation(
         &self,
@@ -147,11 +171,16 @@ impl ControlStore {
             if let Some(limit) = seat_limit {
                 let used: i64 = sqlx::query_scalar(
                     "SELECT
-                       (SELECT count(*) FROM org_members WHERE org_id = $1 AND (seat OR role = 'owner'))
+                       (SELECT count(*) FROM org_members
+                        WHERE org_id = $1 AND (seat OR role = 'owner'))
                        +
                        (SELECT count(*) FROM org_invitations
                         WHERE org_id = $1 AND seat AND expires_at > now() AND email <> $2)",
-                ).bind(org_id).bind(email).fetch_one(&mut *tx).await?;
+                )
+                .bind(org_id)
+                .bind(email)
+                .fetch_one(&mut *tx)
+                .await?;
                 if used >= limit {
                     tx.rollback().await?;
                     return Ok(None);
@@ -164,11 +193,15 @@ impl ControlStore {
                (token_hash, org_id, email, role, seat, invited_by, expires_at)
              VALUES ($1,$2,$3,$4,$5,$6,$7)
              ON CONFLICT (org_id, email) DO UPDATE SET
-               token_hash=EXCLUDED.token_hash, role=EXCLUDED.role, seat=EXCLUDED.seat,
-               invited_by=EXCLUDED.invited_by, expires_at=EXCLUDED.expires_at, updated_at=now()
+               token_hash = EXCLUDED.token_hash,
+               role = EXCLUDED.role,
+               seat = EXCLUDED.seat,
+               invited_by = EXCLUDED.invited_by,
+               expires_at = EXCLUDED.expires_at,
+               updated_at = now()
              RETURNING id",
         )
-        .bind(super::key_hash(raw_token))
+        .bind(crate::db::key_hash(raw_token))
         .bind(org_id)
         .bind(email)
         .bind(role)
@@ -183,9 +216,10 @@ impl ControlStore {
 
     pub async fn list_org_invitations(&self, org_id: i64) -> anyhow::Result<Vec<OrgInvitation>> {
         let rows = sqlx::query(
-            "SELECT i.id, o.name AS org_name, i.email, i.role, i.seat, i.expires_at
-             FROM org_invitations i JOIN orgs o ON o.id=i.org_id
-             WHERE i.org_id=$1 AND i.expires_at>now() ORDER BY lower(i.email)",
+            "SELECT i.id, i.org_id, o.name AS org_name, i.email, i.role, i.seat, i.expires_at
+             FROM org_invitations i JOIN orgs o ON o.id = i.org_id
+             WHERE i.org_id = $1 AND i.expires_at > now()
+             ORDER BY lower(i.email)",
         )
         .bind(org_id)
         .fetch_all(&self.pool)
@@ -198,11 +232,11 @@ impl ControlStore {
         raw_token: &str,
     ) -> anyhow::Result<Option<OrgInvitation>> {
         let row = sqlx::query(
-            "SELECT i.id, o.name AS org_name, i.email, i.role, i.seat, i.expires_at
-             FROM org_invitations i JOIN orgs o ON o.id=i.org_id
-             WHERE i.token_hash=$1 AND i.expires_at>now()",
+            "SELECT i.id, i.org_id, o.name AS org_name, i.email, i.role, i.seat, i.expires_at
+             FROM org_invitations i JOIN orgs o ON o.id = i.org_id
+             WHERE i.token_hash = $1 AND i.expires_at > now()",
         )
-        .bind(super::key_hash(raw_token))
+        .bind(crate::db::key_hash(raw_token))
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.map(row_to_invitation))
@@ -217,13 +251,14 @@ impl ControlStore {
     ) -> anyhow::Result<Option<OrgInvitation>> {
         let expires = chrono::Utc::now() + chrono::Duration::seconds(ttl_secs);
         let row = sqlx::query(
-            "UPDATE org_invitations i SET token_hash=$3, expires_at=$4, updated_at=now()
-             FROM orgs o WHERE i.id=$2 AND i.org_id=$1 AND o.id=i.org_id
-             RETURNING i.id, o.name AS org_name, i.email, i.role, i.seat, i.expires_at",
+            "UPDATE org_invitations i SET token_hash = $3, expires_at = $4, updated_at = now()
+             FROM orgs o
+             WHERE i.id = $2 AND i.org_id = $1 AND o.id = i.org_id
+             RETURNING i.id, i.org_id, o.name AS org_name, i.email, i.role, i.seat, i.expires_at",
         )
         .bind(org_id)
         .bind(invitation_id)
-        .bind(super::key_hash(raw_token))
+        .bind(crate::db::key_hash(raw_token))
         .bind(expires)
         .fetch_optional(&self.pool)
         .await?;
@@ -235,7 +270,7 @@ impl ControlStore {
         org_id: i64,
         invitation_id: i64,
     ) -> anyhow::Result<bool> {
-        let r = sqlx::query("DELETE FROM org_invitations WHERE org_id=$1 AND id=$2")
+        let r = sqlx::query("DELETE FROM org_invitations WHERE org_id = $1 AND id = $2")
             .bind(org_id)
             .bind(invitation_id)
             .execute(&self.pool)
@@ -243,6 +278,9 @@ impl ControlStore {
         Ok(r.rows_affected() == 1)
     }
 
+    /// Atomically consume an email-bound invite and attach the verified user.
+    /// The invitation's reserved seat transfers to the membership in the same
+    /// transaction, so capacity is neither lost nor double-counted.
     pub async fn accept_org_invitation(
         &self,
         raw_token: &str,
@@ -252,10 +290,10 @@ impl ControlStore {
         let mut tx = self.pool.begin().await?;
         let row = sqlx::query(
             "DELETE FROM org_invitations
-             WHERE token_hash=$1 AND email=$2 AND expires_at>now()
+             WHERE token_hash = $1 AND email = $2 AND expires_at > now()
              RETURNING org_id, role, seat",
         )
-        .bind(super::key_hash(raw_token))
+        .bind(crate::db::key_hash(raw_token))
         .bind(verified_email)
         .fetch_optional(&mut *tx)
         .await?;
@@ -263,32 +301,55 @@ impl ControlStore {
             tx.rollback().await?;
             return Ok(None);
         };
-        let org_id: i64 = row.get("org_id");
+        let org_id = row.get::<i64, _>("org_id");
+        let role = row.get::<String, _>("role");
+        let seat = row.get::<bool, _>("seat");
         sqlx::query(
-            "INSERT INTO org_members (org_id,user_id,role,seat) VALUES ($1,$2,$3,$4)
-             ON CONFLICT (org_id,user_id) DO UPDATE SET role=EXCLUDED.role, seat=org_members.seat OR EXCLUDED.seat",
-        ).bind(org_id).bind(user_id).bind(row.get::<String,_>("role")).bind(row.get::<bool,_>("seat"))
-            .execute(&mut *tx).await?;
+            "INSERT INTO org_members (org_id, user_id, role, seat) VALUES ($1,$2,$3,$4)
+             ON CONFLICT (org_id, user_id) DO UPDATE SET
+               role = EXCLUDED.role,
+               seat = org_members.seat OR EXCLUDED.seat",
+        )
+        .bind(org_id)
+        .bind(user_id)
+        .bind(role)
+        .bind(seat)
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
         Ok(Some(org_id))
     }
 
     pub async fn prune_org_invitations(&self) -> anyhow::Result<u64> {
-        let r = sqlx::query("DELETE FROM org_invitations WHERE expires_at<now()")
+        let r = sqlx::query("DELETE FROM org_invitations WHERE expires_at < now()")
             .execute(&self.pool)
             .await?;
         Ok(r.rows_affected())
     }
 
-    pub async fn org_name(&self, org_id: i64) -> anyhow::Result<Option<String>> {
-        let row = sqlx::query("SELECT name FROM orgs WHERE id = $1")
+    /// An org's display name + plan (the ops `tenants` table columns that live
+    /// on `orgs`, not `tenants`). None when the org row is gone (offboarded
+    /// with a stale tenants row, which delete_org's cascade normally prevents).
+    pub async fn org_name_plan(&self, org_id: i64) -> anyhow::Result<Option<(String, String)>> {
+        let row = sqlx::query("SELECT name, plan FROM orgs WHERE id = $1")
             .bind(org_id)
             .fetch_optional(&self.pool)
             .await?;
-        Ok(row.map(|r| r.get::<String, _>("name")))
+        Ok(row.map(|r| (r.get::<String, _>("name"), r.get::<String, _>("plan"))))
     }
 
-    // ---- per-workspace dashboard access -------------------------------------
+    // Consumed by the hosted billing overlay; self-host stays on the default plan.
+    #[allow(dead_code)]
+    pub async fn set_org_plan(&self, org_id: i64, plan: &str) -> anyhow::Result<()> {
+        sqlx::query("UPDATE orgs SET plan = $1 WHERE id = $2")
+            .bind(plan)
+            .bind(org_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    // ---- per-org seats (control-plane: a seat is per-org commercial state) ---
 
     pub async fn has_seat(&self, org_id: i64, user_id: i64) -> anyhow::Result<bool> {
         let row = sqlx::query_scalar::<_, i32>(
@@ -300,6 +361,18 @@ impl ControlStore {
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.is_some())
+    }
+
+    // Consumed by the hosted seat caps; self-host is uncapped.
+    #[allow(dead_code)]
+    pub async fn count_seats(&self, org_id: i64) -> anyhow::Result<i64> {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM org_members WHERE org_id = $1 AND (seat OR role = 'owner')",
+        )
+        .bind(org_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(n)
     }
 
     pub async fn set_seat(&self, org_id: i64, user_id: i64, seat: bool) -> anyhow::Result<bool> {

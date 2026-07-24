@@ -1,26 +1,30 @@
 //! The CONTROL-PLANE store: the one small shared Postgres that knows about
-//! local identity and routing metadata, and NEVER holds customer telemetry or videos.
+//! identity and routing metadata, and NEVER holds customer telemetry or videos.
 //!
 //! Under database-per-org this is the only cross-tenant database. It holds exactly
 //! what must be queryable BEFORE a tenant is resolved (you log in, THEN we resolve
 //! your org -> tenant) or what is the routing key itself:
-//!   - identity: `users`, `sessions`
-//!   - local workspace membership: `orgs`, `org_members`
+//!   - identity: `users`, `sessions`, single-use `email_tokens`
+//!   - membership: `orgs` (with a value-free `plan` label), `org_members` (+
+//!     seats), `org_invitations`, externally provisioned `directory_users`
 //!   - the routing keys: `api_keys` (a CLI/SDK key names its tenant) and the
 //!     `tenants` registry (org id -> connection string + blob scope + status)
+//!   - tenant maintenance state: `tenant_pending_shards`, `tenant_due_work`,
+//!     `org_usage` counters, and the append-only `audit_log`
+//!
+//! The hosted edition extends `orgs` with billing/SSO columns and adds its own
+//! tables through a schema applied AFTER this one (see the deploy repo's
+//! `hosted_control.rs`); nothing here names a plan or a vendor.
 //!
 //! App-scoped data (errors, evidence, triage, jobs, ...) does NOT live here; it
 //! lives in the per-tenant database behind `tenants.db_conn`. See
 //! `crate::db::tenant::TenantStore`.
 
-use super::{key_hash, Member, Org, OrgInvitation, OrgSummary, TenantRecord, TenantStatus, User};
+use super::{Member, Org, OrgInvitation, OrgSummary, TenantRecord, TenantStatus, User};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
 
 use super::secrets::{decrypt as decrypt_conn, encrypt as encrypt_conn};
-
-mod access;
-mod organizations;
 
 /// The control-plane schema. Applied on boot, idempotently. The control DB is a
 /// SINGLE shared database whose shape changes rarely; schema-on-boot
@@ -34,6 +38,18 @@ CREATE TABLE IF NOT EXISTS users (
   pass_hash   TEXT NOT NULL,
   created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified_at TIMESTAMPTZ;
+-- Single-use email flow tokens (signup verification, password reset). Stored
+-- HASHED like sessions/API keys; consuming is a DELETE ... RETURNING so a token
+-- can never be replayed.
+CREATE TABLE IF NOT EXISTS email_tokens (
+  token_hash TEXT PRIMARY KEY,
+  user_id    BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  purpose    TEXT NOT NULL,
+  expires_at TIMESTAMPTZ NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS email_tokens_user ON email_tokens(user_id);
 CREATE TABLE IF NOT EXISTS sessions (
   token      TEXT PRIMARY KEY,
   user_id    BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -43,13 +59,19 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 ALTER TABLE sessions ADD COLUMN IF NOT EXISTS active_org_id BIGINT;
 CREATE INDEX IF NOT EXISTS sessions_user ON sessions(user_id);
+CREATE INDEX IF NOT EXISTS sessions_expires_at
+  ON sessions(expires_at) WHERE expires_at IS NOT NULL;
 CREATE TABLE IF NOT EXISTS orgs (
   id              BIGSERIAL PRIMARY KEY,
   name            TEXT NOT NULL,
+  plan            TEXT NOT NULL DEFAULT 'free',
   personal        BOOLEAN NOT NULL DEFAULT false,
   created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-ALTER TABLE orgs ADD COLUMN IF NOT EXISTS personal        BOOLEAN NOT NULL DEFAULT false;
+ALTER TABLE orgs ADD COLUMN IF NOT EXISTS personal BOOLEAN NOT NULL DEFAULT false;
+-- The plan label is a value-free string; what any plan MEANS (limits, prices)
+-- lives entirely in the hosted overlay. Self-host stays on the default.
+ALTER TABLE orgs ADD COLUMN IF NOT EXISTS plan TEXT NOT NULL DEFAULT 'free';
 CREATE TABLE IF NOT EXISTS org_members (
   org_id    BIGINT NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
   user_id   BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -60,6 +82,8 @@ CREATE TABLE IF NOT EXISTS org_members (
 );
 CREATE INDEX IF NOT EXISTS org_members_user ON org_members(user_id);
 CREATE INDEX IF NOT EXISTS org_members_seated ON org_members(org_id) WHERE seat;
+-- Explicit, email-bound organization invitations. A pending seat invitation
+-- reserves capacity until it is accepted, revoked, replaced, or expires.
 CREATE TABLE IF NOT EXISTS org_invitations (
   id          BIGSERIAL PRIMARY KEY,
   token_hash  TEXT UNIQUE NOT NULL,
@@ -107,6 +131,16 @@ CREATE TABLE IF NOT EXISTS cli_authorizations (
   created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS cli_authorizations_expiry ON cli_authorizations(expires_at);
+-- Externally provisioned memberships (a directory/SCIM overlay writes here;
+-- self-host simply never has rows). Read by list_org_users.
+CREATE TABLE IF NOT EXISTS directory_users (
+  external_id TEXT PRIMARY KEY,
+  org_id      BIGINT NOT NULL REFERENCES orgs(id)  ON DELETE CASCADE,
+  user_id     BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  active      BOOLEAN NOT NULL DEFAULT true,
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS directory_users_org ON directory_users(org_id);
 -- ---- the tenant registry: org id -> its database + blob scope ----------------
 -- The heart of database-per-org. One row per org binds it to a Postgres
 -- connection string (the tenant database) and a blob scope (bucket/prefix). The
@@ -148,6 +182,26 @@ CREATE TABLE IF NOT EXISTS tenant_pending_shards (
   org_id     BIGINT PRIMARY KEY REFERENCES orgs(id) ON DELETE CASCADE,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+CREATE TABLE IF NOT EXISTS tenant_due_work (
+  org_id    BIGINT NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
+  work_kind TEXT NOT NULL,
+  due_at    TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (org_id, work_kind)
+);
+CREATE INDEX IF NOT EXISTS tenant_due_work_claimable
+  ON tenant_due_work(work_kind, due_at, org_id);
+-- ---- usage metering: monthly occurrence counters per org ---------------------
+-- One row per (org, YYYY-MM). Incremented once per ingest batch (by that
+-- batch's error-event count) and read by the hard plan cap. Occurrences live
+-- in the control plane because the plan is org-level and ingest already
+-- touches this DB for key auth. Customer-owned CI execution is not metered.
+CREATE TABLE IF NOT EXISTS org_usage (
+  org_id      BIGINT NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
+  period      TEXT NOT NULL,
+  occurrences BIGINT NOT NULL DEFAULT 0,
+  updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (org_id, period)
+);
 -- ---- security audit trail ------------------------------------------------------
 -- Who did what, when, to which org. Append-only; written fire-and-forget (an
 -- audit failure must never fail the audited request) for: admin-key requests,
@@ -165,6 +219,11 @@ CREATE INDEX IF NOT EXISTS audit_log_org ON audit_log(org_id, id);
 
 /// The shared control-plane store. One pool, one database, cross-tenant by design
 /// (it is the registry), but free of customer telemetry/videos.
+mod credentials;
+mod identity;
+mod organizations;
+mod tenant_registry;
+
 pub struct ControlStore {
     pool: PgPool,
 }
@@ -180,7 +239,10 @@ pub struct AuditRow {
 }
 
 impl ControlStore {
-    #[cfg(test)]
+    /// The raw pool. The seam for edition overlays (the hosted repo extends
+    /// ControlStore with impl blocks in its own modules) and for tests; shared
+    /// handlers go through the typed methods, never this.
+    #[allow(dead_code)] // The hosted overlay and tests reach it; shared flow must not.
     pub(crate) fn pool(&self) -> &PgPool {
         &self.pool
     }
@@ -258,348 +320,26 @@ impl ControlStore {
             .await?;
         Ok(())
     }
+}
 
-    // ---- tenant registry (the routing table) -------------------------------
-
-    /// Insert (or adopt) a tenant row in `provisioning`. Idempotent on org_id so a
-    /// retried signup adopts the in-flight row rather than failing. Returns the
-    /// current record after the upsert.
-    pub async fn begin_provisioning(&self, org_id: i64) -> anyhow::Result<TenantRecord> {
-        sqlx::query(
-            "INSERT INTO tenants (org_id, status) VALUES ($1, 'provisioning')
-             ON CONFLICT (org_id) DO UPDATE SET updated_at = now()",
-        )
-        .bind(org_id)
-        .execute(&self.pool)
-        .await?;
-        self.tenant(org_id)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("tenant row vanished after insert"))
-    }
-
-    /// Every tenant still stuck in `provisioning`, for the startup reconciler
-    /// (a signup that died mid-provision converges to active on next boot).
-    pub async fn provisioning_tenants(&self) -> anyhow::Result<Vec<i64>> {
-        let rows = sqlx::query("SELECT org_id FROM tenants WHERE status = 'provisioning'")
-            .fetch_all(&self.pool)
-            .await?;
-        Ok(rows.iter().map(|r| r.get::<i64, _>("org_id")).collect())
-    }
-
-    /// Record the provisioned connection string for a tenant (idempotent overwrite).
-    /// The conn string is encrypted at rest before storage (no-op passthrough when
-    /// REPROIT_CONN_ENC_KEY is unset; see [`encrypt_conn`]).
-    pub async fn set_tenant_conn(&self, org_id: i64, db_conn: &str) -> anyhow::Result<()> {
-        let stored = encrypt_conn(db_conn)?;
-        sqlx::query("UPDATE tenants SET db_conn = $2, updated_at = now() WHERE org_id = $1")
-            .bind(org_id)
-            .bind(stored)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-
-    /// Record the blob scope (mode + scope key) for a tenant (idempotent).
-    pub async fn set_tenant_blob(
-        &self,
-        org_id: i64,
-        mode: &str,
-        scope: &str,
-    ) -> anyhow::Result<()> {
-        sqlx::query(
-            "UPDATE tenants SET blob_mode = $2, blob_scope = $3, updated_at = now() WHERE org_id = $1",
-        )
-        .bind(org_id)
-        .bind(mode)
-        .bind(scope)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    /// Flip a tenant's lifecycle status (provisioning -> active, active ->
-    /// suspended, ...). The resolver only serves `active` tenants.
-    pub async fn set_tenant_status(&self, org_id: i64, status: TenantStatus) -> anyhow::Result<()> {
-        sqlx::query("UPDATE tenants SET status = $2, updated_at = now() WHERE org_id = $1")
-            .bind(org_id)
-            .bind(status.as_str())
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-
-    /// The tenant record for an org, or None if the org has no tenant row yet.
-    pub async fn tenant(&self, org_id: i64) -> anyhow::Result<Option<TenantRecord>> {
-        let row = sqlx::query(
-            "SELECT org_id, status, db_conn, blob_mode, blob_scope, region FROM tenants WHERE org_id = $1",
-        )
-        .bind(org_id)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row.map(row_to_tenant))
-    }
-
-    /// Every tenant the fleet sweep must visit, ordered for a
-    /// stable, resumable sweep. Includes only tenants that have a connection string
-    /// (a still-`provisioning` row with no DB yet has nothing to sweep).
-    pub async fn all_tenants(&self) -> anyhow::Result<Vec<TenantRecord>> {
-        let rows = sqlx::query(
-            "SELECT org_id, status, db_conn, blob_mode, blob_scope, region FROM tenants
-             WHERE db_conn IS NOT NULL ORDER BY org_id",
-        )
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows.into_iter().map(row_to_tenant).collect())
-    }
-
-    // ---- worker-claim routing hint (tenant_pending_shards) -----------------
-    // See the table comment in CONTROL_SCHEMA for the correctness invariant: a
-    // tenant MUST be present whenever it has >=1 pending shard; over-inclusion is
-    // harmless and self-heals, under-inclusion starves shards.
-
-    /// Mark a tenant as having pending work to claim. Called on EVERY transition
-    /// INTO pending (job submission, requeue-stranded). Idempotent: a no-op if the
-    /// tenant is already marked, so repeated marks are cheap.
-    pub async fn mark_tenant_pending(&self, org_id: i64) -> anyhow::Result<()> {
-        sqlx::query(
-            "INSERT INTO tenant_pending_shards (org_id, updated_at) VALUES ($1, now())
-             ON CONFLICT (org_id) DO UPDATE SET updated_at = now()",
-        )
-        .bind(org_id)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    /// Clear a tenant from the pending set. The caller MUST have just observed a
-    /// fresh `COUNT(*) WHERE state='pending' == 0` for this tenant; clearing on a
-    /// mere empty claim (which can mean "all locked by other workers") would strand
-    /// a later requeue.
-    pub async fn clear_tenant_pending(&self, org_id: i64) -> anyhow::Result<()> {
-        sqlx::query("DELETE FROM tenant_pending_shards WHERE org_id = $1")
-            .bind(org_id)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
-    }
-
-    /// The org ids the worker fleet should try to claim from (presence = "has >=1
-    /// pending shard"). The claim path resolves each to its tenant store and claims;
-    /// a tenant whose fresh pending count is 0 is then cleared by the caller.
-    pub async fn tenants_with_pending(&self) -> anyhow::Result<Vec<i64>> {
-        let rows = sqlx::query("SELECT org_id FROM tenant_pending_shards ORDER BY org_id")
-            .fetch_all(&self.pool)
-            .await?;
-        Ok(rows.iter().map(|r| r.get::<i64, _>("org_id")).collect())
-    }
-
-    /// Offboard: delete the org row; members, API keys, the tenants row, seats,
-    /// and usage counters cascade. Audit rows survive (no FK) as the record of
-    /// the offboarding itself. Returns whether an org was deleted.
-    pub async fn delete_org(&self, org_id: i64) -> anyhow::Result<bool> {
-        let r = sqlx::query("DELETE FROM orgs WHERE id = $1")
-            .bind(org_id)
-            .execute(&self.pool)
-            .await?;
-        Ok(r.rows_affected() > 0)
-    }
-
-    // ---- users / sessions --------------------------------------------------
-
-    pub async fn create_user(&self, email: &str, pass_hash: &str) -> anyhow::Result<i64> {
-        let row = sqlx::query("INSERT INTO users (email, pass_hash) VALUES ($1,$2) RETURNING id")
-            .bind(email)
-            .bind(pass_hash)
-            .fetch_one(&self.pool)
-            .await?;
-        Ok(row.get::<i64, _>("id"))
-    }
-
-    pub async fn user_auth_by_email(&self, email: &str) -> anyhow::Result<Option<(i64, String)>> {
-        let row = sqlx::query("SELECT id, pass_hash FROM users WHERE email = $1")
-            .bind(email)
-            .fetch_optional(&self.pool)
-            .await?;
-        Ok(row.map(|r| (r.get::<i64, _>("id"), r.get::<String, _>("pass_hash"))))
-    }
-
-    pub async fn find_user_id_by_email(&self, email: &str) -> anyhow::Result<Option<i64>> {
-        let row = sqlx::query("SELECT id FROM users WHERE email = $1")
-            .bind(email)
-            .fetch_optional(&self.pool)
-            .await?;
-        Ok(row.map(|r| r.get::<i64, _>("id")))
-    }
-
-    // Sessions are stored HASHED (same SHA-256 scheme as API keys): a leaked DB
-    // dump or backup must not yield live 30-day sessions. The raw token exists
-    // only in the user's cookie; every query binds key_hash(token).
-    pub async fn create_session(
-        &self,
-        token: &str,
-        user_id: i64,
-        ttl_secs: i64,
-    ) -> anyhow::Result<()> {
-        let expires = chrono::Utc::now() + chrono::Duration::seconds(ttl_secs);
-        sqlx::query(
-            "INSERT INTO sessions (token, user_id, active_org_id, expires_at)
-             VALUES ($1,$2,(
-               SELECT o.id FROM org_members m JOIN orgs o ON o.id = m.org_id
-               WHERE m.user_id = $2
-               ORDER BY o.personal DESC, o.id ASC LIMIT 1
-             ),$3)",
-        )
-        .bind(super::key_hash(token))
-        .bind(user_id)
-        .bind(expires)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
-    }
-
-    pub async fn user_for_session(&self, token: &str) -> anyhow::Result<Option<User>> {
-        let row = sqlx::query(
-            "SELECT u.id, u.email FROM sessions s
-             JOIN users u ON u.id = s.user_id
-             WHERE s.token = $1 AND (s.expires_at IS NULL OR s.expires_at > now())",
-        )
-        .bind(super::key_hash(token))
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row.map(|r| User {
-            id: r.get::<i64, _>("id"),
-            email: r.get::<String, _>("email"),
-        }))
-    }
-
-    pub async fn user_and_org_for_session(
-        &self,
-        token: &str,
-    ) -> anyhow::Result<Option<(User, Org)>> {
-        let row = sqlx::query(
-            "WITH live AS (
-               SELECT user_id, active_org_id FROM sessions
-               WHERE token = $1 AND (expires_at IS NULL OR expires_at > now())
-             )
-             SELECT u.id AS user_id, u.email, o.id, o.name, o.plan, m.role
-             FROM live s
-             JOIN users u ON u.id = s.user_id
-             JOIN org_members m ON m.user_id = s.user_id
-             JOIN orgs o ON o.id = m.org_id
-             ORDER BY (o.id = s.active_org_id) DESC, o.personal DESC, o.id ASC
-             LIMIT 1",
-        )
-        .bind(super::key_hash(token))
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row.map(|r| {
-            (
-                User {
-                    id: r.get("user_id"),
-                    email: r.get("email"),
-                },
-                Org {
-                    id: r.get("id"),
-                    name: r.get("name"),
-                    plan: r.get("plan"),
-                    role: r.get("role"),
-                },
-            )
-        }))
-    }
-
-    pub async fn set_session_org(
-        &self,
-        token: &str,
-        user_id: i64,
-        org_id: i64,
-    ) -> anyhow::Result<bool> {
-        let r = sqlx::query(
-            "UPDATE sessions s SET active_org_id = $3
-             WHERE s.token = $1 AND s.user_id = $2
-               AND (s.expires_at IS NULL OR s.expires_at > now())
-               AND EXISTS (SELECT 1 FROM org_members m WHERE m.org_id = $3 AND m.user_id = $2)",
-        )
-        .bind(super::key_hash(token))
-        .bind(user_id)
-        .bind(org_id)
-        .execute(&self.pool)
-        .await?;
-        Ok(r.rows_affected() == 1)
-    }
-
-    /// Append a security-audit row. Fire-and-forget by design: auditing must
-    /// never fail (or slow the tail of) the request being audited, so failures
-    /// are logged and swallowed here rather than surfaced to the caller.
-    pub async fn audit(
-        &self,
-        actor: &str,
-        action: &str,
-        org_id: Option<i64>,
-        detail: serde_json::Value,
-    ) {
-        let r = sqlx::query(
-            "INSERT INTO audit_log (actor, action, org_id, detail) VALUES ($1,$2,$3,$4)",
-        )
-        .bind(actor)
-        .bind(action)
-        .bind(org_id)
-        .bind(detail)
-        .execute(&self.pool)
-        .await;
-        if let Err(e) = r {
-            tracing::warn!("audit write failed ({actor} {action}): {e}");
-        }
-    }
-
-    /// The most recent audit rows for one org, NEWEST FIRST. The table was
-    /// write-only until this read; the ops CLI (`audit <org>`) is its first
-    /// consumer. One indexed backward scan (`audit_log_org` is (org_id, id)),
-    /// bounded by `limit`.
-    pub async fn audit_for_org(&self, org_id: i64, limit: i64) -> anyhow::Result<Vec<AuditRow>> {
-        let rows = sqlx::query(
-            "SELECT actor, action, detail, at FROM audit_log
-             WHERE org_id = $1 ORDER BY id DESC LIMIT $2",
-        )
-        .bind(org_id)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows
-            .into_iter()
-            .map(|r| AuditRow {
-                actor: r.get::<String, _>("actor"),
-                action: r.get::<String, _>("action"),
-                detail: r.get::<serde_json::Value, _>("detail"),
-                at: r.get::<chrono::DateTime<chrono::Utc>, _>("at").to_rfc3339(),
-            })
-            .collect())
-    }
-
-    pub async fn prune_sessions(&self) -> anyhow::Result<u64> {
-        let r =
-            sqlx::query("DELETE FROM sessions WHERE expires_at IS NOT NULL AND expires_at < now()")
-                .execute(&self.pool)
-                .await?;
-        Ok(r.rows_affected())
-    }
-
-    pub async fn delete_session(&self, token: &str) -> anyhow::Result<()> {
-        sqlx::query("DELETE FROM sessions WHERE token = $1")
-            .bind(super::key_hash(token))
-            .execute(&self.pool)
-            .await?;
-        Ok(())
+// Consumed by primary_org (hosted sign-in flow); self-host has no caller yet.
+#[allow(dead_code)]
+fn row_to_org(r: sqlx::postgres::PgRow) -> Org {
+    Org {
+        id: r.get::<i64, _>("id"),
+        name: r.get::<String, _>("name"),
+        plan: r.get::<String, _>("plan"),
+        role: r.get::<String, _>("role"),
     }
 }
 
 fn row_to_invitation(r: sqlx::postgres::PgRow) -> OrgInvitation {
     OrgInvitation {
-        id: r.get("id"),
-        org_name: r.get("org_name"),
-        email: r.get("email"),
-        role: r.get("role"),
-        seat: r.get("seat"),
+        id: r.get::<i64, _>("id"),
+        org_name: r.get::<String, _>("org_name"),
+        email: r.get::<String, _>("email"),
+        role: r.get::<String, _>("role"),
+        seat: r.get::<bool, _>("seat"),
         expires_at: r
             .get::<chrono::DateTime<chrono::Utc>, _>("expires_at")
             .to_rfc3339(),
