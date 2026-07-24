@@ -15,7 +15,7 @@
 //! drain on shutdown.
 
 use crate::db::TenantStore;
-use crate::jobs::ShardState;
+use crate::jobs::{scheduler, ShardState};
 use crate::App;
 use axum::extract::{Json, Path, State};
 use axum::http::StatusCode;
@@ -66,14 +66,11 @@ pub struct ResultReq {
 
 /// POST /v1/worker/claim: atomically claim the next pending shard whose backend
 /// this worker can serve. Under database-per-org the queue is PER-TENANT (shards
-/// live in tenant DBs), so a claim FANS across active tenants and grabs the first
-/// available shard. The returned id is "<org>:<job>:<seed>:<worker>" so
+/// live in tenant DBs), so a claim gathers candidates across active tenants,
+/// orders them with the scheduling policy (`scheduler::claim_order`), and claims
+/// in that order. The returned id is "<org>:<job>:<seed>:<worker>" so
 /// heartbeat/result route back to the right tenant DB and are bound to the
 /// claimant. 200 with the work to do, or 204 when nothing's queued anywhere.
-///
-/// NOTE: fan-then-claim is the simple, correct answer for a modest tenant count.
-/// Global fairness / a cross-tenant claim view is design Open Question 4 (a
-/// control-plane queue index), deliberately deferred.
 pub async fn claim(State(app): State<App>, Json(req): Json<ClaimReq>) -> Response {
     let mut caps = req.capabilities;
     if caps.is_empty() {
@@ -139,56 +136,161 @@ async fn tenant_store(app: &App, org_id: i64) -> Option<TenantStore> {
     app.tenancy.resolve(org_id).await.ok().map(|t| t.store)
 }
 
-/// Claim the first available shard, visiting ONLY tenants the control-plane routing
-/// hint (`tenant_pending_shards`) says have pending work, instead of fanning a claim
-/// query into EVERY active tenant DB on every poll (finding #3). Returns the owning
-/// org id alongside the claimed shard so the worker can route follow-ups.
-///
-/// The hint is allowed to over-include (a stale row just costs one wasted empty
-/// claim here); it must never under-include (that would starve a tenant). So after
-/// scanning a tenant whose claim came back empty, we read the AUTHORITATIVE pending
-/// count and clear the hint ONLY when it is exactly 0. A None claim with a non-zero
-/// pending count means "all pending shards are locked by other workers" -> keep the
-/// hint so a later poll retries.
+/// One target the policy ranked: the tenant + job to fire an atomic per-job
+/// claim against. Parallel to the `Candidate` at the same index.
+struct ClaimTarget {
+    org_id: i64,
+    job_id: String,
+    store: TenantStore,
+}
+
+/// Claim one shard, visiting ONLY tenants the control-plane routing hint
+/// (`tenant_pending_shards`) says have pending work (finding #3): gather the
+/// candidate set across those tenants, ask the pure policy for the claim order,
+/// then attempt the atomic per-job DB claims in that order. The policy chooses
+/// ORDER; the DB claim (`FOR UPDATE SKIP LOCKED`) enforces mutual exclusion, so
+/// losing a race on one candidate just falls through to the next. Returns the
+/// owning org id alongside the claimed shard so the worker can route follow-ups.
 async fn claim_across_tenants(
     app: &App,
     worker_id: &str,
     caps: &[String],
 ) -> Option<(i64, crate::db::ClaimedShard)> {
+    let (cands, targets) = gather_candidates(app, caps).await?;
+    let order = scheduler::claim_order(&cands, chrono::Utc::now().timestamp());
+    let claimed = claim_first(&order, |i| {
+        let target = &targets[i];
+        let (store, job_id) = (target.store.clone(), target.job_id.clone());
+        let (org_id, worker_id) = (target.org_id, worker_id.to_string());
+        let caps = caps.to_vec();
+        async move {
+            match store.claim_shard(&worker_id, &caps, Some(&job_id)).await {
+                Ok(Some(shard)) => Some((org_id, shard)),
+                // Raced away or drained since the gather: next candidate.
+                Ok(None) => None,
+                Err(e) => {
+                    tracing::warn!("claim_shard for tenant {org_id} job {job_id} failed: {e}");
+                    None
+                }
+            }
+        }
+    })
+    .await?;
+    app.policy.on_shard_claimed(claimed.0).await;
+    Some(claimed)
+}
+
+/// Walk the policy's claim order, attempting candidates until one lands. The
+/// fall-through is the worker half of the race protocol: `None` from an attempt
+/// means "raced away, drained, or errored", never "stop". Bounded by `order`.
+async fn claim_first<T, F, Fut>(order: &[usize], mut try_claim: F) -> Option<T>
+where
+    F: FnMut(usize) -> Fut,
+    Fut: std::future::Future<Output = Option<T>>,
+{
+    for &i in order {
+        if let Some(claimed) = try_claim(i).await {
+            return Some(claimed);
+        }
+    }
+    None
+}
+
+/// Index per `scheduler::Tier` into the running-count accumulators.
+fn tier_index(tier: scheduler::Tier) -> usize {
+    match tier {
+        scheduler::Tier::Elastic => 0,
+        scheduler::Tier::Mac => 1,
+    }
+}
+
+/// Gather the cross-tenant candidate set for one claim: one `Candidate` (plus
+/// its `ClaimTarget`) per job with pending shards this worker's caps can serve,
+/// with the tenant load + fair-share context the policy scores by.
+///
+/// The routing hint is allowed to over-include (a stale row just costs one
+/// wasted scan here); it must never under-include (that would starve a tenant).
+/// So a tenant with no candidate jobs for our caps is cleared from the hint
+/// ONLY when its AUTHORITATIVE pending count (a fresh COUNT) is exactly 0:
+/// "pending but a backend we don't serve" must keep the hint alive.
+async fn gather_candidates(
+    app: &App,
+    caps: &[String],
+) -> Option<(Vec<scheduler::Candidate>, Vec<ClaimTarget>)> {
+    let cfg = scheduler::SchedulerConfig::resolve(app.self_hosted);
     let org_ids = app.control.tenants_with_pending().await.ok()?;
+    let now = chrono::Utc::now().timestamp();
+    let mut cands: Vec<scheduler::Candidate> = Vec::new();
+    let mut targets: Vec<ClaimTarget> = Vec::new();
+    let mut running_total = [0u32; 2];
+    let mut tenants_active = 0u32;
     for org_id in org_ids {
         let Some(store) = tenant_store(app, org_id).await else {
             continue;
         };
-        match store.claim_shard(worker_id, caps).await {
-            Ok(Some(shard)) => {
-                app.policy.on_shard_claimed(org_id).await;
-                return Some((org_id, shard));
-            }
-            Ok(None) => {
-                // No shard claimable for our caps. Self-heal the hint, but ONLY if
-                // the tenant genuinely has zero pending shards (a fresh COUNT): a
-                // None can also mean "all pending shards locked by other workers" or
-                // "pending but a backend we don't serve", in which cases we must NOT
-                // clear or we'd strand them.
-                match store.pending_shard_count().await {
-                    Ok(0) => {
-                        if let Err(e) = app.control.clear_tenant_pending(org_id).await {
-                            tracing::warn!("clear_tenant_pending {org_id} failed: {e}");
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(e) => tracing::warn!("pending_shard_count for tenant {org_id} failed: {e}"),
-                }
-                continue;
-            }
+        let jobs = match store.pending_jobs(caps).await {
+            Ok(jobs) => jobs,
             Err(e) => {
-                tracing::warn!("claim_shard for tenant {} failed: {e}", org_id);
+                tracing::warn!("pending_jobs for tenant {org_id} failed: {e}");
                 continue;
             }
+        };
+        if jobs.is_empty() {
+            match store.pending_shard_count().await {
+                Ok(0) => {
+                    if let Err(e) = app.control.clear_tenant_pending(org_id).await {
+                        tracing::warn!("clear_tenant_pending {org_id} failed: {e}");
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!("pending_shard_count for tenant {org_id} failed: {e}"),
+            }
+            continue;
+        }
+        let mut running = [0u32; 2];
+        match store.running_by_backend().await {
+            Ok(rows) => {
+                for (backend, n) in rows {
+                    running[tier_index(scheduler::tier(&backend))] += n.max(0) as u32;
+                }
+            }
+            // Degraded but safe: an unknown load scores as zero (no penalty).
+            Err(e) => tracing::warn!("running_by_backend for tenant {org_id} failed: {e}"),
+        }
+        tenants_active += 1;
+        running_total[0] += running[0];
+        running_total[1] += running[1];
+        for job in jobs {
+            let tier = scheduler::tier(&job.backend);
+            // Queue jobs are all mode "fuzz" today (JobSpec::validate); class
+            // therefore derives from size alone.
+            let class = scheduler::class_for("fuzz", job.seeds);
+            let enqueue = chrono::DateTime::parse_from_rfc3339(&job.started_at)
+                .map(|t| t.timestamp())
+                .unwrap_or(now);
+            cands.push(scheduler::Candidate {
+                tenant: org_id.to_string(),
+                tier,
+                class,
+                deadline_unix: scheduler::deadline_unix(enqueue, class),
+                tenant_running: running[tier_index(tier)],
+                tenant_fair_share: 0, // filled below from the gathered totals
+                tenant_lane_cap: cfg.lane_cap(),
+            });
+            targets.push(ClaimTarget {
+                org_id,
+                job_id: job.job_id,
+                store: store.clone(),
+            });
         }
     }
-    None
+    // Fair share needs the whole gather: total running in the tier over the
+    // tenants competing right now.
+    for cand in &mut cands {
+        cand.tenant_fair_share =
+            scheduler::fair_share(running_total[tier_index(cand.tier)], tenants_active);
+    }
+    Some((cands, targets))
 }
 
 /// POST /v1/worker/shards/:id/heartbeat where id is "<org>:<job>:<seed>:<worker>".
@@ -591,4 +693,107 @@ fn find_report(work: &std::path::Path) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::jobs::scheduler::{claim_order, Candidate, Class, Tier};
+    use std::collections::HashSet;
+    use std::sync::{Arc, Mutex};
+
+    fn cand(tenant: &str, class: Class, deadline: i64) -> Candidate {
+        Candidate {
+            tenant: tenant.into(),
+            tier: Tier::Elastic,
+            class,
+            deadline_unix: deadline,
+            tenant_running: 0,
+            tenant_fair_share: 0,
+            tenant_lane_cap: u32::MAX,
+        }
+    }
+
+    #[test]
+    fn shard_id_round_trips_and_rejects_malformed() {
+        let parsed = parse_shard_id("7:job-a:3:w-1").unwrap();
+        assert_eq!(parsed, (7, "job-a".to_string(), 3, "w-1".to_string()));
+        // Job ids may themselves contain ':' separators.
+        let parsed = parse_shard_id("7:a:b:3:w-1").unwrap();
+        assert_eq!(parsed.1, "a:b");
+        assert!(parse_shard_id("nodigits:job:3:w").is_none());
+        assert!(parse_shard_id("7:job:notseed:w").is_none());
+        assert!(parse_shard_id("7:3:w").is_none());
+    }
+
+    /// The claim path attempts candidates exactly in the policy's order and
+    /// falls through past a candidate another worker raced away.
+    #[tokio::test]
+    async fn claim_path_follows_policy_order() {
+        // Deadlines as the claim path builds them (enqueue + class SLA), all
+        // enqueued around t=0: the interactive job is due first and boosted, so
+        // policy order is interactive, then batch by deadline.
+        let cands = [
+            cand("t1", Class::Batch, scheduler::BATCH_SLA_S),
+            cand("t2", Class::Interactive, scheduler::INTERACTIVE_SLA_S),
+            cand("t3", Class::Batch, scheduler::BATCH_SLA_S - 600),
+        ];
+        let order = claim_order(&cands, 0);
+        assert_eq!(order, vec![1, 2, 0]);
+
+        let attempts = Arc::new(Mutex::new(Vec::new()));
+        let claimed = claim_first(&order, |i| {
+            let attempts = attempts.clone();
+            async move {
+                let mut seen = attempts.lock().unwrap();
+                seen.push(i);
+                // The top-ranked candidate is "raced away" (the DB claim came
+                // back empty): the path must fall through to the next choice.
+                if seen.len() == 1 {
+                    None
+                } else {
+                    Some(i)
+                }
+            }
+        })
+        .await;
+        assert_eq!(claimed, Some(2), "fell through to the policy's second pick");
+        assert_eq!(*attempts.lock().unwrap(), vec![1, 2]);
+    }
+
+    /// Two workers walking the same policy order against one atomic claim
+    /// source (modeling `FOR UPDATE SKIP LOCKED`: first taker wins, the loser
+    /// sees None and falls through) never double-claim, and together drain the
+    /// top of the ranking in order.
+    #[tokio::test]
+    async fn two_workers_never_double_claim() {
+        let cands = [
+            cand("t1", Class::Interactive, 1_000),
+            cand("t2", Class::Interactive, 2_000),
+            cand("t3", Class::Batch, 1_000),
+            cand("t4", Class::Batch, 2_000),
+        ];
+        let order = claim_order(&cands, 0);
+        let pending: Arc<Mutex<HashSet<usize>>> = Arc::new(Mutex::new((0..cands.len()).collect()));
+
+        let worker = |order: Vec<usize>, pending: Arc<Mutex<HashSet<usize>>>| async move {
+            claim_first(&order, |i| {
+                let pending = pending.clone();
+                // Atomic take: exactly one worker can remove a given shard.
+                async move { pending.lock().unwrap().take(&i) }
+            })
+            .await
+        };
+        let (a, b) = tokio::join!(
+            tokio::spawn(worker(order.clone(), pending.clone())),
+            tokio::spawn(worker(order.clone(), pending.clone())),
+        );
+        let (a, b) = (a.unwrap().unwrap(), b.unwrap().unwrap());
+        assert_ne!(a, b, "two workers claimed the same shard");
+        // Whoever wins each race, the pair drains the two most urgent first.
+        let got: HashSet<usize> = [a, b].into();
+        let top: HashSet<usize> = order[..2].iter().copied().collect();
+        assert_eq!(got, top);
+        assert_eq!(pending.lock().unwrap().len(), cands.len() - 2);
+    }
 }

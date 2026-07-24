@@ -44,10 +44,16 @@ impl TenantStore {
         Ok(row.is_some())
     }
 
+    /// Atomically claim one pending shard for `worker_id`, optionally pinned to
+    /// the job the scheduling policy chose. `FOR UPDATE SKIP LOCKED` makes the
+    /// claim race-safe under concurrent workers: a locked row is skipped, never
+    /// double-claimed. `None` means nothing claimable (drained or raced away),
+    /// so the caller falls through to its next candidate.
     pub async fn claim_shard(
         &self,
         worker_id: &str,
         capabilities: &[String],
+        job_id: Option<&str>,
     ) -> anyhow::Result<Option<ClaimedShard>> {
         let row = sqlx::query(
             "WITH claimed AS (
@@ -56,6 +62,7 @@ impl TenantStore {
                WHERE (job_id, seed) IN (
                  SELECT s.job_id, s.seed FROM shards s
                  WHERE s.state='pending' AND s.backend = ANY($2)
+                   AND ($3::TEXT IS NULL OR s.job_id = $3)
                  ORDER BY s.job_id, s.seed
                  FOR UPDATE SKIP LOCKED
                  LIMIT 1
@@ -67,6 +74,7 @@ impl TenantStore {
         )
         .bind(worker_id)
         .bind(capabilities)
+        .bind(job_id)
         .fetch_optional(self.pool.as_ref())
         .await?;
         let Some(row) = row else { return Ok(None) };
@@ -82,6 +90,49 @@ impl TenantStore {
             app_dir: row.get::<String, _>("app_dir"),
             budget: row.get::<i32, _>("budget") as u32,
         }))
+    }
+
+    /// Jobs with >=1 pending shard a worker with `capabilities` could claim,
+    /// one row per job, in the shape the scheduler's candidate needs: backend
+    /// (tier), enqueue time, and total shard count (the class heuristic).
+    /// Bounded and oldest-first so a huge backlog never starves the oldest job
+    /// out of the candidate window.
+    pub async fn pending_jobs(&self, capabilities: &[String]) -> anyhow::Result<Vec<PendingJob>> {
+        let rows = sqlx::query(
+            "SELECT p.job_id, p.backend, j.started_at,
+                    (SELECT COUNT(*) FROM shards t WHERE t.job_id = p.job_id) AS seeds
+             FROM (SELECT DISTINCT job_id, backend FROM shards
+                   WHERE state='pending' AND backend = ANY($1)) p
+             JOIN jobs j ON j.id = p.job_id
+             ORDER BY j.started_at, p.job_id
+             LIMIT 256",
+        )
+        .bind(capabilities)
+        .fetch_all(self.pool.as_ref())
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| PendingJob {
+                job_id: r.get("job_id"),
+                backend: r.get("backend"),
+                started_at: r.get("started_at"),
+                seeds: r.get::<i64, _>("seeds") as u32,
+            })
+            .collect())
+    }
+
+    /// Currently-running shard counts per backend: the scheduler's per-tier
+    /// tenant-load input (fairness penalty + Mac lane cap).
+    pub async fn running_by_backend(&self) -> anyhow::Result<Vec<(String, i64)>> {
+        let rows = sqlx::query(
+            "SELECT backend, COUNT(*) AS n FROM shards WHERE state='running' GROUP BY backend",
+        )
+        .fetch_all(self.pool.as_ref())
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|r| (r.get("backend"), r.get::<i64, _>("n")))
+            .collect())
     }
 
     pub async fn touch_shard(

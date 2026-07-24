@@ -13,7 +13,7 @@
 //! tenants never exhaust Postgres backends. A `TenantStore` is therefore cheap to
 //! clone (an `Arc<PgPool>` inside) and short-lived per request.
 
-use super::{ClaimedShard, Triage};
+use super::{ClaimedShard, PendingJob, Triage};
 use crate::ingest::{ErrorRec, ReplayResult, Step};
 use crate::jobs::{Job, ShardState};
 use serde_json::{json, Value};

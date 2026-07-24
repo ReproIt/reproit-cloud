@@ -92,6 +92,19 @@ pub struct Triage {
     pub fixed_in_build: Option<String>,
 }
 
+/// A job with >=1 pending shard, summarized for the claim path's scheduling
+/// candidate set (see `jobs::scheduler`).
+#[derive(Debug, Clone)]
+pub struct PendingJob {
+    pub job_id: String,
+    pub backend: String,
+    /// RFC3339 submit time (`jobs.started_at`): the enqueue instant slack is
+    /// measured from.
+    pub started_at: String,
+    /// Total shards in the job (the interactive-vs-batch size heuristic).
+    pub seeds: u32,
+}
+
 /// A shard claimed off a tenant's durable queue: everything a worker needs.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ClaimedShard {

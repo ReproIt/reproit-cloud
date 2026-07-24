@@ -38,67 +38,61 @@ Two service classes:
 `class_for(mode, seeds)` defaults small jobs / `reproduce` to interactive, large
 campaigns to batch; the submitter may pin it.
 
-Selection (`scheduler::pick`), lowest score claimed first:
+Selection (`scheduler::claim_order`), lowest score attempted first:
 
-1. **Hard admission gates** (`may_claim`), independent of priority:
+1. **Hard admission gate** (`may_claim`), independent of priority:
    - elastic tier: always admit (Linux burst absorbs it).
    - **per-tenant lane cap**: `tenant_running < tenant_lane_cap`. The hard ceiling
      on bought concurrency. This is the gate that makes managed iOS sellable.
-   - **interactive headroom**: batch may not consume the last
-     `mac_reserved_interactive` free slots, so an interactive shard never queues
-     behind a 10k-shard sweep.
 2. **Priority** (`claim_score`) among the admissible: **least-slack-first**
-   (`deadline - now - est_runtime`), interactive boosted ahead of batch, plus a
-   **fairness penalty** on tenants running above `pool_capacity / active_tenants`
-   so one tenant's campaign cannot starve another. Deterministic tiebreak on
-   deadline then tenant, so all workers agree.
+   (`deadline_unix(enqueue, class) - now`), interactive boosted ahead of batch,
+   plus a **fairness penalty** on tenants running above
+   `fair_share(tier_running_total, active_tenants)` so one tenant's campaign
+   cannot starve another. Deterministic tiebreak on deadline then tenant, so all
+   workers agree on one ranking.
 
-## Wiring into the existing claim path
+There is no pool-occupancy gate: every worker is a PULL client that only claims
+when it has a free slot, so occupancy self-regulates and the control plane has no
+central slot count to gate on. The one gate it must enforce is the lane cap.
 
-`worker::claim` today fans across tenant DBs and grabs "the first pending shard
-whose backend is in the worker's caps" (FIFO-ish; global fairness is Open
-Question 4). Three changes turn that into the policy above, smallest first:
+## Wiring into the claim path (live)
 
-1. **Within a tenant** - replace the FIFO `ORDER BY` in the per-tenant claim
-   query with the `claim_score` expression (least-slack + interactive boost +
-   fairness penalty). `scheduler::claim_score` is the canonical mirror; keep the
-   SQL and it byte-aligned with a test, same pattern as the fixture v2 contract.
-2. **Hard gates in SQL** - add `AND tenant_running < lane_cap` and the
-   interactive-headroom predicate to the claim `WHERE`, so a capped/headroom
-   violation is never even locked. `may_claim` is the mirror for tests.
-3. **Across tenants** - visit tenants in fairness order (least running-share
-   first) instead of arbitrary, closing Open Question 4. The per-tenant
-   `tenant_pending_shards` hint already exists; add a running-share column.
+`worker::claim_across_tenants` visits the tenants the `tenant_pending_shards`
+routing hint names, and per claim:
 
-New fields this needs:
+1. **Gather** (`gather_candidates`): per tenant, `pending_jobs(caps)` (one row
+   per job with claimable pending shards: backend, enqueue time, shard count)
+   and `running_by_backend()` (per-tier tenant load). One `Candidate` per job;
+   fair share computed over the gathered set.
+2. **Order** (`scheduler::claim_order`): the pure policy ranks every admissible
+   candidate. The policy never touches the DB (ratchet-adjacent purity: same
+   contract as the ranking modules in `tests/architecture.rs`).
+3. **Claim in order**: attempt `claim_shard(worker, caps, Some(job))` down the
+   ranking. The claim query is unchanged in mechanism, `FOR UPDATE SKIP LOCKED`,
+   so two workers can walk the same ranking and never double-claim; losing a
+   race falls through to the next candidate.
 
-- `JobSpec`: `class: Option<"interactive"|"batch">` (default via `class_for`),
-  and an SLA per class to compute `deadline_unix = enqueue + sla(class)`.
-- shard row: `enqueue_unix`, `deadline_unix`, `class` (denormalized for ORDER BY).
-- org/plan: `mac_lane_cap` (the bought iOS concurrency).
-- a pool snapshot the claim handler reads: `mac_total` (= owned+burst macs *
-  sims_per_mac), `mac_running`, `mac_reserved_interactive`.
+Class derives from job shape (`class_for("fuzz", seeds)`); an explicit
+`JobSpec.class` pin and a per-org purchased `mac_lane_cap` remain future schema
+work (today the cap is `REPROIT_SCHED_LANE_CAP` / `DEFAULT_LANE_CAP` per
+deployment).
 
-## Sizing the owned pool
+## Sizing the owned pool (design, not code)
 
-`macs_needed(ios_shards_per_s, mean_runtime_s, sims_per_mac, TARGET_UTIL)`:
-offered load (Erlangs) = arrival_rate * mean_runtime; slots = load / target_util;
-hosts = ceil(slots / sims_per_mac). `sims_per_mac` is RAM-bound concurrency per
-box, so you buy capacity on **two axes**: more RAM per Mac (more sims/host) and
-more hosts.
+Offered load (Erlangs) = arrival_rate * mean_runtime; slots = load /
+target_util (~0.80); hosts = ceil(slots / sims_per_mac). `sims_per_mac` is
+RAM-bound concurrency per box, so you buy capacity on **two axes**: more RAM per
+Mac (more sims/host) and more hosts.
 
-Size to **sustained peak**, not instantaneous peak. The scheduler + autoscaler
-absorb spikes; they cannot beat a sustained load above the ceiling (the queue
-just grows). Sizing to sustained instead of instantaneous is the big Mac saving.
+Size to **sustained peak**, not instantaneous peak. A scheduler absorbs spikes;
+it cannot beat a sustained load above the ceiling (the queue just grows). Sizing
+to sustained instead of instantaneous is the big Mac saving.
 
-## Autoscale
-
-`autoscale(q_depth, running, mean_runtime_s, sla_s, sims_per_mac, current_macs)`
-returns the desired host delta to drain the current backlog within the SLA, with
-`DOWNSCALE_HYSTERESIS` so we don't release a 24h-billed Mac we'll re-need. It is a
-**spike shaver on an owned baseline**: keep the owned pool at sustained-peak,
-burst cloud Macs (Orka / EC2 mac, minutes to allocate, 24h min) above it, release
-only after sustained idle past the min-commit window.
+The sizing/autoscale helpers (`macs_needed`, `autoscale`) were removed from
+`scheduler.rs` when the ordering policy went live: there is no autoscale control
+loop or Mac-pool inventory to drive them yet, and dead speculative code does not
+ratchet. Reintroduce them with the control loop, alongside downscale hysteresis
+(cloud Macs bill in 24h blocks, so release is deliberately sticky).
 
 ## Pricing tie-back
 
