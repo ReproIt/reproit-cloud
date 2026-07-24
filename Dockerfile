@@ -17,6 +17,10 @@ COPY protocol ./protocol
 COPY contracts ./contracts
 COPY src ./src
 COPY static ./static
+# The vendored oracle registry is compiled into the binary via include_str!
+# from src/ingest/impact.rs (severity ranking policy), so the build context
+# needs it even though it lives under tests/ for the CLI-contract drift gate.
+COPY tests/golden/fixtures ./tests/golden/fixtures
 RUN apt-get update && apt-get install -y --no-install-recommends pkg-config \
     && rm -rf /var/lib/apt/lists/*
 # Build with optional S3-compatible artifact storage. Selection is at runtime:
