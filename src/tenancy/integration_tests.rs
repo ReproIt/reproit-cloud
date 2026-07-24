@@ -298,45 +298,45 @@ async fn full_path_org_to_provision_to_key_to_tenant_row() {
         anyhow::ensure!(
             tenant
                 .store
-                .create_capture(
-                    "cap_0123456789abcdef",
-                    "review-hash",
-                    Some(user_id),
-                    Some("acme-web"),
-                    "web",
-                    "https://example.test",
-                    "2026-07-18T00:00:00Z",
-                    &capture_manifest,
-                )
+                .create_capture(crate::db::NewCapture {
+                    id: "cap_0123456789abcdef",
+                    review_token_hash: "review-hash",
+                    created_by: Some(user_id),
+                    app_id: Some("acme-web"),
+                    platform: "web",
+                    target: "https://example.test",
+                    source_created_at: "2026-07-18T00:00:00Z",
+                    manifest: &capture_manifest,
+                })
                 .await?,
             "capture should be created"
         );
         anyhow::ensure!(
             tenant
                 .store
-                .approve_capture(
-                    "review-hash",
-                    "acme-web",
-                    "Menu clips content",
-                    "Observed on checkout",
-                    "normal",
-                    "project",
-                )
+                .approve_capture(crate::db::CaptureApproval {
+                    review_token_hash: "review-hash",
+                    app_id: "acme-web",
+                    title: "Menu clips content",
+                    description: "Observed on checkout",
+                    severity: "normal",
+                    visibility: "project",
+                })
                 .await?,
             "capture should be approved"
         );
         anyhow::ensure!(
             tenant
                 .store
-                .add_capture_file(
-                    "cap_0123456789abcdef",
-                    "original.mov",
-                    "captures/cap_0123456789abcdef/original.mov",
-                    42,
-                    &"a".repeat(64),
-                    "video/quicktime",
-                    Some(1024),
-                )
+                .add_capture_file(crate::db::PendingCaptureFile {
+                    capture_id: "cap_0123456789abcdef",
+                    filename: "original.mov",
+                    storage_key: "captures/cap_0123456789abcdef/original.mov",
+                    bytes: 42,
+                    sha256: &"a".repeat(64),
+                    content_type: "video/quicktime",
+                    quota_bytes: Some(1024),
+                })
                 .await?
                 == Some(true),
             "capture file should be recorded"

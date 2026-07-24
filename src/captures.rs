@@ -125,16 +125,16 @@ pub(crate) async fn create(
     let review_hash = token_hash(&review_token);
     let inserted = tenant
         .store
-        .create_capture(
-            &request.id,
-            &review_hash,
-            scope.user_id,
+        .create_capture(crate::db::NewCapture {
+            id: &request.id,
+            review_token_hash: &review_hash,
+            created_by: scope.user_id,
             app_id,
             platform,
             target,
-            created,
-            &request.manifest,
-        )
+            source_created_at: created,
+            manifest: &request.manifest,
+        })
         .await;
     match inserted {
         Ok(true) => {
@@ -248,15 +248,15 @@ pub(crate) async fn put_file(
     let storage_key = format!("captures/{id}/{filename}");
     match tenant
         .store
-        .add_capture_file(
-            &id,
-            &filename,
-            &storage_key,
-            bytes as i64,
-            &actual,
-            &content_type,
-            ingest::max_evidence_bytes_per_app(),
-        )
+        .add_capture_file(crate::db::PendingCaptureFile {
+            capture_id: &id,
+            filename: &filename,
+            storage_key: &storage_key,
+            bytes: bytes as i64,
+            sha256: &actual,
+            content_type: &content_type,
+            quota_bytes: ingest::max_evidence_bytes_per_app(),
+        })
         .await
     {
         Ok(Some(true)) => {}
@@ -419,14 +419,14 @@ pub(crate) async fn approve(
     }
     match tenant
         .store
-        .approve_capture(
-            &token_hash(&token),
-            &request.app_id,
+        .approve_capture(crate::db::CaptureApproval {
+            review_token_hash: &token_hash(&token),
+            app_id: &request.app_id,
             title,
-            request.description.trim(),
-            &request.severity,
-            &request.visibility,
-        )
+            description: request.description.trim(),
+            severity: &request.severity,
+            visibility: &request.visibility,
+        })
         .await
     {
         Ok(true) => (StatusCode::OK, Json(json!({ "ok": true }))).into_response(),

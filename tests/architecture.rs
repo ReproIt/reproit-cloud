@@ -37,7 +37,7 @@ fn source_tree_uses_real_module_hierarchy() {
 
 #[test]
 fn source_files_stay_reviewable() {
-    const MAX_LINES: usize = 2_000;
+    const MAX_LINES: usize = 1_000;
     for path in rust_sources() {
         let lines = std::fs::read_to_string(&path)
             .expect("read Rust source")

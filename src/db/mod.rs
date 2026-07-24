@@ -21,7 +21,7 @@ pub mod secrets;
 pub mod tenant;
 
 pub use control::ControlStore;
-pub use tenant::{AnchoredBucket, TenantStore};
+pub use tenant::{AnchoredBucket, CaptureApproval, NewCapture, PendingCaptureFile, TenantStore};
 // `ResolutionEvent` / `TicketLink` are named only through method return types, so
 // they need no re-export today; kept available behind the modules for callers that
 // want to name them directly.

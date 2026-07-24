@@ -21,7 +21,10 @@ use sqlx::types::Json;
 use sqlx::{PgPool, Row};
 use std::sync::Arc;
 
+mod ingest;
+mod jobs;
 mod traffic;
+mod triage;
 
 /// A connection handle bound to one tenant's database. Clone is cheap (shares the
 /// underlying pool). Handlers receive this, never a global store.
@@ -89,6 +92,36 @@ pub struct CaptureFileRow {
     pub bytes: i64,
     pub sha256: String,
     pub content_type: String,
+}
+
+pub struct NewCapture<'a> {
+    pub id: &'a str,
+    pub review_token_hash: &'a str,
+    pub created_by: Option<i64>,
+    pub app_id: Option<&'a str>,
+    pub platform: &'a str,
+    pub target: &'a str,
+    pub source_created_at: &'a str,
+    pub manifest: &'a Value,
+}
+
+pub struct CaptureApproval<'a> {
+    pub review_token_hash: &'a str,
+    pub app_id: &'a str,
+    pub title: &'a str,
+    pub description: &'a str,
+    pub severity: &'a str,
+    pub visibility: &'a str,
+}
+
+pub struct PendingCaptureFile<'a> {
+    pub capture_id: &'a str,
+    pub filename: &'a str,
+    pub storage_key: &'a str,
+    pub bytes: i64,
+    pub sha256: &'a str,
+    pub content_type: &'a str,
+    pub quota_bytes: Option<i64>,
 }
 
 /// One persisted resolution-status transition (was `db::resolution::ResolutionEvent`).
@@ -256,18 +289,7 @@ impl TenantStore {
 
     // ---- human-authored original captures ---------------------------------
 
-    #[allow(clippy::too_many_arguments)]
-    pub async fn create_capture(
-        &self,
-        id: &str,
-        review_token_hash: &str,
-        created_by: Option<i64>,
-        app_id: Option<&str>,
-        platform: &str,
-        target: &str,
-        source_created_at: &str,
-        manifest: &Value,
-    ) -> anyhow::Result<bool> {
+    pub async fn create_capture(&self, capture: NewCapture<'_>) -> anyhow::Result<bool> {
         let inserted = sqlx::query(
             "INSERT INTO captures
                (id, review_token_hash, created_by, app_id, platform, target,
@@ -282,14 +304,14 @@ impl TenantStore {
              WHERE captures.status='pending_review'
                AND captures.manifest=EXCLUDED.manifest",
         )
-        .bind(id)
-        .bind(review_token_hash)
-        .bind(created_by)
-        .bind(app_id)
-        .bind(platform)
-        .bind(target)
-        .bind(source_created_at)
-        .bind(manifest)
+        .bind(capture.id)
+        .bind(capture.review_token_hash)
+        .bind(capture.created_by)
+        .bind(capture.app_id)
+        .bind(capture.platform)
+        .bind(capture.target)
+        .bind(capture.source_created_at)
+        .bind(capture.manifest)
         .execute(self.pool.as_ref())
         .await?
         .rows_affected()
@@ -327,16 +349,7 @@ impl TenantStore {
         Ok(row.map(capture_from_row))
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub async fn approve_capture(
-        &self,
-        review_token_hash: &str,
-        app_id: &str,
-        title: &str,
-        description: &str,
-        severity: &str,
-        visibility: &str,
-    ) -> anyhow::Result<bool> {
+    pub async fn approve_capture(&self, approval: CaptureApproval<'_>) -> anyhow::Result<bool> {
         let updated = sqlx::query(
             "UPDATE captures
              SET app_id=$2, title=$3, description=$4, severity=$5,
@@ -345,12 +358,12 @@ impl TenantStore {
                AND status='pending_review'
                AND EXISTS (SELECT 1 FROM projects WHERE app_id=$2)",
         )
-        .bind(review_token_hash)
-        .bind(app_id)
-        .bind(title)
-        .bind(description)
-        .bind(severity)
-        .bind(visibility)
+        .bind(approval.review_token_hash)
+        .bind(approval.app_id)
+        .bind(approval.title)
+        .bind(approval.description)
+        .bind(approval.severity)
+        .bind(approval.visibility)
         .execute(self.pool.as_ref())
         .await?
         .rows_affected()
@@ -358,30 +371,23 @@ impl TenantStore {
         Ok(updated)
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub async fn add_capture_file(
         &self,
-        capture_id: &str,
-        filename: &str,
-        storage_key: &str,
-        bytes: i64,
-        sha256: &str,
-        content_type: &str,
-        max: Option<i64>,
+        file: PendingCaptureFile<'_>,
     ) -> anyhow::Result<Option<bool>> {
         let mut tx = self.pool.begin().await?;
         let app_id = sqlx::query_scalar::<_, String>(
             "SELECT app_id FROM captures
              WHERE id=$1 AND status IN ('approved','uploading')",
         )
-        .bind(capture_id)
+        .bind(file.capture_id)
         .fetch_optional(&mut *tx)
         .await?;
         let Some(app_id) = app_id else {
             tx.rollback().await?;
             return Ok(None);
         };
-        if let Some(max) = max {
+        if let Some(max) = file.quota_bytes {
             sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
                 .bind(&app_id)
                 .execute(&mut *tx)
@@ -397,11 +403,11 @@ impl TenantStore {
                       AND NOT (files.capture_id=$2 AND files.filename=$3))",
             )
             .bind(&app_id)
-            .bind(capture_id)
-            .bind(filename)
+            .bind(file.capture_id)
+            .bind(file.filename)
             .fetch_one(&mut *tx)
             .await?;
-            if !quota_allows(used, bytes, max) {
+            if !quota_allows(used, file.bytes, max) {
                 tx.rollback().await?;
                 return Ok(Some(false));
             }
@@ -416,16 +422,16 @@ impl TenantStore {
                  uploaded=false,
                  created_at=now()",
         )
-        .bind(capture_id)
-        .bind(filename)
-        .bind(storage_key)
-        .bind(bytes)
-        .bind(sha256)
-        .bind(content_type)
+        .bind(file.capture_id)
+        .bind(file.filename)
+        .bind(file.storage_key)
+        .bind(file.bytes)
+        .bind(file.sha256)
+        .bind(file.content_type)
         .execute(&mut *tx)
         .await?;
         sqlx::query("UPDATE captures SET status='uploading', updated_at=now() WHERE id=$1")
-            .bind(capture_id)
+            .bind(file.capture_id)
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
@@ -788,1144 +794,6 @@ impl TenantStore {
                     r.get::<chrono::DateTime<chrono::Utc>, _>("created_at")
                         .to_rfc3339(),
                 )
-            })
-            .collect())
-    }
-
-    // ---- telemetry: edges / errors / evidence ------------------------------
-
-    /// Ingest a whole event batch ATOMICALLY in one transaction and a constant
-    /// number of round-trips, instead of one auto-commit statement per event.
-    ///
-    /// `edges` is `(edge_key, count_delta)` ALREADY pre-aggregated by the caller:
-    /// because the `edges` PK is `(app_id, edge_key)`, a single multi-row upsert
-    /// cannot touch the same row twice (Postgres rejects "command cannot affect
-    /// row a second time"), so duplicate keys within one batch MUST be summed in
-    /// memory first and applied as one delta per distinct key. `errors` are
-    /// append-only and inserted in one multi-row `UNNEST` statement. Both share
-    /// the transaction, so the batch is all-or-nothing: a mid-batch failure rolls
-    /// the whole batch back rather than leaving a half-ingested session.
-    /// Ingest one batch atomically. `batch_id` (when the SDK sends one) makes
-    /// the write idempotent: the id is consumed INSIDE the same transaction as
-    /// the data, so a retry of an already-committed batch returns
-    /// `Ok(true)` (deduped) and writes nothing, while a retry of a failed
-    /// batch (id never committed) writes normally.
-    pub async fn ingest_batch(
-        &self,
-        app_id: &str,
-        edges: &[(String, i64)],
-        errors: &[ErrorRec],
-        evidence: &[reproit_protocol::EvidenceGraph],
-        batch_id: &str,
-        deployment: Option<&str>,
-    ) -> anyhow::Result<bool> {
-        if edges.is_empty() && errors.is_empty() && evidence.is_empty() {
-            return Ok(false);
-        }
-        let mut tx = self.pool.begin().await?;
-
-        let r = sqlx::query(
-            "INSERT INTO processed_batches (app_id, batch_id) VALUES ($1,$2)
-             ON CONFLICT DO NOTHING",
-        )
-        .bind(app_id)
-        .bind(batch_id)
-        .execute(&mut *tx)
-        .await?;
-        if r.rows_affected() == 0 {
-            tx.rollback().await?;
-            return Ok(true);
-        }
-
-        if let Some(build) = deployment {
-            sqlx::query(
-                "INSERT INTO build_traffic (app_id, build, count) VALUES ($1,$2,1)
-                 ON CONFLICT (app_id, build) DO UPDATE SET
-                   count=build_traffic.count + 1, last_seen=now()",
-            )
-            .bind(app_id)
-            .bind(build)
-            .execute(&mut *tx)
-            .await?;
-        }
-
-        if !edges.is_empty() {
-            // One multi-row upsert: UNNEST the parallel (key, delta) arrays into
-            // rows, then apply the SAME ON CONFLICT increment incr_edge uses, with
-            // the caller-summed delta so a key repeated in the batch lands once.
-            let keys: Vec<&str> = edges.iter().map(|(k, _)| k.as_str()).collect();
-            let deltas: Vec<i64> = edges.iter().map(|(_, c)| *c).collect();
-            sqlx::query(
-                "INSERT INTO edges (app_id, edge_key, count)
-                 SELECT $1, k, d
-                 FROM UNNEST($2::text[], $3::bigint[]) AS t(k, d)
-                 ON CONFLICT (app_id, edge_key)
-                   DO UPDATE SET count = edges.count + EXCLUDED.count",
-            )
-            .bind(app_id)
-            .bind(&keys)
-            .bind(&deltas)
-            .execute(&mut *tx)
-            .await?;
-        }
-
-        if !errors.is_empty() {
-            // One multi-row append: UNNEST the parallel column arrays into rows.
-            // No ON CONFLICT (errors are an append-only log keyed by serial id).
-            // The bucket id is MATERIALIZED here (same pure fn the read paths
-            // trust) so per-bucket reads are indexed, never scan-and-regroup.
-            let sigs: Vec<&str> = errors.iter().map(|e| e.sig.as_str()).collect();
-            let messages: Vec<&str> = errors.iter().map(|e| e.message.as_str()).collect();
-            let paths: Vec<Value> = errors
-                .iter()
-                .map(|e| serde_json::to_value(&e.path).unwrap_or(Value::Null))
-                .collect();
-            let contexts: Vec<Value> = errors
-                .iter()
-                .map(|e| Value::Object(e.context.clone()))
-                .collect();
-            let bucket_ids: Vec<String> = errors
-                .iter()
-                .map(crate::ingest::buckets::bucket_id)
-                .collect();
-            sqlx::query(
-                "INSERT INTO errors (app_id, sig, message, path, context, bucket_id)
-                 SELECT $1, s, m, p, c, b
-                 FROM UNNEST($2::text[], $3::text[], $4::jsonb[], $5::jsonb[], $6::text[])
-                   AS t(s, m, p, c, b)",
-            )
-            .bind(app_id)
-            .bind(&sigs)
-            .bind(&messages)
-            .bind(&paths)
-            .bind(&contexts)
-            .bind(&bucket_ids)
-            .execute(&mut *tx)
-            .await?;
-        }
-
-        crate::db::artifacts::store_graphs(&mut tx, app_id, evidence).await?;
-
-        tx.commit().await?;
-        Ok(false)
-    }
-
-    /// Drop consumed batch ids past the retry horizon.
-    pub async fn prune_processed_batches(&self, older_than_hours: i64) -> anyhow::Result<u64> {
-        let r = sqlx::query(
-            "DELETE FROM processed_batches
-             WHERE created_at < now() - ($1 || ' hours')::interval",
-        )
-        .bind(older_than_hours.to_string())
-        .execute(self.pool.as_ref())
-        .await?;
-        Ok(r.rows_affected())
-    }
-
-    pub async fn edges(&self, app_id: &str) -> anyhow::Result<Vec<(String, i64)>> {
-        let rows =
-            sqlx::query("SELECT edge_key, count FROM edges WHERE app_id=$1 ORDER BY edge_key")
-                .bind(app_id)
-                .fetch_all(self.pool.as_ref())
-                .await?;
-        Ok(rows
-            .iter()
-            .map(|r| (r.get::<String, _>("edge_key"), r.get::<i64, _>("count")))
-            .collect())
-    }
-
-    /// Uncapped full-history read. Retained for the tenancy integration tests;
-    /// per-app read/repro/bucket/replay routes use `errors_capped` (bounded scan).
-    #[allow(dead_code)]
-    pub async fn errors(&self, app_id: &str) -> anyhow::Result<Vec<ErrorRec>> {
-        let rows = sqlx::query(
-            "SELECT sig, message, path, context FROM errors WHERE app_id=$1 ORDER BY id",
-        )
-        .bind(app_id)
-        .fetch_all(self.pool.as_ref())
-        .await?;
-        Ok(rows.iter().map(row_to_error).collect())
-    }
-
-    /// Like `errors`, but with the same HARD CAP as `errors_with_meta_capped`,
-    /// for read paths that only need the bare `ErrorRec`s (no id/timestamp) but
-    /// must NOT pull a pathological app's entire history into memory. Returns
-    /// `(rows, dropped)` where `dropped` is how many rows fell beyond the cap; the
-    /// caller LOGS a warning naming the count on cap-hit (never silent truncation).
-    /// Keeps the OLDEST rows (`ORDER BY id LIMIT cap`) so first-seen/lineage stays
-    /// correct and per-cohort grouping is exact for occurrences inside the window.
-    #[allow(dead_code)]
-    pub async fn errors_capped(
-        &self,
-        app_id: &str,
-        cap: i64,
-    ) -> anyhow::Result<(Vec<ErrorRec>, i64)> {
-        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM errors WHERE app_id=$1")
-            .bind(app_id)
-            .fetch_one(self.pool.as_ref())
-            .await?;
-        let rows = sqlx::query(
-            "SELECT sig, message, path, context FROM errors WHERE app_id=$1 ORDER BY id LIMIT $2",
-        )
-        .bind(app_id)
-        .bind(cap)
-        .fetch_all(self.pool.as_ref())
-        .await?;
-        let out: Vec<ErrorRec> = rows.iter().map(row_to_error).collect();
-        let dropped = (total - out.len() as i64).max(0);
-        Ok((out, dropped))
-    }
-
-    /// One bucket's occurrences, oldest-first, via the (app_id, bucket_id, id)
-    /// index: the materialized read that replaces scan-and-regroup for every
-    /// per-bucket endpoint. `cap` bounds a pathological bucket.
-    pub async fn errors_for_bucket(
-        &self,
-        app_id: &str,
-        bucket_id: &str,
-        cap: i64,
-    ) -> anyhow::Result<Vec<(i64, String, ErrorRec)>> {
-        let rows = sqlx::query(
-            "SELECT id, sig, message, path, context, created_at FROM errors
-             WHERE app_id=$1 AND bucket_id=$2 ORDER BY id LIMIT $3",
-        )
-        .bind(app_id)
-        .bind(bucket_id)
-        .bind(cap)
-        .fetch_all(self.pool.as_ref())
-        .await?;
-        Ok(rows
-            .iter()
-            .map(|r| {
-                let id = r.get::<i64, _>("id");
-                let ts = r
-                    .get::<chrono::DateTime<chrono::Utc>, _>("created_at")
-                    .to_rfc3339();
-                (id, ts, row_to_error(r))
-            })
-            .collect())
-    }
-
-    /// Remove verified sample occurrences and, once the bucket is empty, its
-    /// derived metadata. The caller supplies only occurrence ids it has already
-    /// classified as sample data. A concurrent real occurrence is preserved and
-    /// keeps the bucket metadata alive.
-    pub async fn delete_sample_bucket_data(
-        &self,
-        app_id: &str,
-        bucket_id: &str,
-        error_ids: &[i64],
-    ) -> anyhow::Result<(u64, Vec<String>)> {
-        if error_ids.is_empty() {
-            return Ok((0, Vec::new()));
-        }
-        let mut tx = self.pool.begin().await?;
-        let evidence =
-            sqlx::query("SELECT storage_key FROM evidence WHERE app_id=$1 AND error_id = ANY($2)")
-                .bind(app_id)
-                .bind(error_ids)
-                .fetch_all(&mut *tx)
-                .await?;
-        let keys = evidence
-            .iter()
-            .map(|row| row.get::<String, _>("storage_key"))
-            .collect();
-        let deleted =
-            sqlx::query("DELETE FROM errors WHERE app_id=$1 AND bucket_id=$2 AND id = ANY($3)")
-                .bind(app_id)
-                .bind(bucket_id)
-                .bind(error_ids)
-                .execute(&mut *tx)
-                .await?
-                .rows_affected();
-        let remaining: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM errors WHERE app_id=$1 AND bucket_id=$2")
-                .bind(app_id)
-                .bind(bucket_id)
-                .fetch_one(&mut *tx)
-                .await?;
-        if remaining == 0 {
-            sqlx::query("DELETE FROM replay_results WHERE app_id=$1 AND bucket_id=$2")
-                .bind(app_id)
-                .bind(bucket_id)
-                .execute(&mut *tx)
-                .await?;
-            sqlx::query("DELETE FROM bucket_tickets WHERE app_id=$1 AND bucket_id=$2")
-                .bind(app_id)
-                .bind(bucket_id)
-                .execute(&mut *tx)
-                .await?;
-            sqlx::query("DELETE FROM bucket_triage WHERE app_id=$1 AND bucket_id=$2")
-                .bind(app_id)
-                .bind(bucket_id)
-                .execute(&mut *tx)
-                .await?;
-            sqlx::query("DELETE FROM bucket_resolution_status WHERE app_id=$1 AND bucket_id=$2")
-                .bind(app_id)
-                .bind(bucket_id)
-                .execute(&mut *tx)
-                .await?;
-            sqlx::query("DELETE FROM bucket_resolution_events WHERE app_id=$1 AND bucket_id=$2")
-                .bind(app_id)
-                .bind(bucket_id)
-                .execute(&mut *tx)
-                .await?;
-            sqlx::query("DELETE FROM cloud_runs WHERE app_id=$1 AND bucket_id=$2")
-                .bind(app_id)
-                .bind(bucket_id)
-                .execute(&mut *tx)
-                .await?;
-        }
-        tx.commit().await?;
-        Ok((deleted, keys))
-    }
-
-    /// The newest `limit` occurrences app-wide, returned OLDEST-FIRST: the
-    /// bounded sample that stands in for "the whole app history" wherever a
-    /// baseline/denominator is needed (discriminators, build ordering, post-fix
-    /// traffic). Recency-biased on purpose: that is where the comparison signal
-    /// lives.
-    pub async fn recent_errors_with_meta(
-        &self,
-        app_id: &str,
-        limit: i64,
-    ) -> anyhow::Result<Vec<(i64, String, ErrorRec)>> {
-        let rows = sqlx::query(
-            "SELECT id, sig, message, path, context, created_at FROM (
-               SELECT * FROM errors WHERE app_id=$1 ORDER BY id DESC LIMIT $2
-             ) newest ORDER BY id",
-        )
-        .bind(app_id)
-        .bind(limit)
-        .fetch_all(self.pool.as_ref())
-        .await?;
-        Ok(rows
-            .iter()
-            .map(|r| {
-                let id = r.get::<i64, _>("id");
-                let ts = r
-                    .get::<chrono::DateTime<chrono::Utc>, _>("created_at")
-                    .to_rfc3339();
-                (id, ts, row_to_error(r))
-            })
-            .collect())
-    }
-
-    /// The bounded whole-app grouping scan (the bucket LIST view), with a HARD CAP on how many rows the bucket
-    /// grouping path will scan, so a single pathological app cannot pull its
-    /// entire (potentially millions) error history into memory on every dashboard
-    /// read. We deliberately do NOT silently truncate: when the cap is hit we
-    /// return `(rows, dropped)` where `dropped` is how many rows were beyond the
-    /// cap, and the caller LOGS a warning naming the count. The scan keeps the
-    /// oldest rows (`ORDER BY id LIMIT cap`) so bucket lineage (first-seen) stays
-    /// correct for everything within the window; only the newest tail is dropped.
-    ///
-    /// NOTE: bucket COUNTS for buckets whose occurrences fall entirely inside the
-    /// window are still exact. Only when an app exceeds the cap (default 200k) do
-    /// the most recent occurrences fall outside it, which is why we warn loudly.
-    pub async fn errors_with_meta_capped(
-        &self,
-        app_id: &str,
-        cap: i64,
-    ) -> anyhow::Result<(Vec<(i64, String, ErrorRec, Option<String>)>, i64)> {
-        // Cheap COUNT first so we can report how many rows we are about to drop.
-        // (Index-only on errors_app; far cheaper than materializing every row.)
-        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM errors WHERE app_id=$1")
-            .bind(app_id)
-            .fetch_one(self.pool.as_ref())
-            .await?;
-        let rows = sqlx::query(
-            "SELECT id, sig, message, path, context, bucket_id, created_at FROM errors WHERE app_id=$1 ORDER BY id LIMIT $2",
-        )
-        .bind(app_id)
-        .bind(cap)
-        .fetch_all(self.pool.as_ref())
-        .await?;
-        let out: Vec<(i64, String, ErrorRec, Option<String>)> = rows
-            .iter()
-            .map(|r| {
-                let id = r.get::<i64, _>("id");
-                let ts = r
-                    .get::<chrono::DateTime<chrono::Utc>, _>("created_at")
-                    .to_rfc3339();
-                (
-                    id,
-                    ts,
-                    row_to_error(r),
-                    r.get::<Option<String>, _>("bucket_id"),
-                )
-            })
-            .collect();
-        let dropped = (total - out.len() as i64).max(0);
-        Ok((out, dropped))
-    }
-
-    /// A PAGINATED slice of an app's errors for the flat list endpoints (not the
-    /// grouping path). `limit`/`offset` give a bounded read with stable id order,
-    /// so a list handler never has to materialize the whole table. Returns the
-    /// page rows plus the app's total error count for client-side pagination.
-    pub async fn errors_paginated(
-        &self,
-        app_id: &str,
-        limit: i64,
-        offset: i64,
-    ) -> anyhow::Result<(Vec<ErrorRec>, i64)> {
-        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM errors WHERE app_id=$1")
-            .bind(app_id)
-            .fetch_one(self.pool.as_ref())
-            .await?;
-        let rows = sqlx::query(
-            "SELECT sig, message, path, context FROM errors WHERE app_id=$1 ORDER BY id LIMIT $2 OFFSET $3",
-        )
-        .bind(app_id)
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(self.pool.as_ref())
-        .await?;
-        Ok((rows.iter().map(row_to_error).collect(), total))
-    }
-
-    pub async fn add_replay_result(
-        &self,
-        app_id: &str,
-        bucket_id: &str,
-        status: &str,
-        runs: i32,
-        failures: i32,
-        local_repro_id: Option<&str>,
-    ) -> anyhow::Result<i64> {
-        let id: i64 = sqlx::query_scalar(
-            "INSERT INTO replay_results (app_id, bucket_id, status, runs, failures, local_repro_id)
-             VALUES ($1,$2,$3,$4,$5,$6) RETURNING id",
-        )
-        .bind(app_id)
-        .bind(bucket_id)
-        .bind(status)
-        .bind(runs)
-        .bind(failures)
-        .bind(local_repro_id)
-        .fetch_one(self.pool.as_ref())
-        .await?;
-        Ok(id)
-    }
-
-    pub async fn replay_results_for(
-        &self,
-        app_id: &str,
-        bucket_id: &str,
-    ) -> anyhow::Result<Vec<ReplayResult>> {
-        let rows = sqlx::query(
-            "SELECT status, runs, failures, local_repro_id, created_at
-             FROM replay_results WHERE app_id=$1 AND bucket_id=$2 ORDER BY id DESC",
-        )
-        .bind(app_id)
-        .bind(bucket_id)
-        .fetch_all(self.pool.as_ref())
-        .await?;
-        Ok(rows
-            .iter()
-            .map(|r| ReplayResult {
-                status: r.get::<String, _>("status"),
-                runs: r.get::<i32, _>("runs"),
-                failures: r.get::<i32, _>("failures"),
-                local_repro_id: r.get::<Option<String>, _>("local_repro_id"),
-                created_at: r
-                    .get::<chrono::DateTime<chrono::Utc>, _>("created_at")
-                    .to_rfc3339(),
-            })
-            .collect())
-    }
-
-    /// ALL reproduction attempts for an app, grouped by bucket, newest-first
-    /// within each bucket. Folds the per-bucket N+1 (`replay_results_for` in a
-    /// loop over every bucket on the list view) into ONE round-trip: the caller
-    /// looks each bucket up in the returned map instead of awaiting per bucket.
-    /// Buckets with no attempts simply have no map entry (caller treats as empty).
-    pub async fn replay_results_by_bucket(
-        &self,
-        app_id: &str,
-    ) -> anyhow::Result<std::collections::HashMap<String, Vec<ReplayResult>>> {
-        let rows = sqlx::query(
-            "SELECT bucket_id, status, runs, failures, local_repro_id, created_at
-             FROM replay_results WHERE app_id=$1 ORDER BY bucket_id, id DESC",
-        )
-        .bind(app_id)
-        .fetch_all(self.pool.as_ref())
-        .await?;
-        let mut by_bucket: std::collections::HashMap<String, Vec<ReplayResult>> =
-            std::collections::HashMap::new();
-        for r in &rows {
-            by_bucket
-                .entry(r.get::<String, _>("bucket_id"))
-                .or_default()
-                .push(ReplayResult {
-                    status: r.get::<String, _>("status"),
-                    runs: r.get::<i32, _>("runs"),
-                    failures: r.get::<i32, _>("failures"),
-                    local_repro_id: r.get::<Option<String>, _>("local_repro_id"),
-                    created_at: r
-                        .get::<chrono::DateTime<chrono::Utc>, _>("created_at")
-                        .to_rfc3339(),
-                });
-        }
-        Ok(by_bucket)
-    }
-
-    /// ALL triage rows for an app, keyed by bucket id. Folds the per-bucket N+1
-    /// (`triage_for_bucket` in a loop over every bucket on the list view) into ONE
-    /// round-trip. A bucket with no triage row is absent from the map (the caller
-    /// treats absence as the implicit `untriaged` state, exactly like the single-row
-    /// helper returning `None`).
-    pub async fn triage_all_for_app(
-        &self,
-        app_id: &str,
-    ) -> anyhow::Result<std::collections::HashMap<String, Triage>> {
-        let rows = sqlx::query(
-            "SELECT bucket_id, status, assignee, updated_at, fixed_in_build
-             FROM bucket_triage WHERE app_id = $1",
-        )
-        .bind(app_id)
-        .fetch_all(self.pool.as_ref())
-        .await?;
-        Ok(rows
-            .iter()
-            .map(|r| {
-                (
-                    r.get::<String, _>("bucket_id"),
-                    Triage {
-                        status: r.get::<String, _>("status"),
-                        assignee: r.get::<Option<i64>, _>("assignee"),
-                        updated_at: r
-                            .get::<chrono::DateTime<chrono::Utc>, _>("updated_at")
-                            .to_rfc3339(),
-                        fixed_in_build: r.get::<Option<String>, _>("fixed_in_build"),
-                    },
-                )
-            })
-            .collect())
-    }
-
-    #[allow(dead_code)]
-    pub async fn error_id_at(&self, app_id: &str, idx: usize) -> anyhow::Result<Option<i64>> {
-        let row =
-            sqlx::query("SELECT id FROM errors WHERE app_id=$1 ORDER BY id OFFSET $2 LIMIT 1")
-                .bind(app_id)
-                .bind(idx as i64)
-                .fetch_optional(self.pool.as_ref())
-                .await?;
-        Ok(row.map(|r| r.get::<i64, _>("id")))
-    }
-
-    /// Reserve an evidence row, enforcing the per-app byte quota ATOMICALLY: the
-    /// sum-and-check and the insert run in one transaction under a per-app
-    /// advisory lock, so concurrent uploads cannot both pass the check and
-    /// overshoot. Returns None when the quota would be exceeded. The caller
-    /// uploads the blob AFTER reserving and compensates with `remove_evidence`
-    /// if the upload fails (the row is the source of truth for usage).
-    pub async fn add_evidence_within_quota(
-        &self,
-        app_id: &str,
-        error_id: i64,
-        kind: &str,
-        storage_key: &str,
-        bytes: i64,
-        max: Option<i64>,
-    ) -> anyhow::Result<Option<i64>> {
-        let mut tx = self.pool.begin().await?;
-        if let Some(max) = max {
-            sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
-                .bind(app_id)
-                .execute(&mut *tx)
-                .await?;
-            let used: i64 = sqlx::query_scalar(
-                "SELECT COALESCE(SUM(bytes), 0)::BIGINT FROM evidence WHERE app_id=$1",
-            )
-            .bind(app_id)
-            .fetch_one(&mut *tx)
-            .await?;
-            if !quota_allows(used, bytes, max) {
-                tx.rollback().await?;
-                return Ok(None);
-            }
-        }
-        let id: i64 = sqlx::query_scalar(
-            "INSERT INTO evidence (app_id, error_id, kind, storage_key, bytes)
-             VALUES ($1,$2,$3,$4,$5) RETURNING id",
-        )
-        .bind(app_id)
-        .bind(error_id)
-        .bind(kind)
-        .bind(storage_key)
-        .bind(bytes)
-        .fetch_one(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok(Some(id))
-    }
-
-    /// Compensating delete for a reserved evidence row whose blob upload failed.
-    pub async fn remove_evidence(&self, id: i64) -> anyhow::Result<()> {
-        sqlx::query("DELETE FROM evidence WHERE id=$1")
-            .bind(id)
-            .execute(self.pool.as_ref())
-            .await?;
-        Ok(())
-    }
-
-    pub async fn evidence_for(
-        &self,
-        error_id: i64,
-    ) -> anyhow::Result<Vec<(String, String, i64, String)>> {
-        let rows = sqlx::query(
-            "SELECT kind, storage_key, bytes, created_at FROM evidence WHERE error_id=$1 ORDER BY id",
-        )
-        .bind(error_id)
-        .fetch_all(self.pool.as_ref())
-        .await?;
-        Ok(rows
-            .iter()
-            .map(|r| {
-                (
-                    r.get::<String, _>("kind"),
-                    r.get::<String, _>("storage_key"),
-                    r.get::<i64, _>("bytes"),
-                    r.get::<chrono::DateTime<chrono::Utc>, _>("created_at")
-                        .to_rfc3339(),
-                )
-            })
-            .collect())
-    }
-
-    #[allow(dead_code)]
-    pub async fn error_at(&self, app_id: &str, idx: usize) -> anyhow::Result<Option<ErrorRec>> {
-        let row = sqlx::query(
-            "SELECT sig, message, path, context FROM errors WHERE app_id=$1 ORDER BY id OFFSET $2 LIMIT 1",
-        )
-        .bind(app_id)
-        .bind(idx as i64)
-        .fetch_optional(self.pool.as_ref())
-        .await?;
-        Ok(row.as_ref().map(row_to_error))
-    }
-
-    // ---- jobs / shards / the durable pull-claim queue ----------------------
-
-    pub async fn insert_job(&self, job: &Job) -> anyhow::Result<()> {
-        let mut tx = self.pool.begin().await?;
-        sqlx::query(
-            "INSERT INTO jobs (id, app_dir, budget, started_at, map_states, map_transitions)
-             VALUES ($1,$2,$3,$4,0,0)",
-        )
-        .bind(&job.id)
-        .bind(&job.spec_app_dir)
-        .bind(job.budget as i32)
-        .bind(&job.started_at)
-        .execute(&mut *tx)
-        .await?;
-        let seeds: Vec<i32> = job.shards.iter().map(|shard| shard.seed as i32).collect();
-        sqlx::query(
-            "INSERT INTO shards (job_id, seed, state, backend, duration_s)
-             SELECT $1, seed, 'pending', $2, 0 FROM UNNEST($3::INT[]) AS seed",
-        )
-        .bind(&job.id)
-        .bind(&job.backend)
-        .bind(&seeds)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok(())
-    }
-
-    /// Whether a job exists in THIS tenant's db. (Replaces the old cross-tenant
-    /// `job_org`: the tenant boundary is the database, so "is this my job?" is just
-    /// "does the row exist here?". `get_job` reads via `snapshot`, which already
-    /// 404s a missing job, so this is kept for explicit existence checks/ops.)
-    #[allow(dead_code)]
-    pub async fn job_exists(&self, job_id: &str) -> anyhow::Result<bool> {
-        let row = sqlx::query_scalar::<_, i32>("SELECT 1 FROM jobs WHERE id = $1")
-            .bind(job_id)
-            .fetch_optional(self.pool.as_ref())
-            .await?;
-        Ok(row.is_some())
-    }
-
-    pub async fn claim_shard(
-        &self,
-        worker_id: &str,
-        capabilities: &[String],
-    ) -> anyhow::Result<Option<ClaimedShard>> {
-        let row = sqlx::query(
-            "WITH claimed AS (
-               UPDATE shards SET state='running', claimed_by=$1, claimed_at=now(),
-                    heartbeat_at=now(), attempts=attempts+1
-               WHERE (job_id, seed) IN (
-                 SELECT s.job_id, s.seed FROM shards s
-                 WHERE s.state='pending' AND s.backend = ANY($2)
-                 ORDER BY s.job_id, s.seed
-                 FOR UPDATE SKIP LOCKED
-                 LIMIT 1
-               )
-               RETURNING job_id, seed, claimed_by, backend
-             )
-             SELECT c.job_id, c.seed, c.claimed_by, c.backend, j.app_dir, j.budget
-             FROM claimed c JOIN jobs j ON j.id=c.job_id",
-        )
-        .bind(worker_id)
-        .bind(capabilities)
-        .fetch_optional(self.pool.as_ref())
-        .await?;
-        let Some(row) = row else { return Ok(None) };
-        let job_id: String = row.get("job_id");
-        let seed: i32 = row.get("seed");
-        let claimed_by: String = row.get("claimed_by");
-        let backend: String = row.get("backend");
-        Ok(Some(ClaimedShard {
-            job_id,
-            seed: seed as u32,
-            claimed_by,
-            backend,
-            app_dir: row.get::<String, _>("app_dir"),
-            budget: row.get::<i32, _>("budget") as u32,
-        }))
-    }
-
-    pub async fn touch_shard(
-        &self,
-        job_id: &str,
-        seed: u32,
-        worker_id: &str,
-    ) -> anyhow::Result<bool> {
-        let r = sqlx::query(
-            "UPDATE shards SET heartbeat_at=now()
-             WHERE job_id=$1 AND seed=$2 AND claimed_by=$3 AND state='running'",
-        )
-        .bind(job_id)
-        .bind(seed as i32)
-        .bind(worker_id)
-        .execute(self.pool.as_ref())
-        .await?;
-        Ok(r.rows_affected() == 1)
-    }
-
-    /// How many shards are currently in state='pending' in THIS tenant's DB. The
-    /// authoritative read behind clearing a tenant from the control-plane
-    /// `tenant_pending_shards` routing hint: a tenant is cleared ONLY when this is
-    /// exactly 0 (a claim returning None is NOT sufficient, since None can mean "all
-    /// pending shards are locked by other workers right now"). Source of truth for
-    /// the hint; see `ControlStore::clear_tenant_pending`.
-    pub async fn pending_shard_count(&self) -> anyhow::Result<i64> {
-        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM shards WHERE state='pending'")
-            .fetch_one(self.pool.as_ref())
-            .await?;
-        Ok(n)
-    }
-
-    /// Requeue shards stranded by a dead worker (running, heartbeat older than
-    /// `stale_secs`) back to pending. Returns the number moved so the caller can
-    /// re-mark the tenant in the control-plane pending set (those shards just
-    /// transitioned INTO pending; see the routing-hint invariant).
-    pub async fn requeue_stranded(&self, stale_secs: i64) -> anyhow::Result<u64> {
-        let r = sqlx::query(
-            "UPDATE shards SET state='pending', claimed_by=NULL, claimed_at=NULL, heartbeat_at=NULL
-             WHERE state='running'
-               AND (heartbeat_at IS NULL OR heartbeat_at < now() - make_interval(secs => $1))",
-        )
-        .bind(stale_secs as f64)
-        .execute(self.pool.as_ref())
-        .await?;
-        Ok(r.rows_affected())
-    }
-
-    pub async fn job_incomplete(&self, job_id: &str) -> anyhow::Result<bool> {
-        let n: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM shards WHERE job_id=$1 AND state IN ('pending','running')",
-        )
-        .bind(job_id)
-        .fetch_one(self.pool.as_ref())
-        .await?;
-        Ok(n > 0)
-    }
-
-    pub async fn set_shard(
-        &self,
-        job_id: &str,
-        seed: u32,
-        worker_id: &str,
-        state: ShardState,
-        report: Option<String>,
-        duration_s: f64,
-    ) -> anyhow::Result<bool> {
-        let r = sqlx::query(
-            "UPDATE shards SET state=$4, report=$5, duration_s=$6
-             WHERE job_id=$1 AND seed=$2 AND claimed_by=$3 AND state='running'",
-        )
-        .bind(job_id)
-        .bind(seed as i32)
-        .bind(worker_id)
-        .bind(state.as_str())
-        .bind(report)
-        .bind(duration_s)
-        .execute(self.pool.as_ref())
-        .await?;
-        Ok(r.rows_affected() == 1)
-    }
-
-    pub async fn finalize_job(
-        &self,
-        job_id: &str,
-        states: usize,
-        transitions: usize,
-    ) -> anyhow::Result<()> {
-        sqlx::query(
-            "UPDATE jobs SET finished_at=$2, map_states=$3, map_transitions=$4 WHERE id=$1",
-        )
-        .bind(job_id)
-        .bind(chrono::Utc::now().to_rfc3339())
-        .bind(states as i32)
-        .bind(transitions as i32)
-        .execute(self.pool.as_ref())
-        .await?;
-        Ok(())
-    }
-
-    pub async fn findings_count(&self, job_id: &str) -> anyhow::Result<usize> {
-        let n: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM shards WHERE job_id=$1 AND state='finding'")
-                .bind(job_id)
-                .fetch_one(self.pool.as_ref())
-                .await?;
-        Ok(n as usize)
-    }
-
-    pub async fn list_jobs(&self, limit: i64) -> anyhow::Result<Vec<Value>> {
-        let rows = sqlx::query(
-            "SELECT
-                j.id,
-                j.app_dir,
-                j.started_at,
-                j.finished_at,
-                j.map_states,
-                j.map_transitions,
-                COUNT(s.seed) AS shards,
-                COUNT(*) FILTER (WHERE s.state NOT IN ('pending','running')) AS done,
-                COUNT(*) FILTER (WHERE s.state = 'finding') AS findings,
-                COUNT(*) FILTER (WHERE s.state = 'error') AS errors,
-                COUNT(*) FILTER (WHERE s.state = 'running') AS running,
-                COUNT(*) FILTER (WHERE s.state = 'clean') AS clean,
-                MIN(s.backend) AS backend
-             FROM jobs j
-             LEFT JOIN shards s ON s.job_id = j.id
-             GROUP BY j.id, j.app_dir, j.started_at, j.finished_at, j.map_states, j.map_transitions
-             ORDER BY j.started_at DESC
-             LIMIT $1",
-        )
-        .bind(limit.clamp(1, 100))
-        .fetch_all(self.pool.as_ref())
-        .await?;
-
-        Ok(rows
-            .into_iter()
-            .map(|r| {
-                let finished_at: Option<String> = r.get("finished_at");
-                json!({
-                    "id": r.get::<String, _>("id"),
-                    "appDir": r.get::<String, _>("app_dir"),
-                    "started_at": r.get::<String, _>("started_at"),
-                    "finished_at": finished_at,
-                    "complete": finished_at.is_some(),
-                    "backend": r.get::<Option<String>, _>("backend").unwrap_or_else(|| "web".to_string()),
-                    "shards": r.get::<i64, _>("shards"),
-                    "done": r.get::<i64, _>("done"),
-                    "findings": r.get::<i64, _>("findings"),
-                    "errors": r.get::<i64, _>("errors"),
-                    "running": r.get::<i64, _>("running"),
-                    "clean": r.get::<i64, _>("clean"),
-                    "map": {
-                        "states": r.get::<i32, _>("map_states"),
-                        "transitions": r.get::<i32, _>("map_transitions")
-                    },
-                })
-            })
-            .collect())
-    }
-
-    pub async fn snapshot(&self, id: &str) -> anyhow::Result<Option<Value>> {
-        let job = sqlx::query(
-            "SELECT app_dir, started_at, finished_at, map_states, map_transitions FROM jobs WHERE id=$1",
-        )
-        .bind(id)
-        .fetch_optional(self.pool.as_ref())
-        .await?;
-        let Some(job) = job else { return Ok(None) };
-        let rows = sqlx::query(
-            "SELECT seed, state, report, duration_s FROM shards WHERE job_id=$1 ORDER BY seed",
-        )
-        .bind(id)
-        .fetch_all(self.pool.as_ref())
-        .await?;
-        let shards: Vec<Value> = rows
-            .iter()
-            .map(|r| {
-                json!({
-                    "seed": r.get::<i32, _>("seed"),
-                    "state": r.get::<String, _>("state"),
-                    "report": r.get::<Option<String>, _>("report"),
-                    "duration_s": r.get::<f64, _>("duration_s"),
-                })
-            })
-            .collect();
-        let done = rows
-            .iter()
-            .filter(|r| {
-                let s: String = r.get("state");
-                s != "pending" && s != "running"
-            })
-            .count();
-        let findings = rows
-            .iter()
-            .filter(|r| r.get::<String, _>("state") == "finding")
-            .count();
-        let finished_at: Option<String> = job.try_get("finished_at")?;
-        Ok(Some(json!({
-            "id": id,
-            "appDir": job.get::<String, _>("app_dir"),
-            "shards": rows.len(),
-            "done": done,
-            "complete": finished_at.is_some(),
-            "started_at": job.get::<String, _>("started_at"),
-            "finished_at": finished_at,
-            "findings": findings,
-            "map": { "states": job.get::<i32, _>("map_states"), "transitions": job.get::<i32, _>("map_transitions") },
-            "shardDetail": shards,
-        })))
-    }
-
-    // ---- per-(app,bucket) triage state -------------------------------------
-
-    pub async fn triage_for_bucket(
-        &self,
-        app_id: &str,
-        bucket_id: &str,
-    ) -> anyhow::Result<Option<Triage>> {
-        let row = sqlx::query(
-            "SELECT status, assignee, updated_at, fixed_in_build FROM bucket_triage
-             WHERE app_id = $1 AND bucket_id = $2",
-        )
-        .bind(app_id)
-        .bind(bucket_id)
-        .fetch_optional(self.pool.as_ref())
-        .await?;
-        Ok(row.map(|r| Triage {
-            status: r.get::<String, _>("status"),
-            assignee: r.get::<Option<i64>, _>("assignee"),
-            updated_at: r
-                .get::<chrono::DateTime<chrono::Utc>, _>("updated_at")
-                .to_rfc3339(),
-            fixed_in_build: r.get::<Option<String>, _>("fixed_in_build"),
-        }))
-    }
-
-    pub async fn upsert_triage(
-        &self,
-        app_id: &str,
-        bucket_id: &str,
-        status: &str,
-        assignee: Option<i64>,
-        fixed_in_build: Option<&str>,
-    ) -> anyhow::Result<()> {
-        sqlx::query(
-            "INSERT INTO bucket_triage (app_id, bucket_id, status, assignee, fixed_in_build, updated_at)
-             VALUES ($1,$2,$3,$4,$5, now())
-             ON CONFLICT (app_id, bucket_id) DO UPDATE
-               SET status = EXCLUDED.status, assignee = EXCLUDED.assignee,
-                   fixed_in_build = EXCLUDED.fixed_in_build, updated_at = now()",
-        )
-        .bind(app_id)
-        .bind(bucket_id)
-        .bind(status)
-        .bind(assignee)
-        .bind(fixed_in_build)
-        .execute(self.pool.as_ref())
-        .await?;
-        Ok(())
-    }
-
-    pub async fn advance_triage_unless_wontfix(
-        &self,
-        app_id: &str,
-        bucket_id: &str,
-        new_status: &str,
-        fixed_in_build: Option<&str>,
-    ) -> anyhow::Result<bool> {
-        let r = sqlx::query(
-            "INSERT INTO bucket_triage (app_id, bucket_id, status, fixed_in_build, updated_at)
-             VALUES ($1,$2,$3,$4, now())
-             ON CONFLICT (app_id, bucket_id) DO UPDATE
-               SET status = EXCLUDED.status,
-                   fixed_in_build = COALESCE(bucket_triage.fixed_in_build, EXCLUDED.fixed_in_build),
-                   updated_at = now()
-             WHERE bucket_triage.status <> 'wontfix'",
-        )
-        .bind(app_id)
-        .bind(bucket_id)
-        .bind(new_status)
-        .bind(fixed_in_build)
-        .execute(self.pool.as_ref())
-        .await?;
-        Ok(r.rows_affected() == 1)
-    }
-
-    // ---- bug <-> ticket link -----------------------------------------------
-
-    pub async fn link_ticket(
-        &self,
-        app_id: &str,
-        bucket_id: &str,
-        provider: &str,
-        repo: &str,
-        external_id: &str,
-        url: &str,
-    ) -> anyhow::Result<()> {
-        sqlx::query(
-            "INSERT INTO bucket_tickets (app_id, bucket_id, provider, repo, external_id, url)
-             VALUES ($1,$2,$3,$4,$5,$6)
-             ON CONFLICT (app_id, bucket_id) DO UPDATE
-               SET provider = EXCLUDED.provider, repo = EXCLUDED.repo,
-                   external_id = EXCLUDED.external_id, url = EXCLUDED.url",
-        )
-        .bind(app_id)
-        .bind(bucket_id)
-        .bind(provider)
-        .bind(repo)
-        .bind(external_id)
-        .bind(url)
-        .execute(self.pool.as_ref())
-        .await?;
-        Ok(())
-    }
-
-    pub async fn ticket_for_bucket(
-        &self,
-        app_id: &str,
-        bucket_id: &str,
-    ) -> anyhow::Result<Option<TicketLink>> {
-        let row = sqlx::query(
-            "SELECT provider, repo, external_id, url FROM bucket_tickets
-             WHERE app_id = $1 AND bucket_id = $2",
-        )
-        .bind(app_id)
-        .bind(bucket_id)
-        .fetch_optional(self.pool.as_ref())
-        .await?;
-        Ok(row.map(|r| TicketLink {
-            provider: r.get::<String, _>("provider"),
-            repo: r.get::<String, _>("repo"),
-            external_id: r.get::<String, _>("external_id"),
-            url: r.get::<String, _>("url"),
-        }))
-    }
-
-    // ---- background regression sweep: status + transition log --------------
-
-    pub async fn anchored_buckets(&self) -> anyhow::Result<Vec<AnchoredBucket>> {
-        let rows = sqlx::query(
-            "SELECT app_id, bucket_id, fixed_in_build FROM bucket_triage
-             WHERE fixed_in_build IS NOT NULL AND fixed_in_build <> ''
-             ORDER BY app_id, bucket_id",
-        )
-        .fetch_all(self.pool.as_ref())
-        .await?;
-        Ok(rows
-            .iter()
-            .map(|r| AnchoredBucket {
-                app_id: r.get::<String, _>("app_id"),
-                bucket_id: r.get::<String, _>("bucket_id"),
-                fixed_in_build: r.get::<String, _>("fixed_in_build"),
-            })
-            .collect())
-    }
-
-    pub async fn last_resolution_status(
-        &self,
-        app_id: &str,
-        bucket_id: &str,
-    ) -> anyhow::Result<Option<String>> {
-        let row = sqlx::query(
-            "SELECT status FROM bucket_resolution_status WHERE app_id = $1 AND bucket_id = $2",
-        )
-        .bind(app_id)
-        .bind(bucket_id)
-        .fetch_optional(self.pool.as_ref())
-        .await?;
-        Ok(row.map(|r| r.get::<String, _>("status")))
-    }
-
-    pub async fn upsert_resolution_status(
-        &self,
-        app_id: &str,
-        bucket_id: &str,
-        status: &str,
-        build: Option<&str>,
-    ) -> anyhow::Result<()> {
-        sqlx::query(
-            "INSERT INTO bucket_resolution_status (app_id, bucket_id, status, build, updated_at)
-             VALUES ($1,$2,$3,$4, now())
-             ON CONFLICT (app_id, bucket_id) DO UPDATE
-               SET status = EXCLUDED.status, build = EXCLUDED.build, updated_at = now()",
-        )
-        .bind(app_id)
-        .bind(bucket_id)
-        .bind(status)
-        .bind(build)
-        .execute(self.pool.as_ref())
-        .await?;
-        Ok(())
-    }
-
-    pub async fn record_resolution_event(
-        &self,
-        app_id: &str,
-        bucket_id: &str,
-        from_status: Option<&str>,
-        to_status: &str,
-        build: Option<&str>,
-    ) -> anyhow::Result<i64> {
-        let id: i64 = sqlx::query_scalar(
-            "INSERT INTO bucket_resolution_events (app_id, bucket_id, from_status, to_status, build)
-             VALUES ($1,$2,$3,$4,$5) RETURNING id",
-        )
-        .bind(app_id)
-        .bind(bucket_id)
-        .bind(from_status)
-        .bind(to_status)
-        .bind(build)
-        .fetch_one(self.pool.as_ref())
-        .await?;
-        Ok(id)
-    }
-
-    pub async fn recent_resolution_events(
-        &self,
-        app_id: &str,
-        limit: i64,
-    ) -> anyhow::Result<Vec<ResolutionEvent>> {
-        let rows = sqlx::query(
-            "SELECT bucket_id, from_status, to_status, build, at
-             FROM bucket_resolution_events
-             WHERE app_id = $1 ORDER BY id DESC LIMIT $2",
-        )
-        .bind(app_id)
-        .bind(limit)
-        .fetch_all(self.pool.as_ref())
-        .await?;
-        Ok(rows
-            .iter()
-            .map(|r| ResolutionEvent {
-                bucket_id: r.get::<String, _>("bucket_id"),
-                from_status: r.get::<Option<String>, _>("from_status"),
-                to_status: r.get::<String, _>("to_status"),
-                build: r.get::<Option<String>, _>("build"),
-                at: r.get::<chrono::DateTime<chrono::Utc>, _>("at").to_rfc3339(),
             })
             .collect())
     }
