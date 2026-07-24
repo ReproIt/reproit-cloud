@@ -36,7 +36,7 @@ for path in fly.toml src/billing static/reset.html static/reset.js; do
 done
 
 auth_files="$(find src/auth -maxdepth 1 -type f -print | LC_ALL=C sort)"
-expected_auth=$'src/auth/invitation_tests.rs\nsrc/auth/keys.rs\nsrc/auth/mod.rs\nsrc/auth/password.rs\nsrc/auth/projects.rs\nsrc/auth/session.rs'
+expected_auth=$'src/auth/account.rs\nsrc/auth/invitation_tests.rs\nsrc/auth/keys.rs\nsrc/auth/mod.rs\nsrc/auth/organizations.rs\nsrc/auth/password.rs\nsrc/auth/projects.rs\nsrc/auth/session.rs'
 if [[ "$auth_files" != "$expected_auth" ]]; then
   echo "self-hosted boundary violation: unexpected authentication module" >&2
   diff -u <(printf '%s\n' "$expected_auth") <(printf '%s\n' "$auth_files") || true
