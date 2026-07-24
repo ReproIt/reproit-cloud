@@ -908,6 +908,49 @@ mod tests {
     }
 
     #[test]
+    fn self_host_maps_database_url_to_both_planes() {
+        let (control, tenant) = resolve_db_config(true, Some("postgres://x/db"), None, "dflt");
+        assert_eq!(control, "postgres://x/db");
+        assert_eq!(tenant.as_deref(), Some("postgres://x/db"));
+    }
+
+    #[test]
+    fn self_host_tenant_override_wins_for_telemetry() {
+        let (control, tenant) = resolve_db_config(
+            true,
+            Some("postgres://x/db"),
+            Some("postgres://x/tel"),
+            "dflt",
+        );
+        assert_eq!(control, "postgres://x/db");
+        assert_eq!(tenant.as_deref(), Some("postgres://x/tel"));
+    }
+
+    #[test]
+    fn self_host_without_database_url_uses_the_local_default() {
+        // The self-host distribution must come up with zero env for local
+        // evaluation; the built-in localhost default backs both planes.
+        let (control, tenant) = resolve_db_config(true, None, None, "dflt");
+        assert_eq!(control, "dflt");
+        assert_eq!(tenant.as_deref(), Some("dflt"));
+    }
+
+    #[test]
+    fn non_self_host_keeps_the_planes_independent() {
+        let (control, tenant) = resolve_db_config(
+            false,
+            Some("postgres://x/ctl"),
+            Some("postgres://x/tel"),
+            "d",
+        );
+        assert_eq!(control, "postgres://x/ctl");
+        assert_eq!(tenant.as_deref(), Some("postgres://x/tel"));
+        let (control, tenant) = resolve_db_config(false, None, None, "d");
+        assert_eq!(control, "d");
+        assert_eq!(tenant, None);
+    }
+
+    #[test]
     fn dashboard_never_advertises_retired_cli_commands() {
         let surfaces = [
             include_str!("../static/app.js"),
