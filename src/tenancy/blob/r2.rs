@@ -653,5 +653,21 @@ mod r2_scoped_creds_tests {
         result.expect("live R2 isolation checks");
         cleanup_a.expect("remove tenant A gate object");
         cleanup_b.expect("remove tenant B gate object");
+
+        // Every check passed and both probe objects are gone: emit the gate's
+        // evidence fragment (only when GATE_EVIDENCE_PATH is set; see
+        // `tenancy::gate_evidence`). The five names are the manifest contract.
+        crate::tenancy::gate_evidence::write_fragment(
+            "r2TenantIsolation",
+            serde_json::json!({
+                "checks": [
+                    "tenant-a-read-b-denied",
+                    "tenant-b-read-a-denied",
+                    "tenant-a-write-b-denied",
+                    "tenant-b-write-a-denied",
+                    "owned-prefix-cleaned",
+                ],
+            }),
+        );
     }
 }

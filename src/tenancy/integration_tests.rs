@@ -26,14 +26,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// The admin (maintenance-DB) URL to create/drop throwaway databases against.
-fn admin_url() -> String {
+/// (`pub(super)`: the gate drills reuse these throwaway-database helpers.)
+pub(super) fn admin_url() -> String {
     std::env::var("TEST_DATABASE_URL")
         .unwrap_or_else(|_| "postgres://reproit:reproit@localhost:5433/postgres".to_string())
 }
 
 /// Swap the database segment of a Postgres URL (mirror of the provider's helper,
 /// kept local to the test so it depends on nothing private).
-fn with_db(url: &str, db: &str) -> String {
+pub(super) fn with_db(url: &str, db: &str) -> String {
     let (base, query) = match url.split_once('?') {
         Some((b, q)) => (b, Some(q)),
         None => (url, None),
@@ -72,7 +73,7 @@ async fn admin_pool_or_skip(test: &str) -> Option<sqlx::PgPool> {
 
 /// Run `CREATE DATABASE "<name>"` (identifiers can't be bound; names here are
 /// test-built from digits/underscores, so this is safe).
-async fn create_db(admin: &sqlx::PgPool, name: &str) -> anyhow::Result<()> {
+pub(super) async fn create_db(admin: &sqlx::PgPool, name: &str) -> anyhow::Result<()> {
     let exists: Option<i32> = sqlx::query_scalar("SELECT 1 FROM pg_database WHERE datname = $1")
         .bind(name)
         .fetch_optional(admin)
@@ -87,7 +88,7 @@ async fn create_db(admin: &sqlx::PgPool, name: &str) -> anyhow::Result<()> {
 
 /// Force-drop a database (terminate lingering backends first). Best-effort: errors
 /// are swallowed so teardown never masks the test's own assertion failure.
-async fn drop_db(admin: &sqlx::PgPool, name: &str) {
+pub(super) async fn drop_db(admin: &sqlx::PgPool, name: &str) {
     let _ =
         sqlx::query("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1")
             .bind(name)
@@ -110,7 +111,7 @@ fn err_rec(sig: &str, message: &str) -> ErrorRec {
 
 /// Insert an `orgs` row with an EXPLICIT id (the FK target for `tenants` /
 /// `api_keys`). High ids (990000+) so we never collide with real BIGSERIAL orgs.
-async fn seed_org(control_url: &str, org_id: i64, name: &str) -> anyhow::Result<()> {
+pub(super) async fn seed_org(control_url: &str, org_id: i64, name: &str) -> anyhow::Result<()> {
     let mut c = sqlx::PgConnection::connect(control_url).await?;
     sqlx::query("INSERT INTO orgs (id, name) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING")
         .bind(org_id)

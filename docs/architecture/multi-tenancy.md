@@ -165,9 +165,17 @@ configuration. Each gate must also bind its exact GitHub Actions workflow run
 and downloaded artifact digest to that commit. A mock-only result cannot close
 a live-provider gate.
 
-The `hosted-production-gates` workflow executes the live R2 and Neon provider
-checks against protected disposable resources. The other workload and recovery
-checks produce one bounded evidence manifest. `release-1.0.sh` refuses the
-first hosted 1.0 release unless
-`scripts/verify_production_readiness.py` accepts that manifest for the exact
-commit being deployed.
+All five gates are executable harnesses driven by the deploy repo's
+`hosted-production-gates` workflow (one job per gate). The R2 isolation, Neon
+pool-load, and control-plane interruption gates live in this repository as
+ignored tests (`tenancy::blob::r2_scoped_creds_tests` and
+`tenancy::gate_drills`); the interruption drill runs entirely against a
+disposable local Postgres, the other two against protected disposable provider
+resources. The backup-restore and two-tenant negative gates are scripts in the
+deploy repo. A passing gate writes a JSON evidence fragment to
+`GATE_EVIDENCE_PATH` (see `tenancy::gate_evidence`), each job uploads its
+fragment as a run artifact, and the deploy repo's
+`scripts/assemble_production_evidence.py` folds the fragments plus run
+provenance into the one bounded manifest. `release-1.0.sh` refuses the first
+hosted 1.0 release unless `scripts/verify_production_readiness.py` accepts
+that manifest for the exact commit being deployed.

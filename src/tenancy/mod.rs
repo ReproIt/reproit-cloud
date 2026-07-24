@@ -22,6 +22,10 @@ pub mod provisioner;
 pub mod resolver;
 
 #[cfg(test)]
+mod gate_drills;
+#[cfg(test)]
+pub(crate) mod gate_evidence;
+#[cfg(test)]
 mod integration_tests;
 
 use crate::db::{ControlStore, TenantRecord};
