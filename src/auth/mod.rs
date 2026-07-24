@@ -11,7 +11,8 @@
 //!   - `session`: session token, cookies, `ct_eq`, `cookie_value`, env helpers
 //!   - `password`: argon2id hashing + the federated "unusable password" sentinel
 //!   - `keys`: `sk_live_*` API key minting + display prefix
-//!   - `google`: the Google OAuth start/callback flow (hosted feature)
+//! Identity-provider overlays (Google OAuth / SSO) live outside this module
+//! and consume the re-exported surface below.
 
 use crate::db::User;
 use crate::App;
@@ -30,29 +31,15 @@ use uuid::Uuid;
 const VERIFY_TTL_SECS: i64 = 48 * 60 * 60;
 const RESET_TTL_SECS: i64 = 30 * 60;
 
-/// Enterprise SSO + SCIM (WorkOS overlay). Lives under `auth` since it is an
-/// identity concern; reuses this module's session + cookie helpers.
-#[cfg(feature = "hosted")]
-pub mod sso;
-
-#[cfg(feature = "hosted")]
-mod google;
 mod keys;
 mod password;
 mod session;
 
-#[cfg(all(test, feature = "hosted"))]
-mod integration_tests;
 #[cfg(test)]
 mod invitation_tests;
-#[cfg(all(test, feature = "hosted"))]
-mod onboarding_tests;
 
-// Re-exports preserving the public API. The SSO overlay (sso.rs) reaches these
-// as `crate::auth::X`, so they stay crate-visible here; main.rs sees the Google
-// handlers as `auth::google_*` and `new_api_key` as `auth::new_api_key`.
-#[cfg(feature = "hosted")]
-pub use google::{google_callback, google_start};
+// Re-exports preserving the public API. `new_api_key` is the router's key-mint
+// handler; the rest is crate surface.
 pub use keys::new_api_key;
 pub(crate) use keys::{api_key_prefix, is_publishable, new_publishable_key};
 // The self-host bootstrap (src/bootstrap.rs) mints the admin user + first key, so
@@ -61,16 +48,21 @@ pub(crate) use keys::{api_key_prefix, is_publishable, new_publishable_key};
 // names so the local `use` of these in this module doesn't collide.
 pub(crate) use keys::api_key_prefix as api_key_prefix_pub;
 pub(crate) use password::hash_password as hash_password_pub;
-#[cfg(feature = "hosted")]
-pub(crate) use password::oauth_sentinel_hash;
-#[cfg(feature = "hosted")]
-pub(crate) use session::{cleared_oauth_state_cookie, oauth_state_cookie, OAUTH_STATE_COOKIE};
-pub(crate) use session::{
-    cookie_value, ct_eq, new_session_token, session_cookie, SESSION_TTL_SECS,
+// The identity-provider overlay surface: everything an external OAuth/SSO
+// module needs from the auth core (session cookies, the OAuth state cookie
+// pair, the CSRF-safe compare, the federated-password sentinel). Consumed by
+// the hosted overlay; unused until an edition mounts a federated provider.
+#[allow(unused_imports)]
+pub use password::oauth_sentinel_hash;
+#[allow(unused_imports)]
+pub use session::{
+    cleared_oauth_state_cookie, env, oauth_state_cookie, public_base, OAUTH_STATE_COOKIE,
 };
+pub use session::{cookie_value, ct_eq, new_session_token, session_cookie, SESSION_TTL_SECS};
 
 use password::{hash_password, verify_password};
-use session::{cleared_cookie, with_cookie, COOKIE_NAME};
+pub use session::COOKIE_NAME;
+use session::{cleared_cookie, with_cookie};
 
 #[derive(Deserialize)]
 pub struct Creds {
@@ -102,7 +94,7 @@ const INVITE_TTL_SECS: i64 = 7 * 24 * 60 * 60;
 
 // ---- helpers ---------------------------------------------------------------
 
-pub(crate) fn err(status: StatusCode, msg: &str) -> Response {
+pub fn err(status: StatusCode, msg: &str) -> Response {
     (status, Json(json!({ "error": msg }))).into_response()
 }
 
@@ -606,31 +598,12 @@ pub async fn reset_password(State(app): State<App>, Json(r): Json<ResetReq>) -> 
     Json(json!({ "ok": true })).into_response()
 }
 
-/// SSO enforcement (Enterprise overlay): if this email's domain maps to an org
-/// that enforces SSO, password login is refused outright. One guarded lookup;
-/// it only fires when an org has set sso_enforced, so normal password login is
-/// never affected. Dormant when WorkOS isn't configured (no org will enforce).
-#[cfg(feature = "hosted")]
+/// Edition login gate: the policy may refuse password login outright with a
+/// message (the hosted edition refuses domains whose org enforces SSO). The
+/// passive policy never interferes, so self-host login is unaffected.
 async fn sso_enforced_refusal(app: &App, email: &str) -> Option<Response> {
-    let domain = email.rsplit('@').next().filter(|d| !d.is_empty())?;
-    if app
-        .control
-        .domain_enforces_sso(domain)
-        .await
-        .unwrap_or(false)
-    {
-        return Some(err(
-            StatusCode::FORBIDDEN,
-            "this organization requires SSO; sign in at /auth/sso/start",
-        ));
-    }
-    None
-}
-
-/// Self-host has no SSO overlay; password login is never refused for it.
-#[cfg(not(feature = "hosted"))]
-async fn sso_enforced_refusal(_app: &App, _email: &str) -> Option<Response> {
-    None
+    let message = app.policy.login_denied(email).await?;
+    Some(err(StatusCode::FORBIDDEN, &message))
 }
 
 pub async fn login(State(app): State<App>, Json(c): Json<Creds>) -> Response {

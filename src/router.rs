@@ -2,11 +2,14 @@
 
 use crate::*;
 
-/// Build the complete HTTP surface from explicit application state.
+/// Build the complete HTTP surface from explicit application state, plus an
+/// optional edition overlay router (identity providers, billing, webhooks)
+/// merged BEFORE the security layers so overlay routes get the same headers,
+/// metrics, and host allowlist as every shared route.
 ///
 /// Keeping route ownership outside process startup makes authentication, rate
 /// limits, middleware ordering, and edition drift reviewable as one unit.
-pub(crate) fn build(app: App) -> Router {
+pub(crate) fn build(app: App, overlay: Option<Router<App>>) -> Router {
     // Rate limiters (in-memory GCRA; Cloudflare edge rules are the gross-abuse
     // first line). Tight on auth (brute-force / argon2 CPU), looser on ingest.
     // IP-keyed limiters MUST use SmartIpKeyExtractor: behind Fly/Cloudflare the
@@ -452,6 +455,7 @@ pub(crate) fn build(app: App) -> Router {
         .merge(ingest)
         .merge(protected)
         .merge(worker_api)
+        .merge(overlay.unwrap_or_default())
         // Cap request bodies (multipart evidence + JSON) to defang memory-DoS.
         .layer(DefaultBodyLimit::max(32 * 1024 * 1024))
         .layer(cors_layer())

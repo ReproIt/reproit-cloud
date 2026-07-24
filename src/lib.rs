@@ -7,19 +7,13 @@
 //! (a Mac for ios + android + web, Linux for web/android) CLAIM over HTTP, so a
 //! restart never loses work and the worker fleet is provider-agnostic.
 
-// The `hosted` cargo feature gates the hosted overlay (Google OAuth, WorkOS
-// SSO/SCIM, billing-aware account surfaces) in files shared with the hosted
-// deployment repository. The overlay modules do not exist here, so building
-// this crate with the feature is a configuration error, not a code path.
-#[cfg(feature = "hosted")]
-compile_error!("the `hosted` feature requires the hosted deployment repository");
-
-mod auth;
+pub mod auth;
 mod backend_contract;
 mod bootstrap;
 mod captures;
-mod db;
-mod edition;
+mod cli;
+pub mod db;
+pub mod edition;
 mod http_security;
 mod ingest;
 mod integrations;
@@ -28,7 +22,7 @@ mod mail;
 mod operations;
 mod router;
 mod sweep;
-mod tenancy;
+pub mod tenancy;
 mod triage;
 
 use axum::http::HeaderMap;
@@ -44,6 +38,7 @@ use axum::{
     Extension, Json, Router,
 };
 use clap::Parser;
+use cli::{Cli, Cmd};
 use db::ControlStore;
 use http_security::*;
 use jobs::{Job, JobSpec};
@@ -70,98 +65,13 @@ const DEFAULT_DB_URL: &str = "postgres://reproit:reproit@localhost:5433/reproit"
 /// installs unrestricted; the hosted deployment sets the two Cloudflare names.
 static ALLOWED_HOSTS: OnceLock<HashSet<String>> = OnceLock::new();
 
-#[derive(Parser)]
-#[command(
-    name = "reproit-cloud",
-    version = env!("CARGO_PKG_VERSION"),
-    about = "ReproIt cloud control plane"
-)]
-struct Cli {
-    #[command(subcommand)]
-    cmd: Option<Cmd>,
-    #[arg(long, default_value_t = 8080)]
-    port: u16,
-    /// Embedded worker pool size (local dev: the control plane also claims and
-    /// runs shards itself). In production this is 0 and remote workers claim.
-    #[arg(long, default_value_t = 0)]
-    workers: usize,
-    /// Path to the reproit binary the (embedded) workers invoke.
-    #[arg(long, default_value = "reproit")]
-    reproit_bin: String,
-}
-
-/// The one-shot subcommand surface (ops).
-#[derive(clap::Subcommand)]
-enum Cmd {
-    /// Print the experimental route-registry-checked backend contract and exit.
-    #[command(hide = true)]
-    BackendContract,
-    /// Offboard a tenant COMPLETELY (ops/GDPR): tear down its database at the
-    /// provider, delete every blob under its scope, and remove the org (members,
-    /// keys, tenants row, usage cascade). Refuses to run without --yes.
-    Offboard {
-        /// The org id to offboard.
-        #[arg(long)]
-        org: i64,
-        /// Confirm the irreversible deletion.
-        #[arg(long)]
-        yes: bool,
-    },
-    /// Suspend a tenant (ops: billing/abuse): the resolver stops serving it, so
-    /// ingest and the dashboard refuse, but its database and blobs stay intact.
-    /// Reversible with `resume`. Refuses to run without --yes.
-    Suspend {
-        /// The org id to suspend.
-        org: i64,
-        /// Confirm taking the tenant out of service.
-        #[arg(long)]
-        yes: bool,
-    },
-    /// Resume a suspended tenant (status back to active; served again).
-    Resume {
-        /// The org id to resume.
-        org: i64,
-    },
-    /// List every tenant in the registry as a table: org id, name, status, plan.
-    Tenants,
-    /// Print an org's most recent audit-log rows, newest first.
-    Audit {
-        /// The org id to read the audit trail for.
-        org: i64,
-        /// How many rows to print.
-        #[arg(long, default_value_t = 50)]
-        limit: i64,
-    },
-    /// Requeue one tenant's stranded shards now (the background sweep does this
-    /// every minute; this is the on-demand ops form).
-    Requeue {
-        /// The org id whose queue to requeue.
-        org: i64,
-    },
-    /// Self-host install bootstrap: create the single org, an admin owner, and a
-    /// default project + its first API key (printed once), then exit. Idempotent:
-    /// safe to re-run (it never mints a second key). Resolves the single-tenant DB
-    /// from DATABASE_URL / REPROIT_SELF_HOSTED_DB exactly like self-host startup.
-    Init {
-        /// Admin account email (becomes owner of the single org).
-        #[arg(long)]
-        email: String,
-        /// Admin account password (at least 8 characters).
-        #[arg(long)]
-        password: String,
-        /// Name of the default project to create.
-        #[arg(long, default_value = "Default")]
-        project: String,
-    },
-}
-
 #[derive(Clone)]
-pub(crate) struct App {
+pub struct App {
     /// The SHARED control plane: tenants registry, identity, keys, billing, SSO.
-    pub(crate) control: Arc<ControlStore>,
+    pub control: Arc<ControlStore>,
     /// The database-per-org machinery: resolve an org id to a tenant-bound store +
     /// blob scope; provision a tenant on signup.
-    pub(crate) tenancy: Arc<Tenancy>,
+    pub tenancy: Arc<Tenancy>,
     pub(crate) reproit_bin: String,
     /// Raw-path job submission (`POST /jobs`) is for local dev and self-hosted
     /// installs where the caller and worker intentionally share a filesystem.
@@ -170,10 +80,10 @@ pub(crate) struct App {
     pub(crate) allow_raw_jobs: bool,
     /// True for the self-hosted single-tenant edition. Hosted cloud keeps plan
     /// and seat-limit behavior; self-host removes commercial seat caps.
-    pub(crate) self_hosted: bool,
+    pub self_hosted: bool,
     /// Edition policy hooks (quotas, metering, tenant maintenance) called from
     /// shared flow; see `edition.rs`. Self-host installs `PassivePolicy`.
-    pub(crate) policy: Arc<dyn edition::EditionPolicy>,
+    pub policy: Arc<dyn edition::EditionPolicy>,
 }
 
 impl App {
@@ -256,7 +166,7 @@ fn admin_target_result(headers: &HeaderMap) -> Result<i64, AdminTargetError> {
 /// `App::tenant_of` maps it to the tenant database the handler operates on. The
 /// cross-tenant boundary is that database, not a `WHERE org_id =` clause.
 #[derive(Clone, Copy, Debug)]
-pub(crate) enum AuthCtx {
+pub enum AuthCtx {
     /// The shared admin/ops key: targets a tenant explicitly (X-Reproit-Tenant).
     Admin,
     /// A per-org API key: resolves to this org's tenant database.
@@ -270,7 +180,7 @@ pub(crate) enum AuthCtx {
 /// publishable key to its own app: a pk lifted from one page must not be able to
 /// inject telemetry into the org's other projects.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct KeyScope {
+pub struct KeyScope {
     pub(crate) project_id: Option<i64>,
     pub(crate) user_id: Option<i64>,
     pub(crate) publishable: bool,
@@ -285,8 +195,31 @@ impl KeyScope {
     };
 }
 
-/// Run the Reproit Cloud application from parsed process configuration.
+/// Composition inputs for `run_with`: the seams a hosted overlay drives.
+/// `Default` is the self-hosted edition exactly as `run()` ships it.
+#[derive(Default)]
+pub struct RunConfig {
+    /// Edition policy hooks (quotas, metering, account card, login gate);
+    /// None installs `PassivePolicy`.
+    pub policy: Option<Arc<dyn edition::EditionPolicy>>,
+    /// Extra routes merged into the shared router BEFORE the security layers
+    /// wrap it (identity providers, billing, webhooks). None mounts nothing.
+    pub overlay_routes: Option<Router<App>>,
+    /// Overlay control-plane schema applied right after the shared schema
+    /// (idempotent SQL, same contract as CONTROL_SCHEMA).
+    pub extra_control_schema: Option<&'static str>,
+    /// Refuse to boot without a configured mail provider. Hosted signup
+    /// depends on verification email; self-host logs the links instead.
+    pub require_mail: bool,
+}
+
+/// Run the self-hosted edition (the `RunConfig` defaults).
 pub async fn run() -> anyhow::Result<()> {
+    run_with(RunConfig::default()).await
+}
+
+/// Run the Reproit Cloud application composed with an edition overlay.
+pub async fn run_with(config: RunConfig) -> anyhow::Result<()> {
     // rustls 0.23 requires a process-wide default crypto provider before any TLS
     // handshake. sqlx (Postgres TLS) and rust-s3 both build rustls configs
     // that rely on this default; without it a TLS-required remote Postgres can
@@ -364,6 +297,15 @@ pub async fn run() -> anyhow::Result<()> {
     // applies on boot; tenant DBs get the declarative schema at provision/boot.
     let control = Arc::new(ControlStore::connect(&control_url).await?);
     tracing::info!("connected to control-plane postgres, schema ready");
+    if let Some(extra_schema) = config.extra_control_schema {
+        control.apply_extra_schema(extra_schema).await?;
+        tracing::info!("edition overlay control schema applied");
+    }
+    if config.require_mail && !mail::is_configured() {
+        anyhow::bail!(
+            "this edition requires outbound mail: set RESEND_API_KEY and REPROIT_MAIL_FROM"
+        );
+    }
 
     // Build the tenancy layer: blobs + the connection provider (local-per-tenant
     // for dev/SaaS, single-tenant for self-hosted) behind one resolver/provisioner.
@@ -385,7 +327,9 @@ pub async fn run() -> anyhow::Result<()> {
         reproit_bin: cli.reproit_bin.clone(),
         allow_raw_jobs: raw_jobs_enabled(self_hosted, dev_open()),
         self_hosted,
-        policy: Arc::new(edition::PassivePolicy),
+        policy: config
+            .policy
+            .unwrap_or_else(|| Arc::new(edition::PassivePolicy)),
     };
 
     // One-shot subcommands: run and exit before the server ever binds.
@@ -472,7 +416,7 @@ pub async fn run() -> anyhow::Result<()> {
         jobs::worker::spawn_embedded(app.clone(), cli.workers, shutdown_rx.clone());
     }
 
-    let router = router::build(app);
+    let router = router::build(app, config.overlay_routes);
 
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", cli.port)).await?;
     tracing::info!(

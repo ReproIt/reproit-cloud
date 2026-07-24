@@ -65,10 +65,6 @@ futures-util = { version = "0.3", optional = true }
 default = []
 # R2 / S3-compatible per-tenant blob storage (the default build uses local-fs).
 r2 = ["dep:futures-util", "dep:object_store"]
-# The hosted overlay (Google OAuth, WorkOS SSO/SCIM, billing-gated auth
-# surfaces). The overlay modules exist only in the hosted deployment repo;
-# building this crate with the feature fails by design (see lib.rs).
-hosted = []
 # Neon-provisioned per-tenant databases. The provisioning path calls the live
 # provider API, so it is release-gated behind this feature.
 neon = []

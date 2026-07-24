@@ -239,11 +239,19 @@ pub struct AuditRow {
 }
 
 impl ControlStore {
+    /// Apply an edition overlay's control schema (idempotent SQL, the same
+    /// contract as CONTROL_SCHEMA). Called once at boot via RunConfig.
+    #[allow(dead_code)] // The hosted overlay's boot path is the caller.
+    pub async fn apply_extra_schema(&self, sql: &str) -> anyhow::Result<()> {
+        sqlx::raw_sql(sql).execute(&self.pool).await?;
+        Ok(())
+    }
+
     /// The raw pool. The seam for edition overlays (the hosted repo extends
-    /// ControlStore with impl blocks in its own modules) and for tests; shared
-    /// handlers go through the typed methods, never this.
+    /// ControlStore through an extension trait over this) and for tests;
+    /// shared handlers go through the typed methods, never this.
     #[allow(dead_code)] // The hosted overlay and tests reach it; shared flow must not.
-    pub(crate) fn pool(&self) -> &PgPool {
+    pub fn pool(&self) -> &PgPool {
         &self.pool
     }
 

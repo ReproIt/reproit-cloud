@@ -780,23 +780,14 @@ pub async fn set_seat(
 
 /// GET /auth/config: which login providers are enabled, so the pages can show
 /// the right buttons. Google appears only once both OAuth env vars are present.
-#[cfg(feature = "hosted")]
-pub async fn auth_config() -> Response {
-    Json(json!({
-        "google": session::env("GOOGLE_CLIENT_ID").is_some()
-            && session::env("GOOGLE_CLIENT_SECRET").is_some(),
-        // SSO is live once the WorkOS overlay is configured (see sso.rs).
-        "sso": crate::auth::sso::workos_config().is_some(),
-    }))
-    .into_response()
-}
-
-/// GET /auth/config: the self-hosted edition uses local password auth only.
-#[cfg(not(feature = "hosted"))]
-pub async fn auth_config() -> Response {
-    Json(json!({
-        "google": false,
-        "sso": false,
-    }))
-    .into_response()
+pub async fn auth_config(State(app): State<App>) -> Response {
+    // The edition's provider descriptor; password-only when the policy has no
+    // federated providers to offer.
+    let methods = app.policy.auth_methods().await.unwrap_or_else(|| {
+        json!({
+            "google": false,
+            "sso": false,
+        })
+    });
+    Json(methods).into_response()
 }

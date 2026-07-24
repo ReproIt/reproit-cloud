@@ -11,37 +11,33 @@ use axum::{
 use serde_json::Value;
 use uuid::Uuid;
 
-#[cfg(feature = "hosted")]
-pub(crate) fn env(k: &str) -> Option<String> {
+pub fn env(k: &str) -> Option<String> {
     std::env::var(k).ok().filter(|v| !v.is_empty())
 }
-#[cfg(feature = "hosted")]
-pub(crate) fn public_base() -> String {
+pub fn public_base() -> String {
     env("REPROIT_PUBLIC_URL").unwrap_or_else(|| "http://cloud.reproit.localhost".into())
 }
 
-pub(crate) const COOKIE_NAME: &str = "rid_session";
+pub const COOKIE_NAME: &str = "rid_session";
 /// Session lifetime: 30 days, kept in lockstep with the server-side `expires_at`
 /// (passed to `create_session`) and the cookie's `Max-Age`.
-pub(crate) const SESSION_TTL_SECS: i64 = 2_592_000;
+pub const SESSION_TTL_SECS: i64 = 2_592_000;
 /// Transient cookie carrying the OAuth `state` between `*_start` and the
 /// callback. Short-lived (10 min) so a dangling value can't be replayed later.
 /// Reused by the SSO overlay (sso.rs) so its flow matches Google's exactly.
-#[cfg(feature = "hosted")]
-pub(crate) const OAUTH_STATE_COOKIE: &str = "rid_oauth_state";
-#[cfg(feature = "hosted")]
-pub(crate) const OAUTH_STATE_TTL_SECS: i64 = 600;
+pub const OAUTH_STATE_COOKIE: &str = "rid_oauth_state";
+pub const OAUTH_STATE_TTL_SECS: i64 = 600;
 
 /// Opaque 64-hex session token (two v4 UUIDs). Also used to mint the OAuth/SSO
 /// `state` nonce (CSPRNG via uuid v4), shared with the SSO overlay (sso.rs).
-pub(crate) fn new_session_token() -> String {
+pub fn new_session_token() -> String {
     format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
 }
 
 /// Constant-time byte compare (length may leak; contents must not). Used to
 /// match the OAuth `state` so a mismatch can't be probed via response timing.
 /// Shared with the SSO overlay (sso.rs) for `state` + webhook signature checks.
-pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -67,7 +63,7 @@ pub(crate) fn secure_attr() -> &'static str {
     }
 }
 
-pub(crate) fn session_cookie(token: &str) -> String {
+pub fn session_cookie(token: &str) -> String {
     // 30-day session, Max-Age in lockstep with the server-side expiry. HttpOnly
     // keeps it out of JS; SameSite=Lax + Secure defend against CSRF / sniffing.
     format!(
@@ -84,8 +80,7 @@ pub(crate) fn cleared_cookie() -> String {
 }
 
 /// Set the short-lived OAuth `state` cookie (CSRF / session-fixation defense).
-#[cfg(feature = "hosted")]
-pub(crate) fn oauth_state_cookie(state: &str) -> String {
+pub fn oauth_state_cookie(state: &str) -> String {
     format!(
         "{OAUTH_STATE_COOKIE}={state}; HttpOnly; SameSite=Lax{}; Path=/; Max-Age={OAUTH_STATE_TTL_SECS}",
         secure_attr()
@@ -93,8 +88,7 @@ pub(crate) fn oauth_state_cookie(state: &str) -> String {
 }
 
 /// Clear the OAuth `state` cookie once the callback has consumed it.
-#[cfg(feature = "hosted")]
-pub(crate) fn cleared_oauth_state_cookie() -> String {
+pub fn cleared_oauth_state_cookie() -> String {
     format!(
         "{OAUTH_STATE_COOKIE}=; HttpOnly; SameSite=Lax{}; Path=/; Max-Age=0",
         secure_attr()
@@ -102,7 +96,7 @@ pub(crate) fn cleared_oauth_state_cookie() -> String {
 }
 
 /// Pull a named cookie value out of a Cookie header.
-pub(crate) fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+pub fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     let raw = headers.get(COOKIE)?.to_str().ok()?;
     raw.split(';').find_map(|c| {
         let c = c.trim();

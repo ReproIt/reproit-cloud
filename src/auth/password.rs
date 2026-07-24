@@ -30,6 +30,6 @@ pub(crate) fn verify_password(pw: &str, hash: &str) -> bool {
 /// the SSO overlay so JIT-provisioned users match the Google path exactly.
 // Consumed by the SSO overlay; self-host has no federated sign-in yet.
 #[allow(dead_code)]
-pub(crate) fn oauth_sentinel_hash() -> String {
+pub fn oauth_sentinel_hash() -> String {
     hash_password(&Uuid::new_v4().to_string()).unwrap_or_else(|_| Uuid::new_v4().to_string())
 }

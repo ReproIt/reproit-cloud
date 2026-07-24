@@ -69,6 +69,24 @@ pub trait EditionPolicy: Send + Sync {
     /// purchasable plans; self-host carries no checkout intent, so the query
     /// parameter is ignored. Sync: a pure filter over the raw string.
     fn valid_checkout_plan(&self, plan: Option<&str>) -> Option<String>;
+
+    /// The edition's account card: plan, limits, billing state, and identity
+    /// provider bindings, merged into the `org` object of the `me` response.
+    /// `Value::Null` (self-host) leaves the base shape untouched.
+    fn account_card<'a>(&'a self, org_id: i64) -> PolicyFuture<'a, serde_json::Value>;
+
+    /// The edition's usage meter: an object whose `plan` and `occurrences`
+    /// members extend the usage response. `Value::Null` reports storage only.
+    fn usage_meter<'a>(&'a self, org_id: i64) -> PolicyFuture<'a, serde_json::Value>;
+
+    /// The login-method descriptor for `/auth/config` (which provider buttons
+    /// the pages render), or None for the password-only default.
+    fn auth_methods<'a>(&'a self) -> PolicyFuture<'a, Option<serde_json::Value>>;
+
+    /// Refuse a password login before credentials are checked. Some(message)
+    /// becomes a 403; the hosted edition refuses domains whose org enforces
+    /// SSO. None never interferes with password login.
+    fn login_denied<'a>(&'a self, email: &'a str) -> PolicyFuture<'a, Option<String>>;
 }
 
 /// The self-hosted edition: no quotas, no metering, no tenant maintenance
@@ -114,5 +132,21 @@ impl EditionPolicy for PassivePolicy {
 
     fn on_tenant_activity<'a>(&'a self, _org_id: i64, _kind: &'static str) -> PolicyFuture<'a, ()> {
         Box::pin(async {})
+    }
+
+    fn account_card<'a>(&'a self, _org_id: i64) -> PolicyFuture<'a, serde_json::Value> {
+        Box::pin(async { serde_json::Value::Null })
+    }
+
+    fn usage_meter<'a>(&'a self, _org_id: i64) -> PolicyFuture<'a, serde_json::Value> {
+        Box::pin(async { serde_json::Value::Null })
+    }
+
+    fn auth_methods<'a>(&'a self) -> PolicyFuture<'a, Option<serde_json::Value>> {
+        Box::pin(async { None })
+    }
+
+    fn login_denied<'a>(&'a self, _email: &'a str) -> PolicyFuture<'a, Option<String>> {
+        Box::pin(async { None })
     }
 }
