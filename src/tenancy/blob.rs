@@ -1,4 +1,6 @@
-//! Blob storage for one self-hosted installation.
+//! Per-tenant blob / object isolation: the videos are the crown jewels, so blob
+//! isolation matters as much as DB isolation (`docs/architecture/multi-tenancy.md`
+//! §5). The model:
 //!
 //!   - A tenant's bytes live under a per-tenant SCOPE: a prefix in a shared bucket
 //!     (default) or a dedicated bucket (enterprise). The control-plane
@@ -14,16 +16,19 @@
 //!   - [`LocalBackend`]: filesystem, the default, needs no credentials, so the
 //!     whole cloud is testable offline. Serves via the cloud's `/v1/blob/*key`
 //!     proxy (which keeps its own safety check).
-//!   - [`R2Backend`] (feature `r2`): any S3-compatible bucket with short-lived
-//!     presigned GET URLs and static installation credentials.
+//!   - [`R2Backend`] (feature `r2`): a Cloudflare R2 bucket with short-lived
+//!     presigned GET urls. With `R2_CREDS_API_TOKEN` set, every tenant operation
+//!     runs under a PER-TENANT temporary credential minted from Cloudflare's
+//!     temp-access-credentials API, bound to the tenant's key prefix and cached
+//!     with TTL-aware refresh, so even a key-forming bug cannot cross a tenant
+//!     boundary at the STORAGE layer. Without it the one process credential is
+//!     used and isolation is convention-only (logged once at startup).
+//!
+//! Self-hosted degenerates to one scope for the one tenant; same code.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::fs;
-
-/// How long a presigned R2 GET url stays valid (1 hour).
-#[cfg(feature = "r2")]
-const PRESIGN_EXPIRY_SECS: u32 = 3600;
 
 /// The provider-agnostic blob backend. Operations take the tenant's SCOPE (the
 /// isolation boundary; a backend that binds storage-layer credentials uses it,
@@ -33,6 +38,8 @@ const PRESIGN_EXPIRY_SECS: u32 = 3600;
 #[allow(async_fn_in_trait)]
 pub trait BlobBackend: Send + Sync {
     async fn put(&self, scope: &str, key: &str, bytes: &[u8]) -> anyhow::Result<String>;
+    // Consumed by the capture upload flow; hosted mounts no capture routes yet.
+    #[allow(dead_code)]
     async fn put_path(
         &self,
         scope: &str,
@@ -63,7 +70,8 @@ pub struct Blobs {
 /// split stays monomorphized and the `r2` feature gates cleanly.)
 enum Backend {
     Local(LocalBackend),
-    // Boxed to keep the local-fs default compact.
+    // Boxed: the R2 backend now carries the credential minter + cache, which
+    // would otherwise dominate the enum's size for the local-fs default too.
     #[cfg(feature = "r2")]
     R2(Box<R2Backend>),
 }
@@ -75,7 +83,15 @@ impl Blobs {
         #[cfg(feature = "r2")]
         {
             if let Some(b) = R2Backend::from_env() {
-                tracing::info!("blobs: S3-compatible object storage backend");
+                if b.mints_scoped_credentials() {
+                    tracing::info!(
+                        "blobs: R2 backend, per-tenant prefix-scoped credentials (minted via the Cloudflare API)"
+                    );
+                } else {
+                    tracing::warn!(
+                        "blobs: R2 backend without credential minting: blob isolation is convention-only (key prefixes); set R2_CREDS_API_TOKEN (with R2_ACCOUNT_ID) for per-tenant prefix-scoped credentials"
+                    );
+                }
                 return Self {
                     backend: Arc::new(Backend::R2(Box::new(b))),
                 };
@@ -168,6 +184,8 @@ impl TenantBlobs {
             .await
     }
 
+    // Consumed by the capture upload flow; hosted mounts no capture routes yet.
+    #[allow(dead_code)]
     pub async fn put_path(
         &self,
         key: &str,
@@ -204,6 +222,8 @@ impl Backend {
             Backend::R2(b) => b.put(scope, key, bytes).await,
         }
     }
+    // Consumed by the capture upload flow; hosted mounts no capture routes yet.
+    #[allow(dead_code)]
     async fn put_path(
         &self,
         scope: &str,
@@ -263,6 +283,8 @@ impl BlobBackend for LocalBackend {
         fs::write(&path, bytes).await?;
         Ok(format!("file://{}", path.display()))
     }
+    // Consumed by the capture upload flow; hosted mounts no capture routes yet.
+    #[allow(dead_code)]
     async fn put_path(
         &self,
         _scope: &str,
@@ -302,142 +324,10 @@ impl BlobBackend for LocalBackend {
     }
 }
 
-/// S3-compatible object-storage backend (feature `r2`).
-///
-/// The historical `R2_*` variable names remain wire-compatible, but any
-/// S3-compatible service can be selected with `R2_ENDPOINT`. This edition has
-/// one installation namespace and never calls a provider control-plane API.
 #[cfg(feature = "r2")]
-pub struct R2Backend {
-    store: object_store::aws::AmazonS3,
-}
-
+mod r2;
 #[cfg(feature = "r2")]
-const MAX_DELETE_PREFIX_OBJECTS: u64 = 100_000;
-
-#[cfg(feature = "r2")]
-impl R2Backend {
-    /// Build from static S3-compatible credentials. `R2_ENDPOINT` selects a
-    /// custom path-style service such as MinIO; without it, `R2_ACCOUNT_ID`
-    /// selects Cloudflare R2.
-    ///
-    ///   - UNSET (the default, Cloudflare R2): the endpoint is derived from
-    ///     `R2_ACCOUNT_ID` (required) as `https://{account}.r2.cloudflarestorage.com`
-    ///     and virtual-host addressing is used, R2's native style.
-    ///   - SET (a local MinIO or other R2-compatible store): `R2_ENDPOINT` is used
-    ///     verbatim as the custom endpoint, `R2_ACCOUNT_ID` becomes OPTIONAL (MinIO
-    ///     has none), and PATH-STYLE addressing is enabled (MinIO requires it, and
-    ///     it points the same code at a local object store for dev/prod parity).
-    ///
-    /// `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, and `R2_BUCKET` are required in
-    /// both shapes.
-    ///
-    fn from_env() -> Option<Self> {
-        let (key, secret, bucket) = (
-            std::env::var("R2_ACCESS_KEY_ID").ok()?,
-            std::env::var("R2_SECRET_ACCESS_KEY").ok()?,
-            std::env::var("R2_BUCKET").ok()?,
-        );
-        let (endpoint, virtual_hosted_style) = match std::env::var("R2_ENDPOINT").ok() {
-            // Custom endpoint (local MinIO / any R2-compatible store): account id is
-            // optional, path-style addressing is required.
-            Some(endpoint) => (endpoint, false),
-            // Default Cloudflare R2: derive the endpoint from the account id
-            // (required) and use virtual-host addressing.
-            None => {
-                let account = std::env::var("R2_ACCOUNT_ID").ok()?;
-                (format!("https://{account}.r2.cloudflarestorage.com"), true)
-            }
-        };
-        let allow_http = endpoint.starts_with("http://");
-        let store = object_store::aws::AmazonS3Builder::new()
-            .with_region("auto")
-            .with_bucket_name(bucket)
-            .with_access_key_id(key)
-            .with_secret_access_key(secret)
-            .with_endpoint(endpoint)
-            .with_virtual_hosted_style_request(virtual_hosted_style)
-            .with_allow_http(allow_http)
-            .build()
-            .ok()?;
-        Some(Self { store })
-    }
-}
-
-#[cfg(feature = "r2")]
-impl BlobBackend for R2Backend {
-    async fn put(&self, _scope: &str, key: &str, bytes: &[u8]) -> anyhow::Result<String> {
-        use object_store::ObjectStoreExt;
-        let location = object_store::path::Path::from(key);
-        self.store.put(&location, bytes.to_vec().into()).await?;
-        Ok(format!("r2://{key}"))
-    }
-    async fn put_path(
-        &self,
-        _scope: &str,
-        key: &str,
-        path: &std::path::Path,
-        content_type: &str,
-    ) -> anyhow::Result<String> {
-        use object_store::{Attribute, Attributes, ObjectStore};
-        use tokio::io::AsyncWriteExt;
-        let location = object_store::path::Path::from(key);
-        let store: Arc<dyn ObjectStore> = Arc::new(self.store.clone());
-        let attributes: Attributes = [(
-            Attribute::ContentType,
-            object_store::AttributeValue::from(content_type.to_string()),
-        )]
-        .into_iter()
-        .collect();
-        let mut writer =
-            object_store::buffered::BufWriter::new(store, location).with_attributes(attributes);
-        let mut source = fs::File::open(path).await?;
-        tokio::io::copy(&mut source, &mut writer).await?;
-        writer.shutdown().await?;
-        Ok(format!("r2://{key}"))
-    }
-    async fn get(&self, _scope: &str, key: &str) -> anyhow::Result<Vec<u8>> {
-        use object_store::ObjectStoreExt;
-        let location = object_store::path::Path::from(key);
-        Ok(self.store.get(&location).await?.bytes().await?.to_vec())
-    }
-    async fn url_for(&self, _scope: &str, key: &str) -> anyhow::Result<String> {
-        use object_store::signer::Signer;
-        let location = object_store::path::Path::from(key);
-        Ok(self
-            .store
-            .signed_url(
-                axum::http::Method::GET,
-                &location,
-                std::time::Duration::from_secs(PRESIGN_EXPIRY_SECS.into()),
-            )
-            .await?
-            .to_string())
-    }
-    async fn delete(&self, _scope: &str, key: &str) -> anyhow::Result<()> {
-        use object_store::ObjectStoreExt;
-        // S3/R2 DELETE is idempotent: deleting a missing key answers 204.
-        self.store
-            .delete(&object_store::path::Path::from(key))
-            .await?;
-        Ok(())
-    }
-    async fn delete_prefix(&self, prefix: &str) -> anyhow::Result<u64> {
-        use futures_util::StreamExt;
-        use object_store::{ObjectStore, ObjectStoreExt};
-        let mut removed = 0u64;
-        let location = object_store::path::Path::from(format!("{prefix}/"));
-        let mut objects = self.store.list(Some(&location));
-        while let Some(object) = objects.next().await {
-            if removed >= MAX_DELETE_PREFIX_OBJECTS {
-                anyhow::bail!("object deletion exceeded {MAX_DELETE_PREFIX_OBJECTS} keys");
-            }
-            self.store.delete(&object?.location).await?;
-            removed += 1;
-        }
-        Ok(removed)
-    }
-}
+pub use r2::R2Backend;
 
 /// Trim a leading slash before a key touches the filesystem.
 fn safe_key(key: &str) -> &str {

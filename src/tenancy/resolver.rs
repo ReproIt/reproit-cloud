@@ -76,9 +76,9 @@ impl std::fmt::Display for ResolveError {
 /// connection provider (for a derive-fallback when a record lacks its conn), the
 /// bounded per-tenant pool cache, the blob store, and a small mapping cache.
 ///
-/// This edition uses a fixed single-installation connection provider. The
-/// resolver still returns a tenant-bound handle so request handlers never build
-/// database or blob scopes themselves.
+/// `P` is the connection provider, so the SAME resolver code runs the SaaS (Local
+/// or Neon provider) and self-hosted (SingleTenant provider) editions; only the
+/// provider differs (the whole point of database-per-org).
 pub struct Resolver {
     control: Arc<ControlStore>,
     provider: Provider,
@@ -105,6 +105,12 @@ struct CachedMapping {
 }
 
 impl Resolver {
+    // Consumed by the hosted org-deletion route; self-host offboards via ops.
+    #[allow(dead_code)]
+    pub(crate) async fn delete_blob_scope(&self, scope: &str) -> anyhow::Result<u64> {
+        self.blobs.delete_scope(scope).await
+    }
+
     pub fn new(
         control: Arc<ControlStore>,
         provider: Provider,

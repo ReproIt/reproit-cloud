@@ -19,6 +19,7 @@
 use super::blob::Blobs;
 use super::Tenancy;
 use crate::db::{ControlStore, TenantStatus};
+use crate::ingest::{buckets, ErrorRec};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::Connection;
 use std::sync::Arc;
@@ -97,6 +98,16 @@ async fn drop_db(admin: &sqlx::PgPool, name: &str) {
         .await;
 }
 
+/// A minimal error record to write through a tenant store.
+fn err_rec(sig: &str, message: &str) -> ErrorRec {
+    ErrorRec {
+        sig: sig.to_string(),
+        message: message.to_string(),
+        path: vec![],
+        context: serde_json::Map::new(),
+    }
+}
+
 /// Insert an `orgs` row with an EXPLICIT id (the FK target for `tenants` /
 /// `api_keys`). High ids (990000+) so we never collide with real BIGSERIAL orgs.
 async fn seed_org(control_url: &str, org_id: i64, name: &str) -> anyhow::Result<()> {
@@ -122,6 +133,142 @@ async fn seed_user(control_url: &str, email: &str) -> anyhow::Result<i64> {
     c.close().await?;
     Ok(id)
 }
+
+/// 1. TENANT ISOLATION (security-critical). Provision two orgs through the tenancy
+///    layer (each gets its own real `reproit_tenant_<org>` database), write a
+///    DISTINCT row into each tenant store, then assert each store reads back ONLY
+///    its own row and NEVER the other tenant's. The boundary is the database
+///    itself, so a leak here would be a physical cross-database read.
+#[tokio::test]
+async fn tenant_isolation_two_orgs_never_see_each_other() {
+    let Some(admin) = admin_pool_or_skip("tenant_isolation_two_orgs_never_see_each_other").await
+    else {
+        return;
+    };
+
+    // Unique throwaway control DB; high org ids -> reproit_tenant_990001 / _990002.
+    let control_db = format!("reproit_it_control_iso_{}", std::process::id());
+    let (org_a, org_b) = (990001i64, 990002i64);
+    let tenant_db_a = format!("reproit_tenant_{org_a}");
+    let tenant_db_b = format!("reproit_tenant_{org_b}");
+
+    // Clean any leftovers from a previous crashed run, then create the control DB.
+    drop_db(&admin, &control_db).await;
+    drop_db(&admin, &tenant_db_a).await;
+    drop_db(&admin, &tenant_db_b).await;
+    create_db(&admin, &control_db)
+        .await
+        .expect("create control db");
+
+    let result = async {
+        let control_url = with_db(&admin_url(), &control_db);
+        let control = Arc::new(ControlStore::connect(&control_url).await?);
+        // The base tenant URL the LocalProvider swaps per org (same server).
+        let base_tenant_url = with_db(&admin_url(), "reproit");
+        let tenancy = Tenancy::new(control.clone(), Blobs::from_env(), &base_tenant_url, None);
+
+        // Orgs must exist (tenants.org_id REFERENCES orgs(id)).
+        seed_org(&control_url, org_a, "Org A").await?;
+        seed_org(&control_url, org_b, "Org B").await?;
+
+        // Provision BOTH tenants: each creates its own database + applies the schema.
+        tenancy.provision(org_a).await?;
+        tenancy.provision(org_b).await?;
+
+        // Resolve each tenant and write a DISTINCT project + error into each.
+        let ta = tenancy
+            .resolve(org_a)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let tb = tenancy
+            .resolve(org_b)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        ta.store.create_project(0, "Alpha", "app-a").await?;
+        tb.store.create_project(0, "Bravo", "app-b").await?;
+        let err_a = err_rec("sig-a", "boom-a");
+        let err_b = err_rec("sig-b", "boom-b");
+        let bucket_a = buckets::bucket_id(&err_a);
+        let bucket_b = buckets::bucket_id(&err_b);
+        ta.store.add_error("app-a", &err_a).await?;
+        tb.store.add_error("app-b", &err_b).await?;
+
+        // Each store sees ONLY its own project.
+        let a_projects = ta.store.list_projects().await?;
+        let b_projects = tb.store.list_projects().await?;
+        anyhow::ensure!(
+            a_projects.len() == 1 && a_projects[0].2 == "app-a",
+            "tenant A should see exactly its own project, saw {a_projects:?}"
+        );
+        anyhow::ensure!(
+            b_projects.len() == 1 && b_projects[0].2 == "app-b",
+            "tenant B should see exactly its own project, saw {b_projects:?}"
+        );
+
+        // The cross-tenant read is physically impossible: A cannot see B's app_id.
+        anyhow::ensure!(
+            !ta.store.owns_app("app-b").await?,
+            "ISOLATION BREACH: tenant A can see tenant B's app-b"
+        );
+        anyhow::ensure!(
+            !tb.store.owns_app("app-a").await?,
+            "ISOLATION BREACH: tenant B can see tenant A's app-a"
+        );
+
+        // Errors are likewise isolated: A's app-id has A's error and nothing of B's.
+        let a_errors = ta.store.errors("app-a").await?;
+        let b_errors = tb.store.errors("app-b").await?;
+        anyhow::ensure!(
+            a_errors.len() == 1 && a_errors[0].sig == "sig-a",
+            "tenant A errors leaked or missing (count {}, first sig {:?})",
+            a_errors.len(),
+            a_errors.first().map(|e| e.sig.as_str())
+        );
+        anyhow::ensure!(
+            b_errors.len() == 1 && b_errors[0].sig == "sig-b",
+            "tenant B errors leaked or missing (count {}, first sig {:?})",
+            b_errors.len(),
+            b_errors.first().map(|e| e.sig.as_str())
+        );
+        anyhow::ensure!(
+            ta.store
+                .errors_for_bucket("app-a", &bucket_a, 10)
+                .await?
+                .len()
+                == 1,
+            "tenant A bucket detail read could not find the bucket listed by the error payload"
+        );
+        anyhow::ensure!(
+            tb.store
+                .errors_for_bucket("app-b", &bucket_b, 10)
+                .await?
+                .len()
+                == 1,
+            "tenant B bucket detail read could not find the bucket listed by the error payload"
+        );
+        // Querying A's store for B's app-id returns nothing (no shared rows).
+        anyhow::ensure!(
+            ta.store.errors("app-b").await?.is_empty(),
+            "ISOLATION BREACH: tenant A returned rows for tenant B's app-id"
+        );
+
+        anyhow::Ok(())
+    }
+    .await;
+
+    // Teardown: drop every database we created, regardless of pass/fail.
+    drop_db(&admin, &tenant_db_a).await;
+    drop_db(&admin, &tenant_db_b).await;
+    drop_db(&admin, &control_db).await;
+    admin.close().await;
+
+    result.expect("tenant isolation test body");
+}
+
+/// 2. SCHEMA APPLY. Apply the declarative tenant schema to a FRESH database,
+///    assert the expected tables exist, and that a SECOND apply is an
+///    idempotent no-op (pre-launch there is no migration ledger; the schema
 ///    file is the truth and re-applies must always be safe).
 #[tokio::test]
 async fn schema_apply_creates_tables_and_reapply_is_noop() {
@@ -157,8 +304,6 @@ async fn schema_apply_creates_tables_and_reapply_is_noop() {
             "replay_results",
             "bucket_tickets",
             "projects",
-            "captures",
-            "capture_files",
             "bucket_triage",
             "bucket_resolution_status",
             "bucket_resolution_events",
@@ -208,8 +353,8 @@ async fn full_path_org_to_provision_to_key_to_tenant_row() {
     let result = async {
         let control_url = with_db(&admin_url(), &control_db);
         let control = Arc::new(ControlStore::connect(&control_url).await?);
-        let base_tenant_url = control_url.clone();
-        let tenancy = Tenancy::new(control.clone(), Blobs::from_env(), &base_tenant_url);
+        let base_tenant_url = with_db(&admin_url(), "reproit");
+        let tenancy = Tenancy::new(control.clone(), Blobs::from_env(), &base_tenant_url, None);
 
         // Control plane: org + user, then provision the tenant database.
         seed_org(&control_url, org_id, "Acme").await?;
@@ -286,88 +431,30 @@ async fn full_path_org_to_provision_to_key_to_tenant_row() {
             edges == vec![("s1->s2".to_string(), 2)],
             "edge row should read back with count 2: {edges:?}"
         );
-
-        // Human capture lifecycle: pending review, browser approval, immutable
-        // file ledger, completion, and project-owned deletion inventory.
-        let capture_manifest = serde_json::json!({
-            "schemaVersion": 1,
-            "id": "cap_0123456789abcdef",
-            "immutableOriginal": true,
-            "fileSha256": { "original.mov": "a".repeat(64) }
-        });
-        anyhow::ensure!(
-            tenant
-                .store
-                .create_capture(crate::db::NewCapture {
-                    id: "cap_0123456789abcdef",
-                    review_token_hash: "review-hash",
-                    created_by: Some(user_id),
-                    app_id: Some("acme-web"),
-                    platform: "web",
-                    target: "https://example.test",
-                    source_created_at: "2026-07-18T00:00:00Z",
-                    manifest: &capture_manifest,
-                })
-                .await?,
-            "capture should be created"
-        );
-        anyhow::ensure!(
-            tenant
-                .store
-                .approve_capture(crate::db::CaptureApproval {
-                    review_token_hash: "review-hash",
-                    app_id: "acme-web",
-                    title: "Menu clips content",
-                    description: "Observed on checkout",
-                    severity: "normal",
-                    visibility: "project",
-                })
-                .await?,
-            "capture should be approved"
-        );
-        anyhow::ensure!(
-            tenant
-                .store
-                .add_capture_file(crate::db::PendingCaptureFile {
-                    capture_id: "cap_0123456789abcdef",
-                    filename: "original.mov",
-                    storage_key: "captures/cap_0123456789abcdef/original.mov",
-                    bytes: 42,
-                    sha256: &"a".repeat(64),
-                    content_type: "video/quicktime",
-                    quota_bytes: Some(1024),
-                })
-                .await?
-                == Some(true),
-            "capture file should be recorded"
-        );
-        anyhow::ensure!(
-            tenant
-                .store
-                .mark_capture_file_uploaded("cap_0123456789abcdef", "original.mov")
-                .await?,
-            "capture file should become visible after blob persistence"
-        );
-        anyhow::ensure!(
-            tenant
-                .store
-                .complete_capture("cap_0123456789abcdef")
-                .await?,
-            "capture should complete"
-        );
-        let capture = tenant
+        let error = ErrorRec {
+            sig: "delete-regression".to_string(),
+            message: "project cleanup regression".to_string(),
+            path: vec![],
+            context: serde_json::from_value(serde_json::json!({
+                "build": {"version": "delete-test"},
+                "locale": "en-US"
+            }))?,
+        };
+        tenant
             .store
-            .capture("cap_0123456789abcdef")
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("capture should read back"))?;
-        anyhow::ensure!(capture.status == "complete", "capture status should persist");
-        let owned_keys = tenant.store.project_evidence_keys("acme-web").await?;
-        anyhow::ensure!(
-            owned_keys == vec!["captures/cap_0123456789abcdef/original.mov"],
-            "capture blob should belong to the project: {owned_keys:?}"
-        );
+            .ingest_batch(
+                "acme-web",
+                &[],
+                &[error.clone(), error],
+                &[],
+                "delete-regression-batch",
+                Some("delete-test"),
+            )
+            .await?;
 
-        // Project deletion removes its tenant data and revokes only its keys.
+        // Project deletion removes raw rows plus derived read models and revokes
+        // only this project's keys. Multiple errors in one bucket reproduce the
+        // old last-error trigger failure if deletion ordering regresses.
         let project = tenant
             .store
             .project_for_app("acme-web")
@@ -400,4 +487,41 @@ async fn full_path_org_to_provision_to_key_to_tenant_row() {
     admin.close().await;
 
     result.expect("full path test body");
+}
+
+/// 4. NEON (feature `neon`, live-gated). Provision-adopt-deprovision round trip
+///    against the real Neon API. The normal suite ignores this external gate;
+///    the production-validation workflow selects it explicitly and missing
+///    credentials are then a hard failure rather than a silent skip.
+#[cfg(feature = "neon")]
+#[tokio::test]
+#[ignore = "requires a disposable live Neon project and production-validation credentials"]
+async fn neon_provision_adopt_deprovision_round_trip() {
+    use super::provider::{ConnectionProvider, NeonProvider};
+    let p = NeonProvider::from_env()
+        .expect("NEON_API_KEY must be set for the explicit production provider gate");
+    // A throwaway org id far above anything real (mirrors the Postgres suite).
+    let org: i64 = 990_000 + (std::process::id() as i64 % 9_000);
+    let result = async {
+        let conn = p.provision(org).await?;
+        anyhow::ensure!(
+            conn.starts_with("postgres://") || conn.starts_with("postgresql://"),
+            "neon returned a non-postgres uri: {conn}"
+        );
+        // Idempotent adopt: a second provision returns a working uri for the
+        // SAME project rather than creating a duplicate.
+        let again = p.provision(org).await?;
+        anyhow::ensure!(
+            again.starts_with("postgres://") || again.starts_with("postgresql://"),
+            "adopt returned a non-postgres uri: {again}"
+        );
+        // The schema applies to the fresh Neon database end to end.
+        crate::db::schema::apply(&conn).await?;
+        anyhow::Ok(())
+    }
+    .await;
+    // Teardown ALWAYS runs (idempotent), then surface the body's verdict.
+    let torn_down = p.deprovision(org).await;
+    result.expect("neon round-trip body");
+    torn_down.expect("neon deprovision");
 }

@@ -363,7 +363,14 @@ pub async fn run() -> anyhow::Result<()> {
     let blobs = tenancy::blob::Blobs::from_env();
     let blobs_local = blobs.is_local_fs();
     let blobs_ops = blobs.clone();
-    let tenancy = Arc::new(Tenancy::new(control.clone(), blobs, &control_url));
+    // Self-hosted: the one tenant lives in the same database as the control
+    // plane, so the single-tenant provider gets the control connection string.
+    let tenancy = Arc::new(Tenancy::new(
+        control.clone(),
+        blobs,
+        &control_url,
+        Some(&control_url),
+    ));
 
     let app = App {
         control: control.clone(),
