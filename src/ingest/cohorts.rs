@@ -9,6 +9,9 @@
 
 use serde_json::{json, Map, Value};
 
+pub type ValueCounts = std::collections::BTreeMap<String, usize>;
+pub type ContextCounts = std::collections::BTreeMap<String, ValueCounts>;
+
 /// k-anonymity floor for cohort analysis. A discriminator is only surfaced when
 /// at least this many cohort members share it, so a reported dimension always
 /// describes a GROUP, never an individual. Without this, a one-person cohort
@@ -163,6 +166,64 @@ fn cohort_value(key: &str, v: &Value) -> Option<String> {
             .map(str::to_string),
         _ => None,
     }
+}
+
+pub fn dimension_values(context: &Map<String, Value>) -> Vec<(String, String)> {
+    context
+        .iter()
+        .filter(|(key, _)| safe_cohort_key(key))
+        .filter_map(|(key, value)| cohort_value(key, value).map(|value| (key.clone(), value)))
+        .collect()
+}
+
+pub fn discriminators_from_counts(
+    cohort_n: usize,
+    cohort: &ContextCounts,
+    baseline_n: usize,
+    baseline: &ContextCounts,
+) -> Vec<Value> {
+    if cohort_n < K_ANON {
+        return Vec::new();
+    }
+    let cohort_n = cohort_n as f64;
+    let baseline_n = baseline_n.max(1) as f64;
+    let mut out: Vec<(f64, f64, Value)> = Vec::new();
+    for (key, values) in cohort {
+        for (value, count) in values {
+            let cohort_share = *count as f64 / cohort_n;
+            let base_count = baseline
+                .get(key)
+                .and_then(|counts| counts.get(value))
+                .copied()
+                .unwrap_or(0);
+            let baseline_share = base_count as f64 / baseline_n;
+            let finite_lift = baseline_share > 0.0;
+            let lift = if finite_lift {
+                cohort_share / baseline_share
+            } else {
+                f64::INFINITY
+            };
+            if cohort_share >= 0.5 && lift >= 1.5 && *count >= K_ANON {
+                out.push((
+                    cohort_share,
+                    lift,
+                    json!({
+                        "key": key,
+                        "value": value,
+                        "cohortShare": (cohort_share * 100.0).round() / 100.0,
+                        "baselineShare": (baseline_share * 100.0).round() / 100.0,
+                        "lift": if finite_lift { json!((lift * 100.0).round() / 100.0) } else { json!("inf") },
+                    }),
+                ));
+            }
+        }
+    }
+    out.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
+    });
+    out.into_iter().map(|(_, _, value)| value).collect()
 }
 
 fn safe_cohort_key(key: &str) -> bool {

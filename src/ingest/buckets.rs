@@ -302,16 +302,22 @@ fn build_of(rec: &ErrorRec) -> Value {
     Value::Object(out)
 }
 
-/// The `context.build.version` string for an occurrence, or `None` if the SDK
-/// didn't attach one. This is the single build coordinate the timeline segments
-/// by and the resolution engine anchors on, kept value-free (a build label, no
+/// The stable build coordinate for an occurrence, or `None` if the SDK didn't
+/// attach one. This is the single build coordinate the timeline segments by
+/// and the resolution engine anchors on, kept value-free (a build label, no
 /// user data), so both the graph and the auto-resolve decision agree on it.
+/// Prefer the source commit so a pull-request verification can anchor the
+/// exact artifact later observed in production; fall back to the developer's
+/// version label when no commit exists.
 pub fn build_version(rec: &ErrorRec) -> Option<String> {
     rec.context
         .get("build")
         .and_then(|v| v.as_object())
-        .and_then(|b| b.get("version"))
-        .and_then(|v| v.as_str())
+        .and_then(|b| {
+            b.get("commit")
+                .and_then(|v| v.as_str())
+                .or_else(|| b.get("version").and_then(|v| v.as_str()))
+        })
         .map(|s| s.to_string())
 }
 
@@ -363,17 +369,31 @@ pub const DEFAULT_TIMELINE_WINDOW_SECS: i64 = 3600;
 /// build with no version tag must not silently vanish from the "is it resolved?"
 /// picture. Pass `DEFAULT_TIMELINE_WINDOW_SECS` for the default hourly grid.
 pub fn timeline(occ: &[(String, Option<String>)], window_secs: i64) -> Timeline {
+    let weighted: Vec<(String, Option<String>, u64)> = occ
+        .iter()
+        .map(|(at, build)| (at.clone(), build.clone(), 1))
+        .collect();
+    timeline_weighted(&weighted, window_secs)
+}
+
+/// `timeline` over pre-aggregated occurrence rows: each `(timestamp, build,
+/// count)` contributes `count` to its cell, so a caller holding rolled-up
+/// telemetry does not have to fan rows back out to weight the series.
+pub fn timeline_weighted(
+    occurrences: &[(String, Option<String>, u64)],
+    window_secs: i64,
+) -> Timeline {
     use std::collections::BTreeMap;
     let window_secs = window_secs.max(1);
     // (window_start_epoch, build) -> count, and window_start_epoch -> total.
     let mut cells: BTreeMap<(i64, String), u64> = BTreeMap::new();
     let mut totals: BTreeMap<i64, u64> = BTreeMap::new();
-    for (ts, build) in occ {
+    for (ts, build, count) in occurrences {
         let epoch = parse_epoch(ts).unwrap_or(0);
         let win = epoch.div_euclid(window_secs) * window_secs;
         let build = build.clone().unwrap_or_else(|| "unknown".to_string());
-        *cells.entry((win, build)).or_default() += 1;
-        *totals.entry(win).or_default() += 1;
+        *cells.entry((win, build)).or_default() += count;
+        *totals.entry(win).or_default() += count;
     }
     Timeline {
         cells: cells
@@ -626,11 +646,14 @@ mod tests {
     }
 
     #[test]
-    fn build_version_reads_context_build_version() {
+    fn build_version_prefers_commit_then_falls_back_to_version() {
         let mut r = rec("e", "s", "home", &[]);
         assert_eq!(build_version(&r), None);
         r.context
             .insert("build".into(), json!({ "version": "1.4.5", "commit": "z" }));
+        assert_eq!(build_version(&r).as_deref(), Some("z"));
+        r.context
+            .insert("build".into(), json!({ "version": "1.4.5" }));
         assert_eq!(build_version(&r).as_deref(), Some("1.4.5"));
     }
 

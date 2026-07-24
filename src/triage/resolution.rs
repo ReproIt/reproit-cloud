@@ -102,6 +102,28 @@ impl Default for Thresholds {
     }
 }
 
+impl Thresholds {
+    /// Production defaults remain conservative. Operators can lower the gates
+    /// in an isolated staging or lifecycle-dogfood deployment without changing
+    /// the resolution algorithm or compiling a special binary.
+    pub fn configured() -> Self {
+        let defaults = Self::default();
+        let resolve_quiet_secs = std::env::var("REPROIT_RESOLVE_QUIET_SECS")
+            .ok()
+            .and_then(|value| value.parse::<i64>().ok())
+            .filter(|value| *value >= 0)
+            .unwrap_or(defaults.resolve_quiet_secs);
+        let min_post_fix_traffic = std::env::var("REPROIT_MIN_POST_FIX_TRAFFIC")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(defaults.min_post_fix_traffic);
+        Self {
+            resolve_quiet_secs,
+            min_post_fix_traffic,
+        }
+    }
+}
+
 /// The full computed verdict: the status plus the evidence behind it, so the
 /// dashboard can show "resolved BECAUSE 0 recurrences across 800 post-fix
 /// sessions, quiet 5 days" or "regressed BECAUSE last seen on the fix build 1h
@@ -182,11 +204,12 @@ pub fn post_fix_traffic(app_stream: &[Occurrence], fixed_in_build: &str) -> u64 
 }
 
 /// Count accepted SDK batches on builds deployed at or after the candidate fix.
+/// Each tuple contains the build's first-seen occurrence and its batch count.
 pub fn post_fix_build_traffic(builds: &[(Occurrence, u64)], fixed_in_build: &str) -> u64 {
     let first_seen = first_seen_by_build(
         &builds
             .iter()
-            .map(|(occurrence, _)| occurrence.clone())
+            .map(|(occ, _)| occ.clone())
             .collect::<Vec<_>>(),
     );
     let Some(&fix_epoch) = first_seen.get(fixed_in_build) else {
@@ -194,9 +217,9 @@ pub fn post_fix_build_traffic(builds: &[(Occurrence, u64)], fixed_in_build: &str
     };
     builds
         .iter()
-        .filter_map(|(occurrence, count)| {
-            let build = occurrence.build.as_deref()?;
-            let epoch = parse_epoch(&occurrence.at)?;
+        .filter_map(|(occ, count)| {
+            let build = occ.build.as_deref()?;
+            let epoch = parse_epoch(&occ.at)?;
             let on_or_after = build == fixed_in_build
                 || first_seen
                     .get(build)
@@ -538,5 +561,16 @@ mod tests {
         assert_eq!(post_fix_traffic(&app, "1.1"), 3);
         // A fix build never seen => zero traffic (no anchor).
         assert_eq!(post_fix_traffic(&app, "9.9"), 0);
+    }
+
+    #[test]
+    fn post_fix_build_traffic_counts_clean_sdk_batches() {
+        let builds = vec![
+            (occ("2026-06-01T00:00:00Z", Some("old")), 40),
+            (occ("2026-06-10T00:00:00Z", Some("fix")), 75),
+            (occ("2026-06-12T00:00:00Z", Some("newer")), 30),
+        ];
+        assert_eq!(post_fix_build_traffic(&builds, "fix"), 105);
+        assert_eq!(post_fix_build_traffic(&builds, "missing"), 0);
     }
 }
