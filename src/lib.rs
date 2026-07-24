@@ -45,6 +45,7 @@ use db::ControlStore;
 use http_security::*;
 use jobs::{Job, JobSpec};
 use operations::*;
+pub use router::StaticAsset;
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
