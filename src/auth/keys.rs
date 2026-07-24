@@ -33,7 +33,7 @@ pub(crate) fn is_publishable(token: &str) -> bool {
 
 /// A non-secret display hint for a key (e.g. "sk_live_ab..." / "pk_live_ab..."):
 /// the literal `xk_live_` prefix plus only the first 2 secret hex chars,
-/// Safe to store and list in plaintext. Deliberately reveals at most
+/// Stripe-style. Safe to store and list in plaintext. Deliberately reveals at most
 /// ~1 secret byte (down from 4) so the hint can never be used to narrow a brute
 /// force of the key.
 pub(crate) fn api_key_prefix(secret: &str) -> String {

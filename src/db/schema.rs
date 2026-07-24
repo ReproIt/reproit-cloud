@@ -79,6 +79,112 @@ CREATE INDEX IF NOT EXISTS errors_app ON errors(app_id, id);
 CREATE INDEX IF NOT EXISTS errors_bucket ON errors(app_id, bucket_id, id);
 -- Retention pruning deletes errors by age.
 CREATE INDEX IF NOT EXISTS errors_created ON errors(created_at);
+CREATE TABLE IF NOT EXISTS bucket_summaries (
+  app_id         TEXT NOT NULL,
+  bucket_id      TEXT NOT NULL,
+  count          BIGINT NOT NULL,
+  first_error_id BIGINT NOT NULL,
+  last_error_id  BIGINT NOT NULL,
+  first_seen     TIMESTAMPTZ NOT NULL,
+  last_seen      TIMESTAMPTZ NOT NULL,
+  PRIMARY KEY (app_id, bucket_id)
+);
+CREATE INDEX IF NOT EXISTS bucket_summaries_app_last
+  ON bucket_summaries(app_id, last_seen DESC);
+CREATE TABLE IF NOT EXISTS bucket_windows (
+  app_id       TEXT NOT NULL,
+  bucket_id    TEXT NOT NULL,
+  window_start TIMESTAMPTZ NOT NULL,
+  build        TEXT NOT NULL DEFAULT '',
+  count        BIGINT NOT NULL,
+  PRIMARY KEY (app_id, bucket_id, window_start, build)
+);
+CREATE INDEX IF NOT EXISTS bucket_windows_app_bucket
+  ON bucket_windows(app_id, bucket_id, window_start);
+CREATE TABLE IF NOT EXISTS app_context_counts (
+  app_id TEXT NOT NULL,
+  key    TEXT NOT NULL,
+  value  TEXT NOT NULL,
+  count  BIGINT NOT NULL,
+  PRIMARY KEY (app_id, key, value)
+);
+CREATE TABLE IF NOT EXISTS bucket_context_counts (
+  app_id    TEXT NOT NULL,
+  bucket_id TEXT NOT NULL,
+  key       TEXT NOT NULL,
+  value     TEXT NOT NULL,
+  count     BIGINT NOT NULL,
+  PRIMARY KEY (app_id, bucket_id, key, value)
+);
+CREATE INDEX IF NOT EXISTS bucket_context_counts_bucket
+  ON bucket_context_counts(app_id, bucket_id);
+CREATE OR REPLACE FUNCTION remove_error_from_read_models() RETURNS TRIGGER AS $$
+DECLARE
+  dimension RECORD;
+BEGIN
+  UPDATE bucket_summaries SET count=count-1
+  WHERE app_id=OLD.app_id AND bucket_id=OLD.bucket_id;
+  DELETE FROM bucket_summaries
+  WHERE app_id=OLD.app_id AND bucket_id=OLD.bucket_id AND count <= 0;
+  IF EXISTS (
+    SELECT 1 FROM bucket_summaries
+    WHERE app_id=OLD.app_id AND bucket_id=OLD.bucket_id
+      AND (first_error_id=OLD.id OR last_error_id=OLD.id)
+  ) THEN
+    UPDATE bucket_summaries SET
+      first_error_id=remaining.first_id,
+      last_error_id=remaining.last_id,
+      first_seen=remaining.first_seen,
+      last_seen=remaining.last_seen
+    FROM (
+      SELECT MIN(id) AS first_id, MAX(id) AS last_id,
+             MIN(created_at) AS first_seen, MAX(created_at) AS last_seen
+      FROM errors WHERE app_id=OLD.app_id AND bucket_id=OLD.bucket_id
+    ) remaining
+    WHERE app_id=OLD.app_id AND bucket_id=OLD.bucket_id;
+  END IF;
+
+  UPDATE bucket_windows SET count=count-1
+  WHERE app_id=OLD.app_id AND bucket_id=OLD.bucket_id
+    AND window_start=date_trunc('hour', OLD.created_at)
+    AND build=COALESCE(OLD.context->'build'->>'commit', OLD.context->'build'->>'version', '');
+  DELETE FROM bucket_windows
+  WHERE app_id=OLD.app_id AND bucket_id=OLD.bucket_id AND count <= 0;
+
+  FOR dimension IN
+    SELECT key,
+      CASE
+        WHEN jsonb_typeof(value)='string' THEN value #>> '{}'
+        WHEN jsonb_typeof(value) IN ('number','boolean') THEN value::TEXT
+        WHEN key='build' THEN COALESCE(value->>'version', value->>'commit')
+      END AS value
+    FROM jsonb_each(OLD.context)
+    WHERE key NOT IN ('fingerprint','input','inputs')
+      AND (jsonb_typeof(value) IN ('string','number','boolean') OR key='build')
+  LOOP
+    IF dimension.value IS NOT NULL THEN
+      UPDATE app_context_counts SET count=count-1
+      WHERE app_id=OLD.app_id AND key=dimension.key AND value=dimension.value;
+      DELETE FROM app_context_counts
+      WHERE app_id=OLD.app_id AND key=dimension.key AND value=dimension.value AND count <= 0;
+      UPDATE bucket_context_counts SET count=count-1
+      WHERE app_id=OLD.app_id AND bucket_id=OLD.bucket_id
+        AND key=dimension.key AND value=dimension.value;
+      DELETE FROM bucket_context_counts
+      WHERE app_id=OLD.app_id AND bucket_id=OLD.bucket_id
+        AND key=dimension.key AND value=dimension.value AND count <= 0;
+    END IF;
+  END LOOP;
+  RETURN OLD;
+END;
+$$ LANGUAGE plpgsql;
+DROP TRIGGER IF EXISTS error_read_model_delete ON errors;
+CREATE TRIGGER error_read_model_delete
+AFTER DELETE ON errors
+FOR EACH ROW EXECUTE FUNCTION remove_error_from_read_models();
+-- Every accepted SDK batch is production traffic, including a clean batch with
+-- no errors. Resolution uses this instead of counting unrelated failures as the
+-- denominator for "the fixed build has seen enough real use".
 CREATE TABLE IF NOT EXISTS build_traffic (
   app_id     TEXT        NOT NULL,
   build      TEXT        NOT NULL,
@@ -100,6 +206,28 @@ CREATE TABLE IF NOT EXISTS evidence (
 );
 CREATE INDEX IF NOT EXISTS evidence_error ON evidence(error_id, id);
 CREATE INDEX IF NOT EXISTS evidence_app_id ON evidence(app_id, id) INCLUDE (bytes);
+CREATE TABLE IF NOT EXISTS app_storage_usage (
+  app_id TEXT PRIMARY KEY,
+  bytes  BIGINT NOT NULL DEFAULT 0 CHECK (bytes >= 0)
+);
+CREATE OR REPLACE FUNCTION update_app_storage_usage() RETURNS TRIGGER AS $$
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    INSERT INTO app_storage_usage (app_id, bytes) VALUES (NEW.app_id, NEW.bytes)
+    ON CONFLICT (app_id) DO UPDATE SET bytes=app_storage_usage.bytes + EXCLUDED.bytes;
+    RETURN NEW;
+  END IF;
+  UPDATE app_storage_usage SET bytes=GREATEST(0, bytes - OLD.bytes) WHERE app_id=OLD.app_id;
+  RETURN OLD;
+END;
+$$ LANGUAGE plpgsql;
+DROP TRIGGER IF EXISTS evidence_storage_usage ON evidence;
+CREATE TRIGGER evidence_storage_usage
+AFTER INSERT OR DELETE ON evidence
+FOR EACH ROW EXECUTE FUNCTION update_app_storage_usage();
+INSERT INTO app_storage_usage (app_id, bytes)
+SELECT app_id, COALESCE(SUM(bytes), 0)::BIGINT FROM evidence GROUP BY app_id
+ON CONFLICT (app_id) DO UPDATE SET bytes=EXCLUDED.bytes;
 
 -- Immutable evidence graphs. Node ids are hashes of kind, parents, and payload;
 -- roots attach a validated graph to a run without copying node content.
@@ -157,6 +285,78 @@ CREATE TABLE IF NOT EXISTS bucket_tickets (
   created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
   PRIMARY KEY (app_id, bucket_id)
 );
+CREATE TABLE IF NOT EXISTS integration_outbox (
+  id         BIGSERIAL PRIMARY KEY,
+  app_id     TEXT NOT NULL,
+  bucket_id  TEXT NOT NULL,
+  kind       TEXT NOT NULL,
+  attempts   INT NOT NULL DEFAULT 0,
+  available_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (app_id, bucket_id, kind)
+);
+CREATE INDEX IF NOT EXISTS integration_outbox_available
+  ON integration_outbox(available_at, id);
+
+-- Populate durable read models for databases created before the rollups.
+INSERT INTO bucket_summaries
+  (app_id, bucket_id, count, first_error_id, last_error_id, first_seen, last_seen)
+SELECT app_id, bucket_id, COUNT(*)::BIGINT, MIN(id), MAX(id), MIN(created_at), MAX(created_at)
+FROM errors WHERE bucket_id IS NOT NULL GROUP BY app_id, bucket_id
+ON CONFLICT (app_id, bucket_id) DO NOTHING;
+INSERT INTO build_traffic (app_id, build, count, first_seen, last_seen)
+SELECT app_id, COALESCE(context->'build'->>'commit', context->'build'->>'version'),
+       COUNT(*)::BIGINT, MIN(created_at), MAX(created_at)
+FROM errors
+WHERE COALESCE(context->'build'->>'commit', context->'build'->>'version') IS NOT NULL
+GROUP BY app_id, COALESCE(context->'build'->>'commit', context->'build'->>'version')
+ON CONFLICT (app_id, build) DO NOTHING;
+INSERT INTO bucket_windows (app_id, bucket_id, window_start, build, count)
+SELECT app_id, bucket_id, date_trunc('hour', created_at),
+       COALESCE(context->'build'->>'commit', context->'build'->>'version', ''), COUNT(*)::BIGINT
+FROM errors WHERE bucket_id IS NOT NULL
+GROUP BY app_id, bucket_id, date_trunc('hour', created_at),
+         COALESCE(context->'build'->>'commit', context->'build'->>'version', '')
+ON CONFLICT (app_id, bucket_id, window_start, build) DO NOTHING;
+INSERT INTO app_context_counts (app_id, key, value, count)
+SELECT app_id, key,
+       CASE
+         WHEN jsonb_typeof(value)='string' THEN value #>> '{}'
+         WHEN jsonb_typeof(value) IN ('number','boolean') THEN value::TEXT
+         WHEN key='build' THEN COALESCE(value->>'version', value->>'commit')
+       END,
+       COUNT(*)::BIGINT
+FROM errors CROSS JOIN LATERAL jsonb_each(context)
+WHERE key NOT IN ('fingerprint','input','inputs')
+  AND (jsonb_typeof(value) IN ('string','number','boolean') OR key='build')
+  AND (key <> 'build' OR COALESCE(value->>'version', value->>'commit') IS NOT NULL)
+GROUP BY app_id, key,
+         CASE
+           WHEN jsonb_typeof(value)='string' THEN value #>> '{}'
+           WHEN jsonb_typeof(value) IN ('number','boolean') THEN value::TEXT
+           WHEN key='build' THEN COALESCE(value->>'version', value->>'commit')
+         END
+ON CONFLICT (app_id, key, value) DO NOTHING;
+INSERT INTO bucket_context_counts (app_id, bucket_id, key, value, count)
+SELECT app_id, bucket_id, key,
+       CASE
+         WHEN jsonb_typeof(value)='string' THEN value #>> '{}'
+         WHEN jsonb_typeof(value) IN ('number','boolean') THEN value::TEXT
+         WHEN key='build' THEN COALESCE(value->>'version', value->>'commit')
+       END,
+       COUNT(*)::BIGINT
+FROM errors CROSS JOIN LATERAL jsonb_each(context)
+WHERE bucket_id IS NOT NULL
+  AND key NOT IN ('fingerprint','input','inputs')
+  AND (jsonb_typeof(value) IN ('string','number','boolean') OR key='build')
+  AND (key <> 'build' OR COALESCE(value->>'version', value->>'commit') IS NOT NULL)
+GROUP BY app_id, bucket_id, key,
+         CASE
+           WHEN jsonb_typeof(value)='string' THEN value #>> '{}'
+           WHEN jsonb_typeof(value) IN ('number','boolean') THEN value::TEXT
+           WHEN key='build' THEN COALESCE(value->>'version', value->>'commit')
+         END
+ON CONFLICT (app_id, bucket_id, key, value) DO NOTHING;
 
 -- ---- projects (the org's apps) -------------------------------------------------
 -- `created_by` references a control-plane user id, so it is a plain BIGINT here
@@ -256,10 +456,10 @@ CREATE TABLE IF NOT EXISTS project_integrations (
   updated_at         TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- ---- CI reproduction runs (repository_dispatch ledger) ------------------------
+-- ---- hosted reproduction runs (repository_dispatch ledger) --------------------
 -- One row per dispatch fired into the customer's CI: run status for the
--- dashboard and staleness expiry.
--- reported by the CI run via POST replay-results {runId}.
+-- dashboard and staleness expiry. Execution happens in the customer's CI and
+-- is deliberately not metered by Reproit.
 CREATE TABLE IF NOT EXISTS cloud_runs (
   id            BIGSERIAL PRIMARY KEY,
   app_id        TEXT NOT NULL,
@@ -269,20 +469,50 @@ CREATE TABLE IF NOT EXISTS cloud_runs (
   dispatched_at TIMESTAMPTZ NOT NULL DEFAULT now(),
   completed_at  TIMESTAMPTZ
 );
+-- Remove the obsolete pre-launch execution-duration field if an early database
+-- was initialized with it. No product data depends on this column.
+ALTER TABLE cloud_runs DROP COLUMN IF EXISTS minutes;
 CREATE INDEX IF NOT EXISTS cloud_runs_app ON cloud_runs(app_id, bucket_id, id);
 CREATE INDEX IF NOT EXISTS cloud_runs_open ON cloud_runs(dispatched_at) WHERE status='dispatched';
 "#;
 
-/// Apply the tenant schema to the database at `conn` (idempotent). Used by the
-/// provisioner for fresh tenants and by the boot sweep for existing ones.
+// v2 adds the human-authored capture tables to every tenant database.
+const TENANT_SCHEMA_VERSION: i64 = 2;
+
+/// Apply all unapplied tenant migrations. Each migration is idempotent, so a
+/// process interruption retries the same version safely before recording it.
 pub async fn apply(conn: &str) -> anyhow::Result<()> {
     let pool = PgPoolOptions::new()
         .max_connections(1)
         .acquire_timeout(std::time::Duration::from_secs(10))
         .connect(conn)
         .await?;
-    sqlx::raw_sql(TENANT_SCHEMA).execute(&pool).await?;
-    backfill_missing_bucket_ids(&pool).await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS tenant_schema_migrations (
+           version BIGINT PRIMARY KEY,
+           applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+         )",
+    )
+    .execute(&pool)
+    .await?;
+    let applied: Option<i64> =
+        sqlx::query_scalar("SELECT MAX(version) FROM tenant_schema_migrations")
+            .fetch_one(&pool)
+            .await?;
+    if applied.unwrap_or(0) < TENANT_SCHEMA_VERSION {
+        sqlx::raw_sql(TENANT_SCHEMA).execute(&pool).await?;
+        backfill_missing_bucket_ids(&pool).await?;
+        // The first pass creates the rollup tables. Re-run the idempotent schema
+        // after legacy bucket ids exist so their read models are populated too.
+        sqlx::raw_sql(TENANT_SCHEMA).execute(&pool).await?;
+        sqlx::query(
+            "INSERT INTO tenant_schema_migrations (version) VALUES ($1)
+             ON CONFLICT (version) DO NOTHING",
+        )
+        .bind(TENANT_SCHEMA_VERSION)
+        .execute(&pool)
+        .await?;
+    }
     pool.close().await;
     Ok(())
 }

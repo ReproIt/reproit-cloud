@@ -12,6 +12,7 @@ mod backend_contract;
 mod bootstrap;
 mod captures;
 mod db;
+mod edition;
 mod http_security;
 mod ingest;
 mod integrations;
@@ -163,6 +164,9 @@ pub(crate) struct App {
     /// True for the self-hosted single-tenant edition. Hosted cloud keeps plan
     /// and seat-limit behavior; self-host removes commercial seat caps.
     pub(crate) self_hosted: bool,
+    /// Edition policy hooks (quotas, metering, tenant maintenance) called from
+    /// shared flow; see `edition.rs`. Self-host installs `PassivePolicy`.
+    pub(crate) policy: Arc<dyn edition::EditionPolicy>,
 }
 
 impl App {
@@ -367,6 +371,7 @@ pub async fn run() -> anyhow::Result<()> {
         reproit_bin: cli.reproit_bin.clone(),
         allow_raw_jobs: raw_jobs_enabled(self_hosted, dev_open()),
         self_hosted,
+        policy: Arc::new(edition::PassivePolicy),
     };
 
     // One-shot subcommands: run and exit before the server ever binds.

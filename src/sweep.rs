@@ -365,7 +365,7 @@ async fn compute_for_bucket(
         Some(fixed_in_build),
         traffic,
         now,
-        resolution::Thresholds::default(),
+        resolution::Thresholds::configured(),
     ))
 }
 

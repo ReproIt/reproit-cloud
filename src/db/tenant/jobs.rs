@@ -1,3 +1,5 @@
+//! Durable job and shard queue operations.
+
 use super::*;
 
 impl TenantStore {

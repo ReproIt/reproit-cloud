@@ -37,8 +37,14 @@ fn kind_ext(kind: &str) -> &str {
     }
 }
 
-/// Optional operator-defined evidence cap. Zero/unset disables it.
-async fn evidence_cap(_app: &App, _tenant: &Tenant) -> Option<i64> {
+/// The per-app evidence byte cap: the edition policy decides first (the
+/// hosted overlay derives it from the org's plan); when it abstains, the
+/// operator's environment cap applies (REPROIT_MAX_EVIDENCE_BYTES_PER_APP,
+/// zero/unset disables).
+async fn evidence_cap(app: &App, tenant: &Tenant) -> Option<i64> {
+    if let Some(cap) = app.policy.evidence_cap(tenant.org_id).await {
+        return Some(cap);
+    }
     max_evidence_bytes_per_app()
 }
 

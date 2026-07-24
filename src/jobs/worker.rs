@@ -161,7 +161,10 @@ async fn claim_across_tenants(
             continue;
         };
         match store.claim_shard(worker_id, caps).await {
-            Ok(Some(shard)) => return Some((org_id, shard)),
+            Ok(Some(shard)) => {
+                app.policy.on_shard_claimed(org_id).await;
+                return Some((org_id, shard));
+            }
             Ok(None) => {
                 // No shard claimable for our caps. Self-heal the hint, but ONLY if
                 // the tenant genuinely has zero pending shards (a fresh COUNT): a

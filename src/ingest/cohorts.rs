@@ -9,7 +9,12 @@
 
 use serde_json::{json, Map, Value};
 
+// The count-based rollup path (dimension_values / discriminators_from_counts)
+// is consumed by the hosted telemetry store today; self-host has no caller
+// yet, so the items carry allow(dead_code) until the rollup lands upstream.
+#[allow(dead_code)]
 pub type ValueCounts = std::collections::BTreeMap<String, usize>;
+#[allow(dead_code)]
 pub type ContextCounts = std::collections::BTreeMap<String, ValueCounts>;
 
 /// k-anonymity floor for cohort analysis. A discriminator is only surfaced when
@@ -168,6 +173,7 @@ fn cohort_value(key: &str, v: &Value) -> Option<String> {
     }
 }
 
+#[allow(dead_code)]
 pub fn dimension_values(context: &Map<String, Value>) -> Vec<(String, String)> {
     context
         .iter()
@@ -176,6 +182,7 @@ pub fn dimension_values(context: &Map<String, Value>) -> Vec<(String, String)> {
         .collect()
 }
 
+#[allow(dead_code)]
 pub fn discriminators_from_counts(
     cohort_n: usize,
     cohort: &ContextCounts,
