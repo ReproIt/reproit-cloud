@@ -141,6 +141,14 @@ pub(crate) fn build(app: App) -> Router {
         )
         .route("/v1/captures/:id/complete", post(captures::complete))
         .route("/v1/blob/*key", get(ingest::get_blob))
+        // Account-token project lifecycle used by automation and disposable
+        // release gates. Project keys cannot create siblings or delete any
+        // project (enforced inside the handlers).
+        .route("/v1/projects", post(auth::create_project_api))
+        .route(
+            "/v1/projects/:app",
+            axum::routing::delete(auth::delete_project_api),
+        )
         .layer(GovernorLayer { config: ingest_rl })
         .route_layer(middleware::from_fn_with_state(app.clone(), require_api_key));
 
@@ -173,6 +181,11 @@ pub(crate) fn build(app: App) -> Router {
         .route("/auth/invitations/preview", get(auth::invitation_preview))
         // Email flows: verification (the signup link) + password reset. All
         // token-bearing and unauthenticated, so they belong on the tight limiter.
+        .route("/auth/verify", get(auth::verify_email))
+        .route("/auth/forgot", post(auth::forgot_password))
+        .route("/auth/reset", post(auth::reset_password))
+        // Email flows: verification (the signup link) + password reset. All
+        // token-bearing and unauthenticated, so they belong on the tight limiter.
         .route_layer(GovernorLayer { config: auth_rl });
 
     // (2) Cookie-authenticated mutation + billing-checkout surface. Cookie-auth'd
@@ -182,6 +195,7 @@ pub(crate) fn build(app: App) -> Router {
     // REPROIT_PUBLIC_URL is unset (dev). OAuth GET callbacks live on `auth_routes`
     // above, NOT here, so the CSRF guard never touches them.
     let account_mut = Router::new()
+        .route("/auth/session", get(auth::session_status))
         .route("/account/me", get(auth::me))
         .route("/account/usage", get(auth::usage))
         .route(backend_contract::CREATE_PROJECT, post(auth::create_project))
@@ -194,6 +208,7 @@ pub(crate) fn build(app: App) -> Router {
             "/account/projects/:app/publishable-key",
             post(auth::rotate_publishable_key),
         )
+        .route("/account/orgs", post(auth::create_org))
         .route("/account/orgs/name", post(auth::rename_org))
         .route("/account/orgs/active", post(auth::set_active_org))
         .route(

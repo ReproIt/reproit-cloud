@@ -1,3 +1,5 @@
+//! Project creation and deletion handlers.
+
 use super::*;
 
 #[derive(Deserialize)]
@@ -20,13 +22,23 @@ pub async fn create_project(
         Ok(x) => x,
         Err(r) => return r,
     };
-    if !can_manage(&org.role) {
+    create_project_for(&app, org.id, user.id, &org.role, &p.name).await
+}
+
+async fn create_project_for(
+    app: &App,
+    org_id: i64,
+    user_id: i64,
+    role: &str,
+    requested_name: &str,
+) -> Response {
+    if !can_manage(role) {
         return err(
             StatusCode::FORBIDDEN,
             "only owners/admins can create projects",
         );
     }
-    let name = p.name.trim();
+    let name = requested_name.trim();
     if name.is_empty() || name.len() > 80 {
         return err(StatusCode::BAD_REQUEST, "project name required");
     }
@@ -43,12 +55,12 @@ pub async fn create_project(
     // The project is written into the org's TENANT database (no org_id: the
     // database is the org). Resolve the tenant first; a not-yet-provisioned org
     // can't create projects.
-    let tenant = match app.tenancy.resolve(org.id).await {
+    let tenant = match app.tenancy.resolve(org_id).await {
         Ok(t) => t,
         Err(e) => {
             tracing::error!(
                 "create_project: tenant resolve failed for org {}: {e}",
-                org.id
+                org_id
             );
             return err(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -56,7 +68,18 @@ pub async fn create_project(
             );
         }
     };
-    let project_id = match tenant.store.create_project(user.id, name, &app_id).await {
+    // Edition cap on project/app count (self-host is uncapped), enforced
+    // like seats: 402 with an upgrade nudge, checked before the write.
+    if let Some(limit) = app.policy.app_limit(org_id).await {
+        let used = tenant.store.count_projects().await.unwrap_or(0);
+        if used >= limit {
+            return err(
+                StatusCode::PAYMENT_REQUIRED,
+                "app limit reached for this plan; upgrade to add more apps",
+            );
+        }
+    }
+    let project_id = match tenant.store.create_project(user_id, name, &app_id).await {
         Ok(id) => id,
         Err(_) => {
             return err(
@@ -81,7 +104,7 @@ pub async fn create_project(
     // nothing has been returned to the caller yet, so a leftover is inert.
     if app
         .control
-        .create_api_key(&key, &prefix, org.id, user.id, Some(project_id))
+        .create_api_key(&key, &prefix, org_id, user_id, Some(project_id))
         .await
         .is_err()
     {
@@ -92,7 +115,7 @@ pub async fn create_project(
     }
     if app
         .control
-        .create_api_key(&pub_key, &pub_prefix, org.id, user.id, Some(project_id))
+        .create_api_key(&pub_key, &pub_prefix, org_id, user_id, Some(project_id))
         .await
         .is_err()
     {
@@ -109,9 +132,9 @@ pub async fn create_project(
     }
     app.control
         .audit(
-            &format!("user:{}", user.id),
+            &format!("user:{user_id}"),
             "apikey.create",
-            Some(org.id),
+            Some(org_id),
             json!({ "prefix": prefix, "publishablePrefix": pub_prefix, "project": project_id }),
         )
         .await;
@@ -132,6 +155,34 @@ pub async fn create_project(
         .into_response()
 }
 
+/// Account-token project creation for automation and the CLI. Project-scoped
+/// keys cannot create siblings, and a token without a user identity cannot
+/// mutate an organization.
+pub async fn create_project_api(
+    State(app): State<App>,
+    Extension(auth): Extension<crate::AuthCtx>,
+    Extension(scope): Extension<crate::KeyScope>,
+    Json(p): Json<NewProject>,
+) -> Response {
+    let crate::AuthCtx::Org(org_id) = auth else {
+        return err(StatusCode::FORBIDDEN, "an account token is required");
+    };
+    let Some(user_id) = scope.user_id else {
+        return err(StatusCode::FORBIDDEN, "an account token is required");
+    };
+    if scope.project_id.is_some() || scope.publishable {
+        return err(
+            StatusCode::FORBIDDEN,
+            "project-scoped keys cannot create projects",
+        );
+    }
+    let role = match app.control.org_role(org_id, user_id).await {
+        Ok(Some(role)) => role,
+        _ => return err(StatusCode::FORBIDDEN, "organization membership required"),
+    };
+    create_project_for(&app, org_id, user_id, &role, &p.name).await
+}
+
 /// Permanently delete one project and all of its telemetry, evidence, keys,
 /// integrations, and triage state. Owner/admin only with exact-name confirmation.
 pub async fn delete_project(
@@ -144,28 +195,39 @@ pub async fn delete_project(
         Ok(x) => x,
         Err(r) => return r,
     };
-    if !can_manage(&org.role) {
+    delete_project_for(&app, org.id, user.id, &org.role, &app_id, &req.confirm).await
+}
+
+async fn delete_project_for(
+    app: &App,
+    org_id: i64,
+    user_id: i64,
+    role: &str,
+    app_id: &str,
+    confirmation: &str,
+) -> Response {
+    if !can_manage(role) {
         return err(
             StatusCode::FORBIDDEN,
             "only owners/admins can delete projects",
         );
     }
-    let tenant = match app.tenancy.resolve(org.id).await {
+    let tenant = match app.tenancy.resolve(org_id).await {
         Ok(t) => t,
         Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "could not open project"),
     };
-    let (project_id, project_name) = match tenant.store.project_for_app(&app_id).await {
+    let (project_id, project_name) = match tenant.store.project_for_app(app_id).await {
         Ok(Some(project)) => project,
         Ok(None) => return err(StatusCode::NOT_FOUND, "project not found"),
         Err(_) => return err(StatusCode::INTERNAL_SERVER_ERROR, "could not open project"),
     };
-    if req.confirm != project_name {
+    if confirmation != project_name {
         return err(
             StatusCode::BAD_REQUEST,
             "type the exact project name to confirm deletion",
         );
     }
-    let keys = match tenant.store.project_evidence_keys(&app_id).await {
+    let keys = match tenant.store.project_evidence_keys(app_id).await {
         Ok(keys) => keys,
         Err(_) => {
             return err(
@@ -194,7 +256,7 @@ pub async fn delete_project(
             "could not revoke project keys",
         );
     }
-    match tenant.store.delete_project_by_app(&app_id).await {
+    match tenant.store.delete_project_by_app(app_id).await {
         Ok(true) => {}
         Ok(false) => return err(StatusCode::NOT_FOUND, "project not found"),
         Err(error) => {
@@ -207,11 +269,39 @@ pub async fn delete_project(
     }
     app.control
         .audit(
-            &format!("user:{}", user.id),
+            &format!("user:{user_id}"),
             "project.delete",
-            Some(org.id),
+            Some(org_id),
             json!({"appId":app_id,"project":project_id,"name":project_name,"evidenceObjects":keys.len()}),
         )
         .await;
     Json(json!({"ok":true,"appId":app_id})).into_response()
+}
+
+/// Account-token project deletion. Exact-name confirmation remains mandatory,
+/// matching the browser surface, and project-scoped keys cannot delete projects.
+pub async fn delete_project_api(
+    State(app): State<App>,
+    Extension(auth): Extension<crate::AuthCtx>,
+    Extension(scope): Extension<crate::KeyScope>,
+    Path(app_id): Path<String>,
+    Json(req): Json<DeleteConfirm>,
+) -> Response {
+    let crate::AuthCtx::Org(org_id) = auth else {
+        return err(StatusCode::FORBIDDEN, "an account token is required");
+    };
+    let Some(user_id) = scope.user_id else {
+        return err(StatusCode::FORBIDDEN, "an account token is required");
+    };
+    if scope.project_id.is_some() || scope.publishable {
+        return err(
+            StatusCode::FORBIDDEN,
+            "project-scoped keys cannot delete projects",
+        );
+    }
+    let role = match app.control.org_role(org_id, user_id).await {
+        Ok(Some(role)) => role,
+        _ => return err(StatusCode::FORBIDDEN, "organization membership required"),
+    };
+    delete_project_for(&app, org_id, user_id, &role, &app_id, &req.confirm).await
 }

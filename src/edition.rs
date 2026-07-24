@@ -56,6 +56,19 @@ pub trait EditionPolicy: Send + Sync {
     /// static tag such as "resolution" or "cloud-runs"). The hosted edition
     /// schedules the matching maintenance sweep; best-effort, never surfaced.
     fn on_tenant_activity<'a>(&'a self, org_id: i64, kind: &'static str) -> PolicyFuture<'a, ()>;
+
+    /// The edition's dashboard-seat cap for an org, or None for uncapped.
+    /// Checked before granting a seat or reserving one on an invitation.
+    fn seat_limit<'a>(&'a self, org_id: i64) -> PolicyFuture<'a, Option<i64>>;
+
+    /// The edition's project/app-count cap for an org, or None for uncapped.
+    /// Checked before creating a project.
+    fn app_limit<'a>(&'a self, org_id: i64) -> PolicyFuture<'a, Option<i64>>;
+
+    /// Validate a signup's checkout intent. The hosted edition names its
+    /// purchasable plans; self-host carries no checkout intent, so the query
+    /// parameter is ignored. Sync: a pure filter over the raw string.
+    fn valid_checkout_plan(&self, plan: Option<&str>) -> Option<String>;
 }
 
 /// The self-hosted edition: no quotas, no metering, no tenant maintenance
@@ -85,6 +98,18 @@ impl EditionPolicy for PassivePolicy {
 
     fn retention_days<'a>(&'a self, _org_id: i64) -> PolicyFuture<'a, Option<i64>> {
         Box::pin(async { None })
+    }
+
+    fn seat_limit<'a>(&'a self, _org_id: i64) -> PolicyFuture<'a, Option<i64>> {
+        Box::pin(async { None })
+    }
+
+    fn app_limit<'a>(&'a self, _org_id: i64) -> PolicyFuture<'a, Option<i64>> {
+        Box::pin(async { None })
+    }
+
+    fn valid_checkout_plan(&self, _plan: Option<&str>) -> Option<String> {
+        None
     }
 
     fn on_tenant_activity<'a>(&'a self, _org_id: i64, _kind: &'static str) -> PolicyFuture<'a, ()> {

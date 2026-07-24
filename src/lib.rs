@@ -7,6 +7,13 @@
 //! (a Mac for ios + android + web, Linux for web/android) CLAIM over HTTP, so a
 //! restart never loses work and the worker fleet is provider-agnostic.
 
+// The `hosted` cargo feature gates the hosted overlay (Google OAuth, WorkOS
+// SSO/SCIM, billing-aware account surfaces) in files shared with the hosted
+// deployment repository. The overlay modules do not exist here, so building
+// this crate with the feature is a configuration error, not a code path.
+#[cfg(feature = "hosted")]
+compile_error!("the `hosted` feature requires the hosted deployment repository");
+
 mod auth;
 mod backend_contract;
 mod bootstrap;
