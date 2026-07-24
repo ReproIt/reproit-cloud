@@ -111,6 +111,30 @@ fn process_coordination_does_not_own_http_routes() {
     );
 }
 
+// The ranking/resolution spine is documented as PURE transforms over signals a
+// handler already fetched (impact.rs, buckets.rs, cohorts.rs, resolution.rs):
+// that purity is what makes them unit-testable with no DB/HTTP and their
+// output reproducible. Encode it so a convenient sqlx import cannot silently
+// break the contract.
+#[test]
+fn pure_ranking_modules_stay_db_free() {
+    for relative in [
+        "src/ingest/impact.rs",
+        "src/ingest/buckets.rs",
+        "src/ingest/cohorts.rs",
+        "src/triage/resolution.rs",
+    ] {
+        let body = source(relative);
+        for forbidden in ["sqlx", "crate::db"] {
+            assert!(
+                !body.contains(forbidden),
+                "{relative} reaches the database through {forbidden}; keep it a pure transform \
+                 and fetch in the handler"
+            );
+        }
+    }
+}
+
 #[test]
 fn responsibility_heavy_modules_stay_split() {
     for (relative, max_lines) in [
