@@ -245,10 +245,14 @@ impl R2Backend {
             // optional, path-style addressing is required.
             Some(endpoint) => (endpoint, false),
             // Default Cloudflare R2: derive the endpoint from the account id
-            // (required) and use virtual-host addressing.
+            // (required). Path-style addressing is required: with an explicit
+            // endpoint host, object_store does not fold the bucket into a
+            // virtual-host subdomain, so virtual-host style drops the bucket
+            // from the request and R2 reads the first key segment as the
+            // bucket (AccessDenied). Path style puts the bucket in the path.
             None => {
                 let account = std::env::var("R2_ACCOUNT_ID").ok()?;
-                (format!("https://{account}.r2.cloudflarestorage.com"), true)
+                (format!("https://{account}.r2.cloudflarestorage.com"), false)
             }
         };
         let scoped = ScopedCreds::from_env(&bucket, &key);
