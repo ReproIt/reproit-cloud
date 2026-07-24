@@ -21,6 +21,22 @@ pub(crate) struct Cli {
     /// Path to the reproit binary the (embedded) workers invoke.
     #[arg(long, default_value = "reproit")]
     pub(crate) reproit_bin: String,
+    /// Base Postgres url tenant databases are derived from (multi-tenant
+    /// providers). Self-host ignores it: the one tenant shares the control DB.
+    #[arg(
+        long,
+        env = "TENANT_DATABASE_URL",
+        default_value = "postgres://reproit:reproit@localhost:5433/reproit"
+    )]
+    pub(crate) tenant_base_url: String,
+    /// Explicit single-tenant telemetry database (the operator's own Postgres).
+    /// When set, no per-tenant provisioning happens; implies self-host mode.
+    #[arg(long, env = "REPROIT_SELF_HOSTED_DB")]
+    pub(crate) self_hosted_db: Option<String>,
+    /// Run as the single-tenant self-hosted edition (also via
+    /// REPROIT_SELF_HOSTED=1). The self-host distribution defaults to this.
+    #[arg(long)]
+    pub(crate) self_hosted: bool,
 }
 
 /// The one-shot subcommand surface (ops).
@@ -70,6 +86,14 @@ pub(crate) enum Cmd {
     Requeue {
         /// The org id whose queue to requeue.
         org: i64,
+    },
+    /// Apply the tenant schema to every ACTIVE tenant database, bounded by
+    /// `--concurrency`. Multi-tenant deployments run this in their release
+    /// phase so fleet-wide database work stays off the serving cold path.
+    Migrate {
+        /// How many tenant databases to migrate concurrently.
+        #[arg(long, default_value_t = 4)]
+        concurrency: usize,
     },
     /// Self-host install bootstrap: create the single org, an admin owner, and a
     /// default project + its first API key (printed once), then exit. Idempotent:

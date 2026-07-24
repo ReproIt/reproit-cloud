@@ -12,10 +12,11 @@ mod backend_contract;
 mod bootstrap;
 mod captures;
 mod cli;
+mod compose;
 pub mod db;
 pub mod edition;
 mod http_security;
-mod ingest;
+pub mod ingest;
 mod integrations;
 mod jobs;
 mod mail;
@@ -33,12 +34,13 @@ use axum::{
         HeaderName, HeaderValue, Method, StatusCode,
     },
     middleware::{self, Next},
-    response::{Html, IntoResponse, Redirect, Response},
+    response::{IntoResponse, Redirect, Response},
     routing::{get, post},
     Extension, Json, Router,
 };
 use clap::Parser;
 use cli::{Cli, Cmd};
+pub use compose::{PolicyFactory, PreflightFn, RunConfig};
 use db::ControlStore;
 use http_security::*;
 use jobs::{Job, JobSpec};
@@ -195,24 +197,6 @@ impl KeyScope {
     };
 }
 
-/// Composition inputs for `run_with`: the seams a hosted overlay drives.
-/// `Default` is the self-hosted edition exactly as `run()` ships it.
-#[derive(Default)]
-pub struct RunConfig {
-    /// Edition policy hooks (quotas, metering, account card, login gate);
-    /// None installs `PassivePolicy`.
-    pub policy: Option<Arc<dyn edition::EditionPolicy>>,
-    /// Extra routes merged into the shared router BEFORE the security layers
-    /// wrap it (identity providers, billing, webhooks). None mounts nothing.
-    pub overlay_routes: Option<Router<App>>,
-    /// Overlay control-plane schema applied right after the shared schema
-    /// (idempotent SQL, same contract as CONTROL_SCHEMA).
-    pub extra_control_schema: Option<&'static str>,
-    /// Refuse to boot without a configured mail provider. Hosted signup
-    /// depends on verification email; self-host logs the links instead.
-    pub require_mail: bool,
-}
-
 /// Run the self-hosted edition (the `RunConfig` defaults).
 pub async fn run() -> anyhow::Result<()> {
     run_with(RunConfig::default()).await
@@ -242,13 +226,22 @@ pub async fn run_with(config: RunConfig) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // This distribution is self-hosted only. There is no hosted/SaaS mode.
-    // (single-tenant by definition). This is the mode that maps DATABASE_URL onto
-    // BOTH connections and enables the startup env-bootstrap. The legacy
-    // `--self-hosted-db` flag also yields a single tenant (see `self_hosted` below),
-    // but keeps the old "control defaults to localhost" resolution, so existing
-    // invocations are byte-for-byte unchanged.
-    let self_hosted = true;
+    let cold_start = std::time::Instant::now();
+    // First-class self-host maps DATABASE_URL onto BOTH connections and enables
+    // the startup env-bootstrap. The legacy `--self-hosted-db` flag also yields
+    // a single tenant but keeps the old "control defaults to localhost"
+    // resolution, so existing invocations are byte-for-byte unchanged. The
+    // edition's default decides the bare invocation: the self-host
+    // distribution is single-tenant unless told otherwise; an overlay
+    // deployment is multi-tenant unless told otherwise.
+    let first_class_self_host = config.default_self_hosted
+        || cli.self_hosted
+        || self_hosted_env()
+        || matches!(cli.cmd, Some(Cmd::Init { .. }));
+    let self_hosted = first_class_self_host || cli.self_hosted_db.is_some();
+    if let Some(preflight) = config.preflight {
+        preflight(self_hosted)?;
+    }
     // Tell the integrations layer which mode we're in: the bare (un-namespaced)
     // tracker env fallback is only legal single-tenant.
     integrations::set_self_hosted(self_hosted);
@@ -284,14 +277,18 @@ pub async fn run_with(config: RunConfig) -> anyhow::Result<()> {
     }
 
     // Compute the EFFECTIVE connection strings, applying the self-host precedence
-    // before we connect. The explicit control/tenant urls arrive via clap (each
-    // backed by its env), so an unset one is genuinely `None` (not the default);
-    // DATABASE_URL has no flag, so it is read raw. Precedence: explicit url >
-    // (first-class self-host) DATABASE_URL > the built-in default.
+    // before we connect. Self-host maps DATABASE_URL (or the built-in local
+    // default) onto both planes unless REPROIT_SELF_HOSTED_DB names a separate
+    // telemetry database; hosted keeps control and tenant urls independent.
     let database_url = std::env::var("DATABASE_URL")
         .ok()
         .filter(|s| !s.trim().is_empty());
-    let control_url = database_url.unwrap_or_else(|| DEFAULT_DB_URL.to_string());
+    let (control_url, self_hosted_db) = resolve_db_config(
+        first_class_self_host,
+        database_url.as_deref(),
+        cli.self_hosted_db.as_deref(),
+        DEFAULT_DB_URL,
+    );
 
     // Connect the SHARED control plane (registry + identity + billing). Its schema
     // applies on boot; tenant DBs get the declarative schema at provision/boot.
@@ -301,9 +298,11 @@ pub async fn run_with(config: RunConfig) -> anyhow::Result<()> {
         control.apply_extra_schema(extra_schema).await?;
         tracing::info!("edition overlay control schema applied");
     }
-    if config.require_mail && !mail::is_configured() {
+    if config.require_mail && !self_hosted && !mail::is_configured() {
         anyhow::bail!(
-            "this edition requires outbound mail: set RESEND_API_KEY and REPROIT_MAIL_FROM"
+            "refusing to start a hosted deployment without email: set RESEND_API_KEY and \
+             REPROIT_MAIL_FROM (verification and password-reset links are undeliverable \
+             otherwise), or run self-hosted"
         );
     }
 
@@ -312,13 +311,14 @@ pub async fn run_with(config: RunConfig) -> anyhow::Result<()> {
     let blobs = tenancy::blob::Blobs::from_env();
     let blobs_local = blobs.is_local_fs();
     let blobs_ops = blobs.clone();
-    // Self-hosted: the one tenant lives in the same database as the control
-    // plane, so the single-tenant provider gets the control connection string.
+    // Self-hosted: the one tenant lives in the resolved self-host database, so
+    // the single-tenant provider gets that connection string; multi-tenant
+    // providers derive per-tenant databases from the tenant base url.
     let tenancy = Arc::new(Tenancy::new(
         control.clone(),
         blobs,
-        &control_url,
-        Some(&control_url),
+        &cli.tenant_base_url,
+        self_hosted_db.as_deref(),
     ));
 
     let app = App {
@@ -327,9 +327,10 @@ pub async fn run_with(config: RunConfig) -> anyhow::Result<()> {
         reproit_bin: cli.reproit_bin.clone(),
         allow_raw_jobs: raw_jobs_enabled(self_hosted, dev_open()),
         self_hosted,
-        policy: config
-            .policy
-            .unwrap_or_else(|| Arc::new(edition::PassivePolicy)),
+        policy: match config.policy {
+            Some(factory) => factory(self_hosted, control.clone()),
+            None => Arc::new(edition::PassivePolicy),
+        },
     };
 
     // One-shot subcommands: run and exit before the server ever binds.
@@ -351,6 +352,9 @@ pub async fn run_with(config: RunConfig) -> anyhow::Result<()> {
         }
         Some(Cmd::Requeue { org }) => {
             return run_requeue(&app, *org).await;
+        }
+        Some(Cmd::Migrate { concurrency }) => {
+            return run_tenant_migrations(&app, (*concurrency).clamp(1, 16)).await;
         }
         // Self-host install bootstrap: create org/admin/project + first key, exit.
         Some(Cmd::Init {
@@ -377,18 +381,21 @@ pub async fn run_with(config: RunConfig) -> anyhow::Result<()> {
         );
     }
 
-    // Optional zero-touch bootstrap creates the installation org before the
-    // fixed data-plane record. With no bootstrap env, `reproit-cloud init`
-    // performs the same idempotent sequence later.
-    run_env_bootstrap(&app).await;
-    if app
-        .control
-        .org_exists(tenancy::SELF_HOSTED_ORG_ID)
-        .await
-        .unwrap_or(false)
-    {
-        if let Err(e) = app.tenancy.provision(tenancy::SELF_HOSTED_ORG_ID).await {
-            tracing::error!("self-hosted data schema initialization failed: {e}");
+    // Self-host applies its single data-plane schema on startup, after the
+    // optional zero-touch env bootstrap has had the chance to create the
+    // installation org. Hosted migrations run in the release phase instead,
+    // keeping fleet-wide database work off the serving cold path.
+    if self_hosted {
+        run_env_bootstrap(&app).await;
+        if app
+            .control
+            .org_exists(tenancy::SELF_HOSTED_ORG_ID)
+            .await
+            .unwrap_or(false)
+        {
+            if let Err(e) = app.tenancy.provision(tenancy::SELF_HOSTED_ORG_ID).await {
+                tracing::error!("self-hosted data schema initialization failed: {e}");
+            }
         }
     }
 
@@ -416,9 +423,19 @@ pub async fn run_with(config: RunConfig) -> anyhow::Result<()> {
         jobs::worker::spawn_embedded(app.clone(), cli.workers, shutdown_rx.clone());
     }
 
-    let router = router::build(app, config.overlay_routes);
+    let router = router::build(
+        app,
+        router::RouterOptions {
+            captures: config.captures,
+            assets: config.assets,
+            overlay_open: config.overlay_routes,
+            overlay_auth: config.overlay_auth,
+            overlay_account: config.overlay_account,
+        },
+    );
 
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", cli.port)).await?;
+    metrics::histogram!("cold_start_seconds").record(cold_start.elapsed().as_secs_f64());
     tracing::info!(
         "reproit-cloud on :{} (embedded workers: {}). /v1/events · /v1/worker/claim",
         cli.port,
@@ -588,6 +605,33 @@ fn dev_open() -> bool {
         std::env::var("REPROIT_DEV_OPEN").ok().as_deref(),
         Some("1") | Some("true")
     )
+}
+
+fn self_hosted_env() -> bool {
+    matches!(
+        std::env::var("REPROIT_SELF_HOSTED").ok().as_deref(),
+        Some("1") | Some("true")
+    )
+}
+
+/// Resolve the control and single-tenant connection strings. First-class
+/// self-host maps DATABASE_URL (or `default`) onto both planes, with
+/// REPROIT_SELF_HOSTED_DB naming a separate telemetry database; otherwise the
+/// control url stands alone and the legacy `--self-hosted-db` value passes
+/// through untouched.
+fn resolve_db_config(
+    first_class_self_host: bool,
+    database_url: Option<&str>,
+    self_hosted_db_flag: Option<&str>,
+    default: &str,
+) -> (String, Option<String>) {
+    if !first_class_self_host {
+        let control_url = database_url.unwrap_or(default).to_string();
+        return (control_url, self_hosted_db_flag.map(str::to_string));
+    }
+    let control_url = database_url.unwrap_or(default).to_string();
+    let self_hosted_db = self_hosted_db_flag.unwrap_or(&control_url).to_string();
+    (control_url, Some(self_hosted_db))
 }
 
 fn raw_jobs_enabled(self_hosted: bool, dev_open: bool) -> bool {

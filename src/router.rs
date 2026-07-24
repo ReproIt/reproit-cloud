@@ -2,14 +2,112 @@
 
 use crate::*;
 
-/// Build the complete HTTP surface from explicit application state, plus an
-/// optional edition overlay router (identity providers, billing, webhooks)
-/// merged BEFORE the security layers so overlay routes get the same headers,
-/// metrics, and host allowlist as every shared route.
+/// One embedded static asset served verbatim: (route path, content type,
+/// body). Editions differ in which pages exist (capture review pages here,
+/// a reset page hosted-side), so the whole static surface is data.
+pub type StaticAsset = (&'static str, &'static str, &'static str);
+
+/// The self-host edition's static surface: auth pages, the dashboard SPA,
+/// capture review pages, and the bundled NimbusShop demo. All embedded at
+/// compile time; an overlay edition supplies its own table.
+pub const SELF_HOST_ASSETS: &[StaticAsset] = &[
+    ("/signup", HTML, include_str!("../static/signup.html")),
+    ("/login", HTML, include_str!("../static/login.html")),
+    ("/cli", HTML, include_str!("../static/cli.html")),
+    (
+        "/capture-upload/:token",
+        HTML,
+        include_str!("../static/capture-upload.html"),
+    ),
+    (
+        "/captures/:id",
+        HTML,
+        include_str!("../static/capture.html"),
+    ),
+    ("/invite", HTML, include_str!("../static/invite.html")),
+    // Auth-page scripts live in files (not inline) so the CSP can stay
+    // `script-src 'self'` with no nonces.
+    ("/login.js", JS_PLAIN, include_str!("../static/login.js")),
+    ("/cli.js", JS, include_str!("../static/cli.js")),
+    (
+        "/capture-upload.js",
+        JS,
+        include_str!("../static/capture-upload.js"),
+    ),
+    ("/capture.js", JS, include_str!("../static/capture.js")),
+    ("/signup.js", JS_PLAIN, include_str!("../static/signup.js")),
+    ("/invite.js", JS_PLAIN, include_str!("../static/invite.js")),
+    // The dashboard SPA and its assets, served same-origin so it hits this
+    // cloud's /v1 API with no CORS.
+    ("/app", HTML, include_str!("../static/app.html")),
+    ("/app.js", JS, include_str!("../static/app.js")),
+    ("/selects.js", JS, include_str!("../static/selects.js")),
+    // The per-seat triage product's view module (bug list + grab-a-bug +
+    // triage controls + seat management). Loaded by app.html after app.js.
+    ("/triage.js", JS, include_str!("../static/triage.js")),
+    ("/styles.css", CSS, include_str!("../static/styles.css")),
+    (
+        "/favicon.svg",
+        "image/svg+xml",
+        include_str!("../static/favicon.svg"),
+    ),
+    // The bundled NimbusShop sample: a polished storefront with one planted
+    // checkout crash and the web SDK wired to THIS cloud, so a first-run user
+    // watches a real crash flow into their dashboard.
+    ("/demo", HTML, include_str!("../static/demo/index.html")),
+    ("/demo/app.js", JS, include_str!("../static/demo/app.js")),
+    (
+        "/demo/reproit-web.js",
+        JS,
+        include_str!("../static/demo/reproit-web.js"),
+    ),
+    (
+        "/demo/styles.css",
+        CSS,
+        include_str!("../static/demo/styles.css"),
+    ),
+];
+
+const HTML: &str = "text/html; charset=utf-8";
+const JS: &str = "application/javascript; charset=utf-8";
+const JS_PLAIN: &str = "application/javascript";
+const CSS: &str = "text/css; charset=utf-8";
+
+/// Per-edition route composition inputs; see `RunConfig` for field meaning.
+pub struct RouterOptions {
+    pub captures: bool,
+    pub assets: &'static [StaticAsset],
+    pub overlay_open: Option<Router<App>>,
+    pub overlay_auth: Option<Router<App>>,
+    pub overlay_account: Option<Router<App>>,
+}
+
+/// Serve an edition's embedded static assets from its data table.
+fn asset_routes(assets: &'static [StaticAsset]) -> Router<App> {
+    let mut router = Router::new();
+    for (path, content_type, body) in assets {
+        router = router.route(
+            path,
+            get(move || async move {
+                (
+                    [(CONTENT_TYPE, HeaderValue::from_static(content_type))],
+                    *body,
+                )
+            }),
+        );
+    }
+    router
+}
+
+/// Build the complete HTTP surface from explicit application state, plus the
+/// edition's routing options. Overlay routers merge into the matching
+/// protection profile BEFORE its guards apply, so an overlay route gets the
+/// same limiter, CSRF stance, headers, metrics, and host allowlist as every
+/// shared route on that profile.
 ///
 /// Keeping route ownership outside process startup makes authentication, rate
 /// limits, middleware ordering, and edition drift reviewable as one unit.
-pub(crate) fn build(app: App, overlay: Option<Router<App>>) -> Router {
+pub(crate) fn build(app: App, options: RouterOptions) -> Router {
     // Rate limiters (in-memory GCRA; Cloudflare edge rules are the gross-abuse
     // first line). Tight on auth (brute-force / argon2 CPU), looser on ingest.
     // IP-keyed limiters MUST use SmartIpKeyExtractor: behind Fly/Cloudflare the
@@ -136,13 +234,6 @@ pub(crate) fn build(app: App, overlay: Option<Router<App>>) -> Router {
         // holds for one app as newline-delimited JSON (bucket triage metadata,
         // error rows within retention, evidence blob keys).
         .route("/v1/apps/:app/export", get(ingest::get_export))
-        .route("/v1/captures", post(captures::create))
-        .route("/v1/captures/:id", get(captures::status))
-        .route(
-            "/v1/captures/:id/files/:filename",
-            axum::routing::put(captures::put_file),
-        )
-        .route("/v1/captures/:id/complete", post(captures::complete))
         .route("/v1/blob/*key", get(ingest::get_blob))
         // Account-token project lifecycle used by automation and disposable
         // release gates. Project keys cannot create siblings or delete any
@@ -151,7 +242,21 @@ pub(crate) fn build(app: App, overlay: Option<Router<App>>) -> Router {
         .route(
             "/v1/projects/:app",
             axum::routing::delete(auth::delete_project_api),
-        )
+        );
+    // The human capture-report API mounts only when the edition serves it.
+    let protected = if options.captures {
+        protected
+            .route("/v1/captures", post(captures::create))
+            .route("/v1/captures/:id", get(captures::status))
+            .route(
+                "/v1/captures/:id/files/:filename",
+                axum::routing::put(captures::put_file),
+            )
+            .route("/v1/captures/:id/complete", post(captures::complete))
+    } else {
+        protected
+    };
+    let protected = protected
         .layer(GovernorLayer { config: ingest_rl })
         .route_layer(middleware::from_fn_with_state(app.clone(), require_api_key));
 
@@ -187,8 +292,9 @@ pub(crate) fn build(app: App, overlay: Option<Router<App>>) -> Router {
         .route("/auth/verify", get(auth::verify_email))
         .route("/auth/forgot", post(auth::forgot_password))
         .route("/auth/reset", post(auth::reset_password))
-        // Email flows: verification (the signup link) + password reset. All
-        // token-bearing and unauthenticated, so they belong on the tight limiter.
+        // Overlay identity providers (OAuth/SSO start + callback) share the
+        // same brute-force surface, so they ride the same limiter.
+        .merge(options.overlay_auth.unwrap_or_default())
         .route_layer(GovernorLayer { config: auth_rl });
 
     // (2) Cookie-authenticated mutation + billing-checkout surface. Cookie-auth'd
@@ -228,11 +334,6 @@ pub(crate) fn build(app: App, overlay: Option<Router<App>>) -> Router {
         .route("/account/seats", post(auth::set_seat))
         .route("/account/scans", get(account_scans))
         .route("/account/scans/:id", get(account_scan_detail))
-        .route(
-            "/account/capture-uploads/:token",
-            get(captures::review).post(captures::approve),
-        )
-        .route("/account/captures/:id", get(captures::account_capture))
         // The per-seat triage/management surface (the dashboard, not the engine):
         // cookie-authenticated AND seat-gated inside the handlers (a member without
         // a seat gets 402; the free CLI never reaches these). Triage state on a
@@ -264,7 +365,22 @@ pub(crate) fn build(app: App, overlay: Option<Router<App>>) -> Router {
         .route(
             "/v1/apps/:app/resolution-events",
             get(triage::get_resolution_events),
-        )
+        );
+    // Capture review pages are cookie-authenticated mutations too.
+    let account_mut = if options.captures {
+        account_mut
+            .route(
+                "/account/capture-uploads/:token",
+                get(captures::review).post(captures::approve),
+            )
+            .route("/account/captures/:id", get(captures::account_capture))
+    } else {
+        account_mut
+    };
+    let account_mut = account_mut
+        // Overlay cookie-authenticated mutations (billing checkout/portal,
+        // SSO settings) get the same limiter and CSRF stance.
+        .merge(options.overlay_account.unwrap_or_default())
         .route_layer(GovernorLayer { config: account_rl })
         .route_layer(middleware::from_fn(csrf_origin_check));
 
@@ -273,176 +389,7 @@ pub(crate) fn build(app: App, overlay: Option<Router<App>>) -> Router {
     let public_routes = Router::new()
         .route("/", get(|| async { Redirect::to("/app") }))
         .route("/auth/config", get(auth::auth_config))
-        .route(
-            "/signup",
-            get(|| async { Html(include_str!("../static/signup.html")) }),
-        )
-        .route(
-            "/login",
-            get(|| async { Html(include_str!("../static/login.html")) }),
-        )
-        .route(
-            "/cli",
-            get(|| async { Html(include_str!("../static/cli.html")) }),
-        )
-        .route(
-            "/capture-upload/:token",
-            get(|| async { Html(include_str!("../static/capture-upload.html")) }),
-        )
-        .route(
-            "/captures/:id",
-            get(|| async { Html(include_str!("../static/capture.html")) }),
-        )
-        .route(
-            "/invite",
-            get(|| async { Html(include_str!("../static/invite.html")) }),
-        )
-        // Auth-page scripts live in files (not inline) so the CSP can stay
-        // `script-src 'self'` with no nonces.
-        .route(
-            "/login.js",
-            get(|| async {
-                (
-                    [(axum::http::header::CONTENT_TYPE, "application/javascript")],
-                    include_str!("../static/login.js"),
-                )
-            }),
-        )
-        .route(
-            "/cli.js",
-            get(|| async {
-                (
-                    [(CONTENT_TYPE, "application/javascript; charset=utf-8")],
-                    include_str!("../static/cli.js"),
-                )
-            }),
-        )
-        .route(
-            "/capture-upload.js",
-            get(|| async {
-                (
-                    [(CONTENT_TYPE, "application/javascript; charset=utf-8")],
-                    include_str!("../static/capture-upload.js"),
-                )
-            }),
-        )
-        .route(
-            "/capture.js",
-            get(|| async {
-                (
-                    [(CONTENT_TYPE, "application/javascript; charset=utf-8")],
-                    include_str!("../static/capture.js"),
-                )
-            }),
-        )
-        .route(
-            "/signup.js",
-            get(|| async {
-                (
-                    [(axum::http::header::CONTENT_TYPE, "application/javascript")],
-                    include_str!("../static/signup.js"),
-                )
-            }),
-        )
-        .route(
-            "/invite.js",
-            get(|| async {
-                (
-                    [(axum::http::header::CONTENT_TYPE, "application/javascript")],
-                    include_str!("../static/invite.js"),
-                )
-            }),
-        )
-        .route(
-            "/app",
-            get(|| async { Html(include_str!("../static/app.html")) }),
-        )
-        // The dashboard's static assets (referenced relatively by app.html, so
-        // they resolve to /app.js and /styles.css). Served same-origin so the
-        // SPA hits this cloud's /v1 API with no CORS.
-        .route(
-            "/app.js",
-            get(|| async {
-                (
-                    [(CONTENT_TYPE, "application/javascript; charset=utf-8")],
-                    include_str!("../static/app.js"),
-                )
-            }),
-        )
-        .route(
-            "/selects.js",
-            get(|| async {
-                (
-                    [(CONTENT_TYPE, "application/javascript; charset=utf-8")],
-                    include_str!("../static/selects.js"),
-                )
-            }),
-        )
-        // The per-seat triage product's view module (bug list + grab-a-bug +
-        // triage controls + seat management). Loaded by app.html after app.js.
-        .route(
-            "/triage.js",
-            get(|| async {
-                (
-                    [(CONTENT_TYPE, "application/javascript; charset=utf-8")],
-                    include_str!("../static/triage.js"),
-                )
-            }),
-        )
-        .route(
-            "/styles.css",
-            get(|| async {
-                (
-                    [(CONTENT_TYPE, "text/css; charset=utf-8")],
-                    include_str!("../static/styles.css"),
-                )
-            }),
-        )
-        .route(
-            "/favicon.svg",
-            get(|| async {
-                (
-                    [(CONTENT_TYPE, "image/svg+xml")],
-                    include_str!("../static/favicon.svg"),
-                )
-            }),
-        )
-        // The bundled NimbusShop sample: a polished storefront with one planted
-        // checkout crash and the web SDK wired to THIS cloud. Onboarding opens it with the new
-        // project's ?appId=&key= so a first-run user watches a real crash flow
-        // into their dashboard before pointing the SDK at their own app. Served
-        // same-origin so the SDK's /v1/events POST needs no CORS.
-        .route(
-            "/demo",
-            get(|| async { Html(include_str!("../static/demo/index.html")) }),
-        )
-        .route(
-            "/demo/app.js",
-            get(|| async {
-                (
-                    [(CONTENT_TYPE, "application/javascript; charset=utf-8")],
-                    include_str!("../static/demo/app.js"),
-                )
-            }),
-        )
-        .route(
-            "/demo/reproit-web.js",
-            get(|| async {
-                (
-                    [(CONTENT_TYPE, "application/javascript; charset=utf-8")],
-                    include_str!("../static/demo/reproit-web.js"),
-                )
-            }),
-        )
-        .route(
-            "/demo/styles.css",
-            get(|| async {
-                (
-                    [(CONTENT_TYPE, "text/css; charset=utf-8")],
-                    include_str!("../static/demo/styles.css"),
-                )
-            }),
-        );
+        .merge(asset_routes(options.assets));
 
     let router = Router::new()
         // Liveness: process is up. Readiness: Postgres is reachable.
@@ -455,7 +402,7 @@ pub(crate) fn build(app: App, overlay: Option<Router<App>>) -> Router {
         .merge(ingest)
         .merge(protected)
         .merge(worker_api)
-        .merge(overlay.unwrap_or_default())
+        .merge(options.overlay_open.unwrap_or_default())
         // Cap request bodies (multipart evidence + JSON) to defang memory-DoS.
         .layer(DefaultBodyLimit::max(32 * 1024 * 1024))
         .layer(cors_layer())

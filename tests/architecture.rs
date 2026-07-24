@@ -106,7 +106,7 @@ fn process_coordination_does_not_own_http_routes() {
         "src/main.rs must remain a thin delegate to the library application"
     );
     assert!(
-        source("src/lib.rs").contains("router::build(app"),
+        source("src/lib.rs").contains("router::build("),
         "src/lib.rs must construct the HTTP surface through router::build"
     );
 }

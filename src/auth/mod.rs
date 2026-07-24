@@ -118,7 +118,7 @@ pub async fn session_status(State(app): State<App>, headers: HeaderMap) -> Respo
 
 /// Resolve the signed-in user AND their primary org, or an error response.
 /// Shared with the SSO overlay (sso.rs) for the org-level SSO settings handler.
-pub(crate) async fn user_and_org(
+pub async fn user_and_org(
     app: &App,
     headers: &HeaderMap,
 ) -> Result<(crate::db::User, crate::db::Org), Response> {
@@ -134,7 +134,7 @@ pub(crate) async fn user_and_org(
     Ok((user, org))
 }
 
-pub(crate) fn can_manage(role: &str) -> bool {
+pub fn can_manage(role: &str) -> bool {
     role == "owner" || role == "admin"
 }
 

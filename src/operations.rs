@@ -275,3 +275,52 @@ pub(super) async fn retention_pass(tenant: &tenancy::resolver::Tenant, org_id: i
         );
     }
 }
+
+/// Apply the tenant schema to every ACTIVE tenant database, `concurrency` at a
+/// time. Failures are collected, never short-circuited, so one broken tenant
+/// cannot hide the rest of the fleet's result.
+pub(super) async fn run_tenant_migrations(app: &App, concurrency: usize) -> anyhow::Result<()> {
+    let tenants = app.control.all_tenants().await?;
+    let mut pending = tokio::task::JoinSet::new();
+    let mut failures = Vec::new();
+    let mut migrated = 0usize;
+    for tenant in tenants {
+        if tenant.status != db::TenantStatus::Active {
+            continue;
+        }
+        let Some(conn) = tenant.db_conn else { continue };
+        while pending.len() >= concurrency {
+            let result = pending
+                .join_next()
+                .await
+                .expect("migration task exists")??;
+            migrated += 1;
+            if let Some(failure) = result {
+                failures.push(failure);
+            }
+        }
+        pending.spawn(async move {
+            Ok::<_, anyhow::Error>(
+                db::schema::apply(&conn)
+                    .await
+                    .err()
+                    .map(|error| format!("tenant {}: {error}", tenant.org_id)),
+            )
+        });
+    }
+    while let Some(result) = pending.join_next().await {
+        migrated += 1;
+        if let Some(failure) = result?? {
+            failures.push(failure);
+        }
+    }
+    if !failures.is_empty() {
+        anyhow::bail!(
+            "{} of {migrated} tenant migrations failed: {}",
+            failures.len(),
+            failures.join("; ")
+        );
+    }
+    tracing::info!("migrated {migrated} active tenant database(s)");
+    Ok(())
+}
