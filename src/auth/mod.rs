@@ -11,6 +11,7 @@
 //!   - `session`: session token, cookies, `ct_eq`, `cookie_value`, env helpers
 //!   - `password`: argon2id hashing + the federated "unusable password" sentinel
 //!   - `keys`: `sk_live_*` API key minting + display prefix
+//!
 //! Identity-provider overlays (Google OAuth / SSO) live outside this module
 //! and consume the re-exported surface below.
 

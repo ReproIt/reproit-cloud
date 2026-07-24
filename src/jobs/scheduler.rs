@@ -159,11 +159,7 @@ pub fn deadline_unix(enqueue_unix: i64, class: Class) -> i64 {
 /// competing tenants divided by the number of tenants with pending work. The
 /// fairness penalty bites only tenants running ABOVE this average.
 pub fn fair_share(tier_running_total: u32, active_tenants: u32) -> u32 {
-    if active_tenants == 0 {
-        0
-    } else {
-        tier_running_total / active_tenants
-    }
+    tier_running_total.checked_div(active_tenants).unwrap_or(0)
 }
 
 /// A fully-resolved scheduling candidate: one job with claimable pending shards

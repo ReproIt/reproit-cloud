@@ -135,6 +135,16 @@ Resolution skips the hosted tenant-registry lookup and always returns a store fo
 that fixed database plus the single configured blob scope. The handlers, tenant
 schema, event protocol, replay model, and data-plane operations remain the same.
 
+The multi-tenant data plane itself is shared, composable library code, not a
+hosted-only surface. `REPROIT_TENANT_PROVIDER` selects `local` (a
+database-per-org on the base Postgres) or, behind the `neon` feature, a
+project-per-org provider; the R2 backend can mint short-lived prefix-scoped
+credentials via Cloudflare's temp-access-credentials API. Self-host leaves the
+provider unset (single tenant) and uses convention-only blob scoping, so this
+code is dormant by default. `scripts/audit-boundary.sh` therefore forbids only
+the genuinely hosted-only surfaces (billing flows, enterprise SSO/SCIM, hosted
+usage metering), not the shared tenancy provider or the credential minter.
+
 The source-available self-hosted Cloud is licensed under Elastic License 2.0.
 The CLI and SDK repositories are separate and licensed under Apache License 2.0.
 
