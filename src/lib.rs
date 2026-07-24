@@ -912,6 +912,36 @@ mod tests {
     }
 
     #[test]
+    fn delete_confirmation_shows_the_case_sensitive_name() {
+        let dashboard = include_str!("../static/app.js");
+        let styles = include_str!("../static/styles.css");
+
+        assert!(dashboard.contains(r#"class="confirmation-value">${esc(project.name)}</span>"#));
+        assert!(dashboard.contains("Capitalization and spacing must match."));
+        assert!(dashboard.contains("The value does not match. Copy the name exactly as shown."));
+        assert!(styles.contains(".confirmation-value{"));
+        assert!(styles.contains("text-transform:none"));
+    }
+
+    #[test]
+    fn project_deletion_selects_a_surviving_project() {
+        let dashboard = include_str!("../static/app.js");
+
+        assert!(dashboard.contains("function projectAfterDeletion(projects, deletedAppId)"));
+        assert!(dashboard.contains("const nextProject = projectAfterDeletion("));
+        assert!(dashboard.contains("Switched to ${nextProject.name}."));
+    }
+
+    #[test]
+    fn replay_path_exposes_its_overflow_scrollbar() {
+        let styles = include_str!("../static/styles.css");
+
+        assert!(styles.contains(".path-card .bd::-webkit-scrollbar-thumb"));
+        assert!(styles.contains("overflow-y:auto"));
+        assert!(styles.contains("scrollbar-width:thin"));
+    }
+
+    #[test]
     fn admin_target_requires_numeric_header() {
         let headers = HeaderMap::new();
         let err = admin_target_result(&headers).unwrap_err();

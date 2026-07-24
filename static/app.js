@@ -201,6 +201,9 @@ function currentProject() {
   const projects = (S.account && S.account.projects) || [];
   return projects.find((p) => p.appId === CFG.app) || null;
 }
+function projectAfterDeletion(projects, deletedAppId) {
+  return projects.find((project) => project.appId !== deletedAppId) || null;
+}
 function canManageOrg() {
   const role = S.account && S.account.org && S.account.org.role;
   return role === "owner" || role === "admin";
@@ -1495,16 +1498,26 @@ function renderOrganizationSettings(account, org) {
 function renderProjectDanger(project) {
   if (!project || !canManageOrg()) return "";
   const ready = S.projectDeleteConfirm === project.name && !S.projectDeleteBusy;
+  const mismatch = S.projectDeleteConfirm.length > 0 && S.projectDeleteConfirm !== project.name;
   return `<div class="card danger-zone">
     <div class="hd">Delete project</div>
     <div class="bd">
       <p>Permanently deletes this project's bugs, runs, evidence, integrations, and API keys.</p>
       <form id="project-delete-form" class="danger-form">
-        <label class="fld-lbl" for="project-delete-confirm">Type ${esc(project.name)} to confirm</label>
+        <label class="fld-lbl" for="project-delete-confirm">
+          Type the exact name to confirm
+          <span class="confirmation-value">${esc(project.name)}</span>
+        </label>
         <div class="inline-row">
-          <input id="project-delete-confirm" value="${esc(S.projectDeleteConfirm)}" autocomplete="off" />
+          <input id="project-delete-confirm" value="${esc(S.projectDeleteConfirm)}"
+            placeholder="Enter the name shown above" autocomplete="off"
+            aria-describedby="project-delete-hint" aria-invalid="${mismatch}" />
           <button class="danger-btn" type="submit"${ready ? "" : " disabled"}>${S.projectDeleteBusy ? "Deleting..." : "Delete project"}</button>
         </div>
+        <div class="confirmation-hint${mismatch ? " mismatch" : ""}"
+          id="project-delete-hint" aria-live="polite">${mismatch
+            ? "The value does not match. Copy the name exactly as shown."
+            : "Capitalization and spacing must match."}</div>
       </form>
     </div>
   </div>`;
@@ -1515,16 +1528,26 @@ function renderOrganizationDanger(account, org) {
   if (org.role !== "owner" || org.selfHosted || !active || active.personal) return "";
   const paid = org.plan && org.plan !== "free";
   const ready = S.orgDeleteConfirm === org.name && !S.orgDeleteBusy && !paid;
+  const mismatch = S.orgDeleteConfirm.length > 0 && S.orgDeleteConfirm !== org.name;
   return `<div class="card danger-zone">
     <div class="hd">Delete organization</div>
     <div class="bd">
       <p>Permanently deletes this organization, every project, member, key, bug, run, and evidence object.</p>
       ${paid ? `<div class="muted danger-note">Cancel the ${esc(org.plan)} subscription in billing and wait for the plan to become free before deleting.</div>` : `<form id="org-delete-form" class="danger-form">
-        <label class="fld-lbl" for="org-delete-confirm">Type ${esc(org.name)} to confirm</label>
+        <label class="fld-lbl" for="org-delete-confirm">
+          Type the exact name to confirm
+          <span class="confirmation-value">${esc(org.name)}</span>
+        </label>
         <div class="inline-row">
-          <input id="org-delete-confirm" value="${esc(S.orgDeleteConfirm)}" autocomplete="off" />
+          <input id="org-delete-confirm" value="${esc(S.orgDeleteConfirm)}"
+            placeholder="Enter the name shown above" autocomplete="off"
+            aria-describedby="org-delete-hint" aria-invalid="${mismatch}" />
           <button class="danger-btn" type="submit"${ready ? "" : " disabled"}>${S.orgDeleteBusy ? "Deleting..." : "Delete organization"}</button>
         </div>
+        <div class="confirmation-hint${mismatch ? " mismatch" : ""}"
+          id="org-delete-hint" aria-live="polite">${mismatch
+            ? "The value does not match. Copy the name exactly as shown."
+            : "Capitalization and spacing must match."}</div>
       </form>`}
     </div>
   </div>`;
@@ -1712,15 +1735,22 @@ async function deleteCurrentProject() {
     return;
   }
   forgetProjectKeys(project.appId);
+  const nextProject = projectAfterDeletion(S.account.projects || [], project.appId);
   S.projectDeleteConfirm = "";
   S.justCreatedKey = null;
-  CFG = { ...CFG, app: "", key: "" };
+  CFG = {
+    ...CFG,
+    app: nextProject ? nextProject.appId : "",
+    key: nextProject ? keyForApp(nextProject.appId) : "",
+  };
   saveConfig(CFG);
   resetAppData();
   if (window.ReproitTriage && window.ReproitTriage.resetForApp) window.ReproitTriage.resetForApp();
   await loadAccount();
   syncProjectUrl(true);
-  setBanner(`Deleted ${project.name}.`);
+  setBanner(nextProject
+    ? `Deleted ${project.name}. Switched to ${nextProject.name}.`
+    : `Deleted ${project.name}.`);
   render();
 }
 

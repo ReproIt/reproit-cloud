@@ -297,6 +297,10 @@ kbd{background:var(--panel2);border:1px solid var(--line);border-bottom-width:2p
 
 /* triage controls */
 .fld-lbl{display:block;color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.06em;margin:0 0 6px}
+.confirmation-value{display:block;width:max-content;max-width:100%;margin-top:7px;color:var(--ink);font-size:12.5px;letter-spacing:0;text-transform:none;overflow-wrap:anywhere;user-select:all}
+.confirmation-hint{min-height:17px;margin-top:7px;color:var(--dim);font-size:11px;line-height:1.45}
+.confirmation-hint.mismatch{color:var(--red)}
+.danger-form input[aria-invalid=true]{border-color:rgba(244,98,90,.7);box-shadow:0 0 0 2px rgba(244,98,90,.1)}
 .detail .selwrap{display:block;width:100%}
 .detail .acts{display:flex;gap:10px}
 .detail .term-replay[disabled]{opacity:.6;cursor:default}
@@ -334,7 +338,11 @@ kbd{background:var(--panel2);border:1px solid var(--line);border-bottom-width:2p
 .replaysteps li{display:grid;grid-template-columns:minmax(62px,.75fr) minmax(0,1.25fr);gap:9px;align-items:baseline;min-width:0}
 .replaysteps .verb{color:var(--green);min-width:0;overflow-wrap:anywhere}
 .replaysteps .tgt,.replaysteps .muted{color:var(--dim);min-width:0;overflow-wrap:anywhere;word-break:break-word}
-.path-card .bd{max-height:190px;overflow:auto}
+.path-card .bd{max-height:190px;overflow-x:hidden;overflow-y:auto;scrollbar-width:thin;scrollbar-color:var(--line2) transparent}
+.path-card .bd::-webkit-scrollbar{width:8px}
+.path-card .bd::-webkit-scrollbar-track{background:transparent}
+.path-card .bd::-webkit-scrollbar-thumb{background:var(--line2);border:2px solid var(--panel);border-radius:999px}
+.path-card .bd::-webkit-scrollbar-thumb:hover{background:var(--mut)}
 
 /* linked ticket */
 .ticketrow{display:flex;align-items:center;gap:9px;font-size:12.5px}
