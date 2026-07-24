@@ -75,12 +75,12 @@ pub struct App {
     /// The database-per-org machinery: resolve an org id to a tenant-bound store +
     /// blob scope; provision a tenant on signup.
     pub tenancy: Arc<Tenancy>,
-    pub(crate) reproit_bin: String,
+    pub reproit_bin: String,
     /// Raw-path job submission (`POST /jobs`) is for local dev and self-hosted
     /// installs where the caller and worker intentionally share a filesystem.
     /// Managed cloud tenants must not be able to submit arbitrary `app_dir`
     /// paths, even though `jobs::validate_app_dir` confines them defensively.
-    pub(crate) allow_raw_jobs: bool,
+    pub allow_raw_jobs: bool,
     /// True for the self-hosted single-tenant edition. Hosted cloud keeps plan
     /// and seat-limit behavior; self-host removes commercial seat caps.
     pub self_hosted: bool,
@@ -184,9 +184,9 @@ pub enum AuthCtx {
 /// inject telemetry into the org's other projects.
 #[derive(Clone, Copy, Debug)]
 pub struct KeyScope {
-    pub(crate) project_id: Option<i64>,
-    pub(crate) user_id: Option<i64>,
-    pub(crate) publishable: bool,
+    pub project_id: Option<i64>,
+    pub user_id: Option<i64>,
+    pub publishable: bool,
 }
 
 impl KeyScope {
