@@ -212,7 +212,7 @@ pub(super) async fn resolve_api_auth(
         // a tiny control-plane lookup; if it ever becomes hot enough to cache,
         // the cache needs explicit invalidation on key revoke/rotate.
         match app.control.org_for_api_key(token).await {
-            Ok(Some((org_id, project_id, created_by))) => {
+            Ok(Some((org_id, _plan, project_id, created_by))) => {
                 req.extensions_mut().insert(AuthCtx::Org(org_id));
                 req.extensions_mut().insert(KeyScope {
                     project_id,
@@ -277,6 +277,11 @@ pub(super) async fn require_worker_token(req: Request, next: Next) -> Result<Res
 /// and status class. Registered app-wide alongside the security headers.
 pub(super) async fn request_metrics(req: Request, next: Next) -> Response {
     let method = req.method().as_str().to_string();
+    let route = req
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map(|path| path.as_str().to_string())
+        .unwrap_or_else(|| "unmatched".to_string());
     let started = std::time::Instant::now();
     let resp = next.run(req).await;
     let status = resp.status().as_u16();
@@ -286,10 +291,17 @@ pub(super) async fn request_metrics(req: Request, next: Next) -> Response {
         400..=499 => "4xx",
         _ => "5xx",
     };
-    metrics::counter!("http_requests_total", "method" => method.clone(), "class" => class)
+    let response_bytes = resp
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    metrics::counter!("http_requests_total", "method" => method.clone(), "route" => route.clone(), "class" => class)
         .increment(1);
-    metrics::histogram!("http_request_duration_seconds", "method" => method, "class" => class)
+    metrics::histogram!("http_request_duration_seconds", "method" => method, "route" => route.clone(), "class" => class)
         .record(started.elapsed().as_secs_f64());
+    metrics::histogram!("http_response_bytes", "route" => route).record(response_bytes as f64);
     resp
 }
 
@@ -434,10 +446,9 @@ pub(super) fn csrf_origin_allowed(claimed: Option<&str>, allowed: &[String]) -> 
     }
 }
 
-/// CORS for the API. Production REQUIRES an explicit allowlist
-/// (`REPROIT_CORS_ORIGINS`, comma-separated); only `REPROIT_DEV_OPEN=1` permits
-/// the any-origin fallback. An empty/missing allowlist in prod means "no
-/// cross-origin", safer than silently allowing everyone.
+/// CORS for the API. Hosted ingest uses `REPROIT_CORS_ORIGINS=*` because browser
+/// SDKs run on customer-controlled origins. Authorization remains bearer-key
+/// based, and this layer never enables credentialed cookie CORS.
 pub(super) fn cors_layer() -> CorsLayer {
     let base = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
@@ -446,6 +457,10 @@ pub(super) fn cors_layer() -> CorsLayer {
         .ok()
         .filter(|s| !s.trim().is_empty());
     match list {
+        Some(list) if list.trim() == "*" => {
+            tracing::info!("CORS: allowing browser SDK requests from any origin");
+            base.allow_origin(AllowOrigin::any())
+        }
         Some(list) => {
             let origins: Vec<HeaderValue> = list
                 .split(',')

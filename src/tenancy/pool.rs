@@ -70,11 +70,14 @@ impl TenantPools {
     /// the tenant's recency, lazily creates a bounded pool on a miss, and evicts
     /// the LRU pool if we are over the cap. Returns a cheap `Arc<PgPool>` clone.
     pub async fn get(&self, org_id: i64, conn: &str) -> anyhow::Result<Arc<PgPool>> {
+        let started = Instant::now();
         {
             // Fast path: an existing live pool. Bump recency and return.
             let mut map = self.inner.lock().await;
             if let Some(e) = map.get_mut(&org_id) {
                 e.last_used = Instant::now();
+                metrics::histogram!("tenant_pool_get_seconds", "result" => "hit")
+                    .record(started.elapsed().as_secs_f64());
                 return Ok(e.pool.clone());
             }
         }
@@ -93,6 +96,8 @@ impl TenantPools {
         // drop ours (the extra pool closes when its Arc drops).
         if let Some(e) = map.get_mut(&org_id) {
             e.last_used = Instant::now();
+            metrics::histogram!("tenant_pool_get_seconds", "result" => "raced")
+                .record(started.elapsed().as_secs_f64());
             return Ok(e.pool.clone());
         }
         map.insert(
@@ -103,6 +108,8 @@ impl TenantPools {
             },
         );
         self.evict_locked(&mut map);
+        metrics::histogram!("tenant_pool_get_seconds", "result" => "miss")
+            .record(started.elapsed().as_secs_f64());
         Ok(pool)
     }
 

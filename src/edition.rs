@@ -47,6 +47,15 @@ pub trait EditionPolicy: Send + Sync {
     /// The edition's per-app evidence byte cap, or None to defer to the
     /// operator's environment cap.
     fn evidence_cap<'a>(&'a self, org_id: i64) -> PolicyFuture<'a, Option<i64>>;
+
+    /// The edition's data retention window in days, or None when the operator
+    /// owns retention (exports then cover everything).
+    fn retention_days<'a>(&'a self, org_id: i64) -> PolicyFuture<'a, Option<i64>>;
+
+    /// Observe tenant activity that an edition may follow up on (`kind` is a
+    /// static tag such as "resolution" or "cloud-runs"). The hosted edition
+    /// schedules the matching maintenance sweep; best-effort, never surfaced.
+    fn on_tenant_activity<'a>(&'a self, org_id: i64, kind: &'static str) -> PolicyFuture<'a, ()>;
 }
 
 /// The self-hosted edition: no quotas, no metering, no tenant maintenance
@@ -72,5 +81,13 @@ impl EditionPolicy for PassivePolicy {
 
     fn evidence_cap<'a>(&'a self, _org_id: i64) -> PolicyFuture<'a, Option<i64>> {
         Box::pin(async { None })
+    }
+
+    fn retention_days<'a>(&'a self, _org_id: i64) -> PolicyFuture<'a, Option<i64>> {
+        Box::pin(async { None })
+    }
+
+    fn on_tenant_activity<'a>(&'a self, _org_id: i64, _kind: &'static str) -> PolicyFuture<'a, ()> {
+        Box::pin(async {})
     }
 }

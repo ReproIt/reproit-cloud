@@ -55,13 +55,31 @@ pub async fn post_replay_results(
             }
         }
     }
-    // Verified-fix => triage advances to `fixed`. The SAME signal the ticket-close
-    // path keys on (`is_verified_fix`) auto-advances the bucket's triage status,
-    // UNLESS a human marked it `wontfix` (the DB twin enforces that guard in SQL,
-    // and inserts a fresh `fixed` row if the bucket was never touched). Triage is
-    // independent of the tracker integration, so this fires whether or not the app
-    // has a tracker configured. Best-effort: a triage write failure must not fail
-    // the replay-result POST (the result itself is already durably recorded).
+    let candidate_fix_is_new = if crate::integrations::is_verified_fix(status, runs, failures) {
+        let has_anchor = tenant
+            .store
+            .triage_for_bucket(&app_id, &bucket)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|t| t.fixed_in_build)
+            .is_some();
+        let regressed = tenant
+            .store
+            .last_resolution_status(&app_id, &bucket)
+            .await
+            .ok()
+            .flatten()
+            .as_deref()
+            == Some("regressed");
+        !has_anchor || regressed
+    } else {
+        false
+    };
+    // A verified CI replay anchors the candidate fixed build. It does not resolve
+    // the production bug. The resolution sweep waits for that build in production.
+    // Best-effort: an anchor write failure must not fail the replay-result POST
+    // because the result itself is already durably recorded.
     if crate::integrations::is_verified_fix(status, runs, failures) {
         let anchor = body
             .get("fixedInBuild")
@@ -83,23 +101,21 @@ pub async fn post_replay_results(
             Err(e) => tracing::warn!("triage auto-advance failed for {bucket}: {e}"),
         }
     }
-    // Verified-fix close: if this result is the signal that the bug no longer
-    // reproduces, comment + close the linked ticket with proof. Opt-in and
-    // best-effort, the hook short-circuits when the app has no tracker or the
-    // bucket has no linked ticket, and NEVER fails the request on a tracker
-    // outage (it logs and swallows). If the client knows the actual fixed build
-    // it may pass `fixedInBuild`; cloud does not infer it from bug occurrences.
-    if crate::integrations::is_verified_fix(status, runs, failures)
-        && crate::integrations::is_configured_for(&tenant.store, &app_id).await
+    // A clean CI replay verifies a candidate fix, but a branch is not production.
+    // Keep the linked issue open and record the proof. The resolution sweep
+    // closes it only after the fixed build is observed in production and clears
+    // the production-evidence threshold.
+    if candidate_fix_is_new && crate::integrations::is_configured_for(&tenant.store, &app_id).await
     {
         let build = body
             .get("fixedInBuild")
             .and_then(|v| v.as_str())
             .map(str::trim)
             .filter(|s| !s.is_empty());
-        crate::integrations::close_ticket_on_fix(&tenant.store, &app_id, &bucket, build).await;
+        crate::integrations::comment_ticket_fix_verified(&tenant.store, &app_id, &bucket, build)
+            .await;
     }
-    // CI-run loop closure: a run dispatched via POST .../reproduce passes
+    // Hosted-run loop closure: a CI run dispatched via POST .../reproduce passes
     // its `runId` back here, which completes the cloud_runs ledger row. The row
     // must belong to this (app, bucket). Best-effort: an
     // unknown or already-terminal run id is ignored (the result itself stands).
@@ -117,7 +133,7 @@ pub async fn post_replay_results(
     Ok(Json(json!({ "ok": true, "id": id })))
 }
 
-/// POST /v1/apps/:app/buckets/:bucket/reproduce, the CI reproduction
+/// POST /v1/apps/:app/buckets/:bucket/reproduce, the HOSTED reproduction
 /// trigger. Fires a `repository_dispatch` into the app's bound customer repo
 /// (project_integrations.dispatch_repo) so reproduction runs in THEIR CI; the
 /// cloud never holds source or simulators. 202 with the run id; the CI
@@ -173,6 +189,9 @@ pub async fn post_reproduce(
         ));
     }
     metrics::counter!("cloud_runs_dispatched_total").increment(1);
+    app.policy
+        .on_tenant_activity(tenant.org_id, "cloud-runs")
+        .await;
     app.control
         .audit(
             &requested_by,

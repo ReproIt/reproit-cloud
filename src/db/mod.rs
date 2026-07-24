@@ -21,6 +21,9 @@ pub mod secrets;
 pub mod tenant;
 
 pub use control::ControlStore;
+// The capture re-exports feed the capture intake handlers; the hosted
+// edition does not mount those routes yet, so it carries them unused.
+#[allow(unused_imports)]
 pub use tenant::{AnchoredBucket, CaptureApproval, NewCapture, PendingCaptureFile, TenantStore};
 // `ResolutionEvent` / `TicketLink` are named only through method return types, so
 // they need no re-export today; kept available behind the modules for callers that
@@ -41,6 +44,9 @@ pub struct User {
 pub struct Org {
     pub id: i64,
     pub name: String,
+    // Read by the hosted plan gates; self-host carries it without reading it.
+    #[allow(dead_code)]
+    pub plan: String,
     pub role: String,
 }
 
@@ -54,6 +60,7 @@ pub struct Member {
     pub seat: bool,
 }
 
+/// One organization a user can actively work in.
 #[derive(Debug, Clone)]
 pub struct OrgSummary {
     pub id: i64,
@@ -63,8 +70,8 @@ pub struct OrgSummary {
     pub personal: bool,
 }
 
-/// Pending organization invitation. Only a digest of the raw invitation token
-/// is persisted; list APIs never expose it.
+/// A pending, revocable organization invitation. The raw bearer token is never
+/// stored or returned by list APIs; only its SHA-256 digest lives in Postgres.
 #[derive(Debug, Clone)]
 pub struct OrgInvitation {
     pub id: i64,

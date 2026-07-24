@@ -91,6 +91,11 @@ impl Tenancy {
         }
     }
 
+    /// Crash-recovery reconciler for tenants stuck mid-provisioning. Run on startup.
+    pub async fn reconcile(&self) -> anyhow::Result<()> {
+        self.provisioner.reconcile(&self.control).await
+    }
+
     /// Resolve an org id to a tenant-bound handle (store + blobs).
     pub async fn resolve(&self, org_id: i64) -> Result<Tenant, ResolveError> {
         self.resolver.resolve(org_id).await

@@ -130,17 +130,17 @@ impl ControlStore {
             .collect())
     }
 
-    /// (org_id, project_id, created_by) that owns an API key. This is the hot
-    /// per-request routing read: the org id it returns is
+    /// (org_id, plan, project_id, created_by) that owns an API key. This is the
+    /// hot per-request routing read: the org id it returns is
     /// what the resolver maps to a tenant database. `project_id` is the tenant-db
     /// project the key was minted for (None for org-wide keys); ingest uses it to
     /// pin a publishable key to its own app.
     pub async fn org_for_api_key(
         &self,
         presented: &str,
-    ) -> anyhow::Result<Option<(i64, Option<i64>, Option<i64>)>> {
+    ) -> anyhow::Result<Option<(i64, String, Option<i64>, Option<i64>)>> {
         let row = sqlx::query(
-            "SELECT o.id, k.project_id, k.created_by
+            "SELECT o.id, o.plan, k.project_id, k.created_by
              FROM api_keys k
              JOIN orgs o ON o.id = k.org_id
              WHERE k.key = $1
@@ -153,6 +153,7 @@ impl ControlStore {
         Ok(row.map(|r| {
             (
                 r.get::<i64, _>("id"),
+                r.get::<String, _>("plan"),
                 r.get::<Option<i64>, _>("project_id"),
                 r.get::<Option<i64>, _>("created_by"),
             )

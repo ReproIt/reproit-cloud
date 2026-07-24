@@ -5,8 +5,8 @@
 //!   - close:        PATCH  /repos/{owner}/{repo}/issues/{n}   {state: closed}
 //!
 //! Auth is a token (PAT / GitHub App installation token) with `issues:write`,
-//! sent as `Authorization: Bearer <token>` per GitHub's REST v3 contract. The
-//! base URL is injectable
+//! sent as `Authorization: Bearer <token>` per GitHub's REST v3 contract, the
+//! same bearer/reqwest shape billing uses for Stripe. The base url is injectable
 //! (`with_base_url`) so tests point it at a local mock server and make ZERO real
 //! external calls; production leaves it at the api.github.com default.
 //!
@@ -130,6 +130,23 @@ impl Tracker for GithubTracker {
         }
         Ok(())
     }
+
+    async fn reopen(&self, issue_number: &str) -> anyhow::Result<()> {
+        let resp = self
+            .req(
+                self.client
+                    .patch(self.issues_url(&format!("/{issue_number}"))),
+            )
+            .json(&json!({ "state": "open" }))
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let v: Value = resp.json().await.unwrap_or_else(|_| json!({}));
+            anyhow::bail!("github reopen {status}: {}", message_of(&v));
+        }
+        Ok(())
+    }
 }
 
 /// Pull GitHub's `message` field out of an error response for the log/anyhow
@@ -248,6 +265,18 @@ mod tests {
         assert_eq!(r.closed_issue, Some(7));
         // close transitions to GitHub's terminal state.
         assert_eq!(r.closed_state.as_deref(), Some("closed"));
+    }
+
+    #[tokio::test]
+    async fn reopen_transitions_mock_issue_back_to_open() {
+        let (base, rec) = mock_github().await;
+        let gh = GithubTracker::new("octo/repo".into(), "tok".into()).with_base_url(base);
+
+        gh.reopen("7").await.unwrap();
+
+        let r = rec.lock().unwrap();
+        assert_eq!(r.closed_issue, Some(7));
+        assert_eq!(r.closed_state.as_deref(), Some("open"));
     }
 
     #[test]

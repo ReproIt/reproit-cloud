@@ -244,7 +244,7 @@ async fn full_path_org_to_provision_to_key_to_tenant_row() {
             .await?;
         let resolved = control.org_for_api_key("secret-xyz").await?;
         anyhow::ensure!(
-            resolved == Some((org_id, Some(project_id), Some(user_id))),
+            resolved == Some((org_id, "free".to_string(), Some(project_id), Some(user_id))),
             "the API key should route to the org and carry its project scope: {resolved:?}"
         );
         let key_hash = crate::db::key_hash("secret-xyz");
@@ -274,7 +274,7 @@ async fn full_path_org_to_provision_to_key_to_tenant_row() {
         .await?;
         let resolved = control.org_for_api_key("secret-xyz").await?;
         anyhow::ensure!(
-            resolved == Some((org_id, Some(project_id), Some(user_id))),
+            resolved == Some((org_id, "free".to_string(), Some(project_id), Some(user_id))),
             "future-expiring API key should route to the org: {resolved:?}"
         );
 

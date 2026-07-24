@@ -1,7 +1,56 @@
+//! Telemetry ingest, bounded reads, replay results, and evidence operations.
+
 use super::*;
+
+fn prefixed_error(row: &sqlx::postgres::PgRow, prefix: &str) -> ErrorRec {
+    let Json(path): Json<Vec<Step>> = row.get(format!("{prefix}_path").as_str());
+    let Json(context): Json<serde_json::Map<String, Value>> =
+        row.get(format!("{prefix}_context").as_str());
+    ErrorRec {
+        sig: row.get(format!("{prefix}_sig").as_str()),
+        message: row.get(format!("{prefix}_message").as_str()),
+        path,
+        context,
+    }
+}
 
 impl TenantStore {
     // ---- telemetry: edges / errors / evidence ------------------------------
+
+    /// Single-row edge upsert. Retained for the tenancy integration tests and as
+    /// a one-off helper; the hot ingest path uses the batched `ingest_batch`.
+    #[allow(dead_code)]
+    pub async fn incr_edge(&self, app_id: &str, key: &str) -> anyhow::Result<()> {
+        sqlx::query(
+            "INSERT INTO edges (app_id, edge_key, count) VALUES ($1,$2,1)
+             ON CONFLICT (app_id, edge_key) DO UPDATE SET count = edges.count + 1",
+        )
+        .bind(app_id)
+        .bind(key)
+        .execute(self.pool.as_ref())
+        .await?;
+        Ok(())
+    }
+
+    /// Single-row error insert. Retained for the tenancy integration tests and as
+    /// a one-off helper; the hot ingest path uses the batched `ingest_batch`.
+    #[allow(dead_code)]
+    pub async fn add_error(&self, app_id: &str, rec: &ErrorRec) -> anyhow::Result<()> {
+        let bucket_id = crate::ingest::buckets::bucket_id(rec);
+        sqlx::query(
+            "INSERT INTO errors (app_id, sig, message, path, context, bucket_id)
+             VALUES ($1,$2,$3,$4,$5,$6)",
+        )
+        .bind(app_id)
+        .bind(&rec.sig)
+        .bind(&rec.message)
+        .bind(Json(&rec.path))
+        .bind(Json(&rec.context))
+        .bind(bucket_id)
+        .execute(self.pool.as_ref())
+        .await?;
+        Ok(())
+    }
 
     /// Ingest a whole event batch ATOMICALLY in one transaction and a constant
     /// number of round-trips, instead of one auto-commit statement per event.
@@ -97,11 +146,38 @@ impl TenantStore {
                 .iter()
                 .map(crate::ingest::buckets::bucket_id)
                 .collect();
+            let mut dimension_buckets = Vec::new();
+            let mut dimension_keys = Vec::new();
+            let mut dimension_values = Vec::new();
+            for (error, bucket_id) in errors.iter().zip(&bucket_ids) {
+                for (key, value) in crate::ingest::cohorts::dimension_values(&error.context) {
+                    dimension_buckets.push(bucket_id.as_str());
+                    dimension_keys.push(key);
+                    dimension_values.push(value);
+                }
+            }
             sqlx::query(
-                "INSERT INTO errors (app_id, sig, message, path, context, bucket_id)
-                 SELECT $1, s, m, p, c, b
-                 FROM UNNEST($2::text[], $3::text[], $4::jsonb[], $5::jsonb[], $6::text[])
-                   AS t(s, m, p, c, b)",
+                "WITH inserted AS (
+                   INSERT INTO errors (app_id, sig, message, path, context, bucket_id)
+                   SELECT $1, s, m, p, c, b
+                   FROM UNNEST($2::text[], $3::text[], $4::jsonb[], $5::jsonb[], $6::text[])
+                     AS t(s, m, p, c, b)
+                   RETURNING id, bucket_id, created_at
+                 ), grouped AS (
+                   SELECT bucket_id, COUNT(*)::BIGINT AS count,
+                          MIN(id) AS first_id, MAX(id) AS last_id,
+                          MIN(created_at) AS first_seen, MAX(created_at) AS last_seen
+                   FROM inserted GROUP BY bucket_id
+                 )
+                 INSERT INTO bucket_summaries
+                   (app_id, bucket_id, count, first_error_id, last_error_id, first_seen, last_seen)
+                 SELECT $1, bucket_id, count, first_id, last_id, first_seen, last_seen FROM grouped
+                 ON CONFLICT (app_id, bucket_id) DO UPDATE SET
+                   count=bucket_summaries.count + EXCLUDED.count,
+                   first_error_id=LEAST(bucket_summaries.first_error_id, EXCLUDED.first_error_id),
+                   last_error_id=GREATEST(bucket_summaries.last_error_id, EXCLUDED.last_error_id),
+                   first_seen=LEAST(bucket_summaries.first_seen, EXCLUDED.first_seen),
+                   last_seen=GREATEST(bucket_summaries.last_seen, EXCLUDED.last_seen)",
             )
             .bind(app_id)
             .bind(&sigs)
@@ -111,12 +187,245 @@ impl TenantStore {
             .bind(&bucket_ids)
             .execute(&mut *tx)
             .await?;
+
+            if !dimension_keys.is_empty() {
+                sqlx::query(
+                    "INSERT INTO app_context_counts (app_id, key, value, count)
+                     SELECT $1, key, value, COUNT(*)::BIGINT
+                     FROM UNNEST($2::text[], $3::text[]) AS t(key, value)
+                     GROUP BY key, value
+                     ON CONFLICT (app_id, key, value) DO UPDATE SET
+                       count=app_context_counts.count + EXCLUDED.count",
+                )
+                .bind(app_id)
+                .bind(&dimension_keys)
+                .bind(&dimension_values)
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query(
+                    "INSERT INTO bucket_context_counts (app_id, bucket_id, key, value, count)
+                     SELECT $1, bucket_id, key, value, COUNT(*)::BIGINT
+                     FROM UNNEST($2::text[], $3::text[], $4::text[])
+                       AS t(bucket_id, key, value)
+                     GROUP BY bucket_id, key, value
+                     ON CONFLICT (app_id, bucket_id, key, value) DO UPDATE SET
+                       count=bucket_context_counts.count + EXCLUDED.count",
+                )
+                .bind(app_id)
+                .bind(&dimension_buckets)
+                .bind(&dimension_keys)
+                .bind(&dimension_values)
+                .execute(&mut *tx)
+                .await?;
+            }
+
+            let unique_buckets: std::collections::BTreeSet<&str> =
+                bucket_ids.iter().map(String::as_str).collect();
+            let outbox_buckets: Vec<&str> = unique_buckets.into_iter().collect();
+            sqlx::query(
+                "INSERT INTO integration_outbox (app_id, bucket_id, kind)
+                 SELECT $1, bucket_id, 'file-issue'
+                 FROM UNNEST($2::text[]) AS bucket_id
+                 ON CONFLICT (app_id, bucket_id, kind) DO NOTHING",
+            )
+            .bind(app_id)
+            .bind(&outbox_buckets)
+            .execute(&mut *tx)
+            .await?;
+
+            let build = deployment.unwrap_or("");
+            sqlx::query(
+                "INSERT INTO bucket_windows (app_id, bucket_id, window_start, build, count)
+                 SELECT $1, bucket_id, date_trunc('hour', now()), $2, COUNT(*)::BIGINT
+                 FROM UNNEST($3::text[]) AS bucket_id GROUP BY bucket_id
+                 ON CONFLICT (app_id, bucket_id, window_start, build) DO UPDATE SET
+                   count=bucket_windows.count + EXCLUDED.count",
+            )
+            .bind(app_id)
+            .bind(build)
+            .bind(&bucket_ids)
+            .execute(&mut *tx)
+            .await?;
         }
 
         crate::db::artifacts::store_graphs(&mut tx, app_id, evidence).await?;
 
         tx.commit().await?;
         Ok(false)
+    }
+
+    pub async fn build_traffic(&self, app_id: &str) -> anyhow::Result<Vec<(String, u64, String)>> {
+        let rows = sqlx::query(
+            "SELECT build, count, first_seen FROM build_traffic
+             WHERE app_id=$1 ORDER BY first_seen, build",
+        )
+        .bind(app_id)
+        .fetch_all(self.pool.as_ref())
+        .await?;
+        metrics::counter!("database_rows_read_total", "query" => "build_traffic")
+            .increment(rows.len() as u64);
+        Ok(rows
+            .iter()
+            .map(|r| {
+                (
+                    r.get::<String, _>("build"),
+                    r.get::<i64, _>("count").max(0) as u64,
+                    r.get::<chrono::DateTime<chrono::Utc>, _>("first_seen")
+                        .to_rfc3339(),
+                )
+            })
+            .collect())
+    }
+
+    pub async fn bucket_rollups(&self, app_id: &str) -> anyhow::Result<Vec<BucketRollup>> {
+        let rows = sqlx::query(
+            "SELECT s.bucket_id, s.count, s.first_seen, s.last_seen,
+                    first.sig AS first_sig, first.message AS first_message,
+                    first.path AS first_path, first.context AS first_context,
+                    last.sig AS last_sig, last.message AS last_message,
+                    last.path AS last_path, last.context AS last_context
+             FROM bucket_summaries s
+             JOIN errors first ON first.id=s.first_error_id
+             JOIN errors last ON last.id=s.last_error_id
+             WHERE s.app_id=$1 ORDER BY s.first_seen, s.bucket_id",
+        )
+        .bind(app_id)
+        .fetch_all(self.pool.as_ref())
+        .await?;
+        metrics::counter!("database_rows_read_total", "query" => "bucket_rollups")
+            .increment(rows.len() as u64);
+        Ok(rows
+            .iter()
+            .map(|row| BucketRollup {
+                bucket_id: row.get("bucket_id"),
+                count: row.get::<i64, _>("count").max(0) as u64,
+                last_seen: row
+                    .get::<chrono::DateTime<chrono::Utc>, _>("last_seen")
+                    .to_rfc3339(),
+                oldest: prefixed_error(row, "first"),
+                newest: prefixed_error(row, "last"),
+            })
+            .collect())
+    }
+
+    pub async fn bucket_endpoints(
+        &self,
+        app_id: &str,
+        bucket_id: &str,
+    ) -> anyhow::Result<Option<(ErrorRec, ErrorRec)>> {
+        let row = sqlx::query(
+            "SELECT first.sig AS first_sig, first.message AS first_message,
+                    first.path AS first_path, first.context AS first_context,
+                    last.sig AS last_sig, last.message AS last_message,
+                    last.path AS last_path, last.context AS last_context
+             FROM bucket_summaries s
+             JOIN errors first ON first.id=s.first_error_id
+             JOIN errors last ON last.id=s.last_error_id
+             WHERE s.app_id=$1 AND s.bucket_id=$2",
+        )
+        .bind(app_id)
+        .bind(bucket_id)
+        .fetch_optional(self.pool.as_ref())
+        .await?;
+        Ok(row.map(|row| (prefixed_error(&row, "first"), prefixed_error(&row, "last"))))
+    }
+
+    pub async fn claim_integration_work(&self, limit: i64) -> anyhow::Result<Vec<IntegrationWork>> {
+        let rows = sqlx::query(
+            "UPDATE integration_outbox SET
+               attempts=attempts+1,
+               available_at=now() + make_interval(secs => LEAST(3600, 15 * (1 << LEAST(attempts, 8))))
+             WHERE id IN (
+               SELECT id FROM integration_outbox WHERE available_at <= now()
+               ORDER BY id FOR UPDATE SKIP LOCKED LIMIT $1
+             )
+             RETURNING id, app_id, bucket_id",
+        )
+        .bind(limit.clamp(1, 100))
+        .fetch_all(self.pool.as_ref())
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|row| IntegrationWork {
+                id: row.get("id"),
+                app_id: row.get("app_id"),
+                bucket_id: row.get("bucket_id"),
+            })
+            .collect())
+    }
+
+    pub async fn complete_integration_work(&self, id: i64) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM integration_outbox WHERE id=$1")
+            .bind(id)
+            .execute(self.pool.as_ref())
+            .await?;
+        Ok(())
+    }
+
+    pub async fn context_count_maps(
+        &self,
+        app_id: &str,
+    ) -> anyhow::Result<(
+        crate::ingest::cohorts::ContextCounts,
+        std::collections::HashMap<String, crate::ingest::cohorts::ContextCounts>,
+    )> {
+        let app_rows =
+            sqlx::query("SELECT key, value, count FROM app_context_counts WHERE app_id=$1")
+                .bind(app_id)
+                .fetch_all(self.pool.as_ref())
+                .await?;
+        let bucket_rows = sqlx::query(
+            "SELECT bucket_id, key, value, count
+             FROM bucket_context_counts WHERE app_id=$1",
+        )
+        .bind(app_id)
+        .fetch_all(self.pool.as_ref())
+        .await?;
+        let mut app_counts = crate::ingest::cohorts::ContextCounts::new();
+        for row in app_rows {
+            app_counts
+                .entry(row.get("key"))
+                .or_default()
+                .insert(row.get("value"), row.get::<i64, _>("count").max(0) as usize);
+        }
+        let mut buckets = std::collections::HashMap::new();
+        for row in bucket_rows {
+            let bucket: String = row.get("bucket_id");
+            buckets
+                .entry(bucket)
+                .or_insert_with(crate::ingest::cohorts::ContextCounts::new)
+                .entry(row.get("key"))
+                .or_default()
+                .insert(row.get("value"), row.get::<i64, _>("count").max(0) as usize);
+        }
+        Ok((app_counts, buckets))
+    }
+
+    pub async fn bucket_window_counts(
+        &self,
+        app_id: &str,
+    ) -> anyhow::Result<std::collections::HashMap<String, Vec<(String, Option<String>, u64)>>> {
+        let rows = sqlx::query(
+            "SELECT bucket_id, window_start, build, count
+             FROM bucket_windows WHERE app_id=$1 ORDER BY window_start, build",
+        )
+        .bind(app_id)
+        .fetch_all(self.pool.as_ref())
+        .await?;
+        let mut by_bucket = std::collections::HashMap::new();
+        for row in rows {
+            let build: String = row.get("build");
+            by_bucket
+                .entry(row.get("bucket_id"))
+                .or_insert_with(Vec::new)
+                .push((
+                    row.get::<chrono::DateTime<chrono::Utc>, _>("window_start")
+                        .to_rfc3339(),
+                    (!build.is_empty()).then_some(build),
+                    row.get::<i64, _>("count").max(0) as u64,
+                ));
+        }
+        Ok(by_bucket)
     }
 
     /// Drop consumed batch ids past the retry horizon.
@@ -254,6 +563,21 @@ impl TenantStore {
                 .fetch_one(&mut *tx)
                 .await?;
         if remaining == 0 {
+            sqlx::query("DELETE FROM bucket_summaries WHERE app_id=$1 AND bucket_id=$2")
+                .bind(app_id)
+                .bind(bucket_id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("DELETE FROM bucket_windows WHERE app_id=$1 AND bucket_id=$2")
+                .bind(app_id)
+                .bind(bucket_id)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query("DELETE FROM bucket_context_counts WHERE app_id=$1 AND bucket_id=$2")
+                .bind(app_id)
+                .bind(bucket_id)
+                .execute(&mut *tx)
+                .await?;
             sqlx::query("DELETE FROM replay_results WHERE app_id=$1 AND bucket_id=$2")
                 .bind(app_id)
                 .bind(bucket_id)
@@ -542,12 +866,15 @@ impl TenantStore {
     ) -> anyhow::Result<Option<i64>> {
         let mut tx = self.pool.begin().await?;
         if let Some(max) = max {
-            sqlx::query("SELECT pg_advisory_xact_lock(hashtext($1))")
-                .bind(app_id)
-                .execute(&mut *tx)
-                .await?;
+            sqlx::query(
+                "INSERT INTO app_storage_usage (app_id, bytes) VALUES ($1, 0)
+                 ON CONFLICT (app_id) DO NOTHING",
+            )
+            .bind(app_id)
+            .execute(&mut *tx)
+            .await?;
             let used: i64 = sqlx::query_scalar(
-                "SELECT COALESCE(SUM(bytes), 0)::BIGINT FROM evidence WHERE app_id=$1",
+                "SELECT bytes FROM app_storage_usage WHERE app_id=$1 FOR UPDATE",
             )
             .bind(app_id)
             .fetch_one(&mut *tx)
@@ -581,14 +908,21 @@ impl TenantStore {
         Ok(())
     }
 
-    pub async fn evidence_for(
+    /// Evidence for a whole bucket in one indexed query. Package reads commonly
+    /// contain hundreds or thousands of occurrences, most with no evidence; a
+    /// query per occurrence turns that empty case into an avoidable N+1.
+    pub async fn evidence_for_many(
         &self,
-        error_id: i64,
+        error_ids: &[i64],
     ) -> anyhow::Result<Vec<(String, String, i64, String)>> {
+        if error_ids.is_empty() {
+            return Ok(Vec::new());
+        }
         let rows = sqlx::query(
-            "SELECT kind, storage_key, bytes, created_at FROM evidence WHERE error_id=$1 ORDER BY id",
+            "SELECT kind, storage_key, bytes, created_at
+             FROM evidence WHERE error_id = ANY($1) ORDER BY error_id, id",
         )
-        .bind(error_id)
+        .bind(error_ids)
         .fetch_all(self.pool.as_ref())
         .await?;
         Ok(rows

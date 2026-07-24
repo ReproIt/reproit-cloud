@@ -120,6 +120,7 @@ fn bucket_package_exposes_bucket_first_replay_shape() {
         "bkt_deadbeef0001",
         &newest,
         &oldest,
+        &newest,
         2,
         &discriminators,
         evidence,

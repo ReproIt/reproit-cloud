@@ -14,7 +14,6 @@ const EXPORT_PAGE: i64 = 1000;
 ///   3. error rows within the retention window, oldest first (`"kind":"error"`),
 ///   4. evidence blob KEYS (`"kind":"evidence"`; bytes stay in object storage,
 ///      fetch each via `GET /v1/blob/<key>`).
-///   5. human-authored original captures and their immutable file keys.
 ///
 /// The body is produced by a spawned task paging the tenant DB with keyset
 /// reads and writing lines into a bounded channel, so an export never
@@ -30,11 +29,11 @@ pub async fn get_export(
         Ok(t) => t,
         Err(e) => return e.into_response(),
     };
-    // Hosted: bound the export to the plan's retention window; rows past it
-    // are already queued for deletion, and an export must not resurrect data
-    // the retention contract says is gone. Self-host owns its retention, so it
-    // exports everything.
-    let days = None;
+    // Bound the export to the edition's retention window (hosted: the plan's;
+    // rows past it are already queued for deletion, and an export must not
+    // resurrect data the retention contract says is gone). A None means the
+    // operator owns retention, so the export covers everything.
+    let days = app.policy.retention_days(tenant.org_id).await;
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<String, std::io::Error>>(8);
     tokio::spawn(export_stream(tenant, app_id, days, tx));
     (

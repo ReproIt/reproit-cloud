@@ -434,6 +434,17 @@ pub async fn run() -> anyhow::Result<()> {
         }
     }
 
+    // Finish any tenant stuck mid-provision from a prior crash (idempotent;
+    // a no-op when nothing is pending).
+    {
+        let tenancy = app.tenancy.clone();
+        tokio::spawn(async move {
+            if let Err(error) = tenancy.reconcile().await {
+                tracing::warn!("background tenant reconcile failed: {error}");
+            }
+        });
+    }
+
     spawn_background_sweeps(app.clone());
     // Proactive regression sweep: periodically re-evaluate prod-truth for every
     // anchored bucket and log status TRANSITIONS to the durable alert table. Runs

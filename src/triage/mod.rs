@@ -146,36 +146,21 @@ pub fn seat_decision(signed_in: bool, has_seat: bool) -> SeatVerdict {
 ///
 /// The `repro` summary is computed by the same `buckets::repro_status` the bucket
 /// list uses, so the seat view and the API agree.
-pub struct BucketDetail<'a> {
-    pub app_id: &'a str,
-    pub bucket_id: &'a str,
-    pub newest: &'a crate::ingest::ErrorRec,
-    pub oldest: &'a crate::ingest::ErrorRec,
-    pub sample: Option<&'a str>,
-    pub count: usize,
-    pub discriminators: Vec<Value>,
-    pub cohorts: Vec<Value>,
-    pub repro: Value,
-    pub ticket: Option<Value>,
-    pub triage: Option<&'a Triage>,
-    pub resolution: &'a resolution::Outcome,
-}
-
-pub fn bucket_detail(detail: BucketDetail<'_>) -> Value {
-    let BucketDetail {
-        app_id,
-        bucket_id,
-        newest,
-        oldest,
-        sample,
-        count,
-        discriminators,
-        cohorts,
-        repro,
-        ticket,
-        triage,
-        resolution,
-    } = detail;
+#[allow(clippy::too_many_arguments)]
+pub fn bucket_detail(
+    app_id: &str,
+    bucket_id: &str,
+    newest: &crate::ingest::ErrorRec,
+    oldest: &crate::ingest::ErrorRec,
+    sample: Option<&str>,
+    count: usize,
+    discriminators: Vec<Value>,
+    cohorts: Vec<Value>,
+    repro: Value,
+    ticket: Option<Value>,
+    triage: Option<&Triage>,
+    resolution: &resolution::Outcome,
+) -> Value {
     // A bucket with no triage row is implicitly `untriaged`, never touched.
     let (status, updated_at) = match triage {
         Some(t) => (t.status.clone(), Value::from(t.updated_at.clone())),
@@ -244,6 +229,28 @@ async fn compute_resolution(
     bucket: &str,
     fixed_in_build: Option<&str>,
 ) -> resolution::Outcome {
+    let bug: Vec<resolution::Occurrence> = store
+        .errors_for_bucket(app_id, bucket, crate::ingest::baseline_sample())
+        .await
+        .unwrap_or_default()
+        .iter()
+        .map(|(_, at, rec)| resolution::Occurrence {
+            at: at.clone(),
+            build: buckets::build_version(rec),
+        })
+        .collect();
+    compute_resolution_for_occurrences(store, app_id, fixed_in_build, &bug).await
+}
+
+async fn compute_resolution_for_occurrences(
+    store: &crate::db::TenantStore,
+    app_id: &str,
+    fixed_in_build: Option<&str>,
+    bug: &[resolution::Occurrence],
+) -> resolution::Outcome {
+    // Accepted SDK batches are the production-traffic denominator. Fall back to
+    // the historical error stream for tenants created before build traffic was
+    // recorded.
     let traffic_rows = store.build_traffic(app_id).await.unwrap_or_default();
     let weighted_traffic: Vec<(resolution::Occurrence, u64)> = traffic_rows
         .iter()
@@ -263,29 +270,17 @@ async fn compute_resolution(
             .await
             .unwrap_or_default()
             .iter()
-            .map(|(_, at, record)| resolution::Occurrence {
+            .map(|(_, at, rec)| resolution::Occurrence {
                 at: at.clone(),
-                build: buckets::build_version(record),
+                build: buckets::build_version(rec),
             })
             .collect()
     } else {
         weighted_traffic
             .iter()
-            .map(|(occurrence, _)| occurrence.clone())
+            .map(|(occ, _)| occ.clone())
             .collect()
     };
-    // This bucket's own occurrences (the recurrence signal), via the
-    // materialized bucket_id index.
-    let bug: Vec<resolution::Occurrence> = store
-        .errors_for_bucket(app_id, bucket, crate::ingest::baseline_sample())
-        .await
-        .unwrap_or_default()
-        .iter()
-        .map(|(_, at, rec)| resolution::Occurrence {
-            at: at.clone(),
-            build: buckets::build_version(rec),
-        })
-        .collect();
     let first_seen = resolution::first_seen_by_build(&app_stream);
     let traffic = fixed_in_build
         .map(|f| {
@@ -298,12 +293,12 @@ async fn compute_resolution(
         .unwrap_or(0);
     let now = chrono::Utc::now().to_rfc3339();
     resolution::evaluate(
-        &bug,
+        bug,
         &first_seen,
         fixed_in_build,
         traffic,
         &now,
-        resolution::Thresholds::default(),
+        resolution::Thresholds::configured(),
     )
 }
 
@@ -385,7 +380,7 @@ async fn authorize_app(
             None
         } else {
             match app.control.org_for_api_key(&token).await {
-                Ok(Some((org_id, _project, _user))) => Some(org_id),
+                Ok(Some((org_id, _plan, _project, _user))) => Some(org_id),
                 Ok(None) => None,
                 Err(e) => {
                     tracing::error!("org_for_api_key lookup failed: {e}");
@@ -528,7 +523,7 @@ pub async fn post_triage(
     Path((app_id, bucket)): Path<(String, String)>,
     Json(body): Json<TriageUpdate>,
 ) -> Response {
-    let (tenant, _org_id) = match authorize_app(&app, &headers, &app_id).await {
+    let (tenant, org_id) = match authorize_app(&app, &headers, &app_id).await {
         Ok(x) => x,
         Err(resp) => return resp,
     };
@@ -572,6 +567,9 @@ pub async fn post_triage(
     {
         tracing::error!("upsert_triage failed for {bucket}: {e}");
         return err(StatusCode::INTERNAL_SERVER_ERROR, "internal error");
+    }
+    if fixed_in_build.is_some() {
+        app.policy.on_tenant_activity(org_id, "resolution").await;
     }
     Json(json!({
         "bucketId": bucket,
@@ -671,22 +669,54 @@ pub async fn get_bucket_detail(
     // Compute the prod-evidence truth against the bucket's claimed fix anchor (if
     // any). On-read evaluation: the resolution is always live, never stale.
     let fixed = triage.as_ref().and_then(|t| t.fixed_in_build.clone());
-    let resolution = compute_resolution(&tenant.store, &app_id, &bucket, fixed.as_deref()).await;
-    Json(bucket_detail(BucketDetail {
-        app_id: &app_id,
-        bucket_id: &bucket,
-        newest: &newest,
-        oldest: &oldest,
+    let occurrences: Vec<resolution::Occurrence> = rows
+        .iter()
+        .map(|(_, at, record)| resolution::Occurrence {
+            at: at.clone(),
+            build: buckets::build_version(record),
+        })
+        .collect();
+    let resolution =
+        compute_resolution_for_occurrences(&tenant.store, &app_id, fixed.as_deref(), &occurrences)
+            .await;
+    let series: Vec<(String, Option<String>)> = occurrences
+        .iter()
+        .map(|occurrence| (occurrence.at.clone(), occurrence.build.clone()))
+        .collect();
+    let timeline = buckets::timeline(&series, 300);
+    let mut detail = bucket_detail(
+        &app_id,
+        &bucket,
+        &newest,
+        &oldest,
         sample,
         count,
         discriminators,
         cohorts,
         repro,
         ticket,
-        triage: triage.as_ref(),
-        resolution: &resolution,
-    }))
-    .into_response()
+        triage.as_ref(),
+        &resolution,
+    );
+    detail["timeline"] = json!({
+        "bucketId": bucket,
+        "appId": app_id,
+        "windowSecs": 300,
+        "series": timeline.cells,
+        "total": timeline.total,
+        "resolution": resolution.to_json(),
+    });
+    let encoded = serde_json::to_vec(&detail).unwrap_or_default();
+    use sha2::{Digest, Sha256};
+    let etag = format!("\"{:x}\"", Sha256::digest(&encoded));
+    if headers
+        .get(axum::http::header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        == Some(etag.as_str())
+    {
+        return StatusCode::NOT_MODIFIED.into_response();
+    }
+    ([(axum::http::header::ETAG, etag)], Json(detail)).into_response()
 }
 
 /// DELETE /v1/apps/:app/buckets/:bucket/sample clears only the bundled

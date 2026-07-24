@@ -245,7 +245,7 @@ async fn sweep_bucket(
     org_id: i64,
     now: &str,
 ) -> anyhow::Result<u64> {
-    let outcome =
+    let (outcome, regression_build) =
         compute_for_bucket(store, &b.app_id, &b.bucket_id, &b.fixed_in_build, now).await?;
     let current = outcome.status.as_str();
     let prev = store
@@ -295,6 +295,23 @@ async fn sweep_bucket(
                 });
             }
         }
+        if current == "resolved" {
+            crate::integrations::close_ticket_on_fix(
+                store,
+                &b.app_id,
+                &b.bucket_id,
+                Some(&b.fixed_in_build),
+            )
+            .await;
+        } else if current == "regressed" {
+            crate::integrations::reopen_ticket_on_regression(
+                store,
+                &b.app_id,
+                &b.bucket_id,
+                regression_build.as_deref(),
+            )
+            .await;
+        }
     }
     // Persist the current status last (the baseline the NEXT pass diffs against),
     // so a failure recording the event doesn't advance the baseline past it.
@@ -314,7 +331,7 @@ async fn compute_for_bucket(
     bucket: &str,
     fixed_in_build: &str,
     now: &str,
-) -> anyhow::Result<resolution::Outcome> {
+) -> anyhow::Result<(resolution::Outcome, Option<String>)> {
     let traffic_rows = store.build_traffic(app_id).await?;
     let weighted_traffic: Vec<(resolution::Occurrence, u64)> = traffic_rows
         .iter()
@@ -333,15 +350,15 @@ async fn compute_for_bucket(
             .recent_errors_with_meta(app_id, crate::ingest::baseline_sample())
             .await?
             .iter()
-            .map(|(_, at, record)| resolution::Occurrence {
+            .map(|(_, at, rec)| resolution::Occurrence {
                 at: at.clone(),
-                build: buckets::build_version(record),
+                build: buckets::build_version(rec),
             })
             .collect()
     } else {
         weighted_traffic
             .iter()
-            .map(|(occurrence, _)| occurrence.clone())
+            .map(|(occ, _)| occ.clone())
             .collect()
     };
     let bug: Vec<resolution::Occurrence> = store
@@ -359,19 +376,60 @@ async fn compute_for_bucket(
     } else {
         resolution::post_fix_build_traffic(&weighted_traffic, fixed_in_build)
     };
-    Ok(resolution::evaluate(
+    let outcome = resolution::evaluate(
         &bug,
         &first_seen,
         Some(fixed_in_build),
         traffic,
         now,
         resolution::Thresholds::configured(),
-    ))
+    );
+    let regression_build = latest_post_fix_build(&bug, &first_seen, fixed_in_build);
+    Ok((outcome, regression_build))
+}
+
+fn latest_post_fix_build(
+    bug: &[resolution::Occurrence],
+    first_seen: &std::collections::BTreeMap<String, i64>,
+    fixed_in_build: &str,
+) -> Option<String> {
+    let fix_epoch = *first_seen.get(fixed_in_build)?;
+    bug.iter()
+        .filter_map(|occurrence| {
+            let build = occurrence.build.as_deref()?;
+            let epoch = chrono::DateTime::parse_from_rfc3339(&occurrence.at)
+                .ok()?
+                .timestamp();
+            let build_epoch = *first_seen.get(build)?;
+            (epoch >= fix_epoch && (build == fixed_in_build || build_epoch >= fix_epoch))
+                .then_some((epoch, build.to_string()))
+        })
+        .max_by_key(|(epoch, _)| *epoch)
+        .map(|(_, build)| build)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn regression_notification_names_the_actual_recurring_build() {
+        let bug = vec![
+            resolution::Occurrence {
+                at: "2026-07-16T20:00:00Z".into(),
+                build: Some("fixed".into()),
+            },
+            resolution::Occurrence {
+                at: "2026-07-16T21:00:00Z".into(),
+                build: Some("regressed".into()),
+            },
+        ];
+        let first_seen = resolution::first_seen_by_build(&bug);
+        assert_eq!(
+            latest_post_fix_build(&bug, &first_seen, "fixed").as_deref(),
+            Some("regressed")
+        );
+    }
 
     #[test]
     fn first_observation_seeds_the_baseline_without_an_event() {

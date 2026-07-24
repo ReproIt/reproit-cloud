@@ -170,20 +170,20 @@ fn bucket_detail_bundles_everything_a_dev_needs_to_grab_a_bug() {
         last_seen_on_fixed_build: None,
         post_fix_occurrences: 0,
     };
-    let d = bucket_detail(BucketDetail {
-        app_id: "acme-web",
-        bucket_id: bid,
-        newest: &newest,
-        oldest: &oldest,
-        sample: None,
-        count: 3,
-        discriminators: discs.clone(),
-        cohorts: cohorts.clone(),
-        repro: repro.clone(),
-        ticket: ticket.clone(),
-        triage: Some(&triage),
-        resolution: &res,
-    });
+    let d = bucket_detail(
+        "acme-web",
+        bid,
+        &newest,
+        &oldest,
+        None,
+        3,
+        discs.clone(),
+        cohorts.clone(),
+        repro.clone(),
+        ticket.clone(),
+        Some(&triage),
+        &res,
+    );
 
     // Identity + the reproduce command a dev runs to grab it.
     assert_eq!(d["bucketId"], bid);
@@ -218,20 +218,20 @@ fn bucket_detail_defaults_to_implicit_untriaged_with_no_triage_or_ticket() {
         last_seen_on_fixed_build: None,
         post_fix_occurrences: 0,
     };
-    let d = bucket_detail(BucketDetail {
-        app_id: "app",
-        bucket_id: "bkt_x",
-        newest: &r,
-        oldest: &r,
-        sample: None,
-        count: 1,
-        discriminators: Vec::new(),
-        cohorts: Vec::new(),
+    let d = bucket_detail(
+        "app",
+        "bkt_x",
+        &r,
+        &r,
+        None,
+        1,
+        Vec::new(),
+        Vec::new(),
         repro,
-        ticket: None,
-        triage: None,
-        resolution: &res,
-    });
+        None,
+        None,
+        &res,
+    );
     // A never-touched bucket reads as `untriaged`, no ticket.
     assert_eq!(d["triage"]["status"], "untriaged");
     assert_eq!(d["triage"]["updatedAt"], Value::Null);

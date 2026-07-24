@@ -8,12 +8,11 @@
 //!     issue carrying the PII-safe repro package (bucket id, crash signature,
 //!     normalized message, replay action list, lineage, and the local
 //!     direct `reproit bkt_...` command), and persist the link.
-//!   - **close-on-fix**: when a replay-result flips a bucket to FIXED (a posted
-//!     result whose verdict says the bug no longer reproduces), auto-comment +
-//!     close the linked ticket with proof.
+//!   - **automatic resolution**: CI verifies a candidate fix, production
+//!     evidence closes the linked ticket, and recurrence reopens it.
 //!
 //! The provider behind a link is a small `Tracker` trait (create_issue /
-//! comment / close), so GitHub/Jira/Linear/Shortcut plug into the same
+//! comment / close / reopen), so GitHub/Jira/Linear/Shortcut plug into the same
 //! buckets/replay-results flow. The DB link
 //! (`bucket_tickets(app, bucket_id, provider, repo, external_id, url)`) lives in
 //! `db::integrations`; the GitHub REST client in `github`. Everything here is
@@ -38,8 +37,9 @@ use shortcut::ShortcutTracker;
 /// impl, no change to the buckets/replay-results flow:
 ///   - `create_issue` files a new ticket from a PII-safe body, returns its
 ///     provider-native id + url (what we persist into `bucket_tickets`).
-///   - `comment` posts the verified-fix proof onto the linked ticket.
-///   - `close` transitions it to the provider's terminal/closed state.
+///   - `comment` posts CI and production evidence onto the linked ticket.
+///   - `close` transitions it after production confirmation.
+///   - `reopen` restores it when the same structural bug recurs.
 ///
 /// Async-trait-free (returns boxed futures via `async fn` in trait, stabilized
 /// since Rust 1.75) to match the codebase's plain-`async fn` style.
@@ -55,6 +55,11 @@ pub trait Tracker {
     async fn comment(&self, external_id: &str, body: &str) -> anyhow::Result<()>;
     /// Close an existing issue (transition to the provider's closed state).
     async fn close(&self, external_id: &str) -> anyhow::Result<()>;
+    /// Reopen a previously closed issue. Providers without a portable reopen
+    /// transition may leave it unchanged after the regression comment.
+    async fn reopen(&self, _external_id: &str) -> anyhow::Result<()> {
+        anyhow::bail!("provider does not support automatic reopen")
+    }
 }
 
 pub enum ConfiguredTracker {
@@ -107,6 +112,15 @@ impl ConfiguredTracker {
             Self::Jira(t) => t.close(external_id).await,
             Self::Linear(t) => t.close(external_id).await,
             Self::Shortcut(t) => t.close(external_id).await,
+        }
+    }
+
+    async fn reopen(&self, external_id: &str) -> anyhow::Result<()> {
+        match self {
+            Self::Github(t) => t.reopen(external_id).await,
+            Self::Jira(t) => t.reopen(external_id).await,
+            Self::Linear(t) => t.reopen(external_id).await,
+            Self::Shortcut(t) => t.reopen(external_id).await,
         }
     }
 }
@@ -343,26 +357,46 @@ pub fn issue_body(
          reproit {bucket_id}\n\
          ```\n\
          reproit will download the replay package, synthesize a PII-safe fixture, replay the \
-         actions deterministically, and post the verdict back. When it confirms the bug no \
-         longer reproduces, reproit will comment the proof here and close this issue.",
+         actions deterministically, and post the verdict back. A clean pull request verifies \
+         the candidate fix. This issue closes only after that commit is deployed and production \
+         confirms the bug stays gone.",
         crash = newest.sig,
         msg = buckets::normalized_message(newest),
     );
     (title, body)
 }
 
-/// PII-safe comment posted onto the linked ticket when a bucket is verified
-/// fixed. References only the bucket id and the build it was confirmed on (no
-/// user data), matching the brief's "reproit confirmed bucket <id> no longer
-/// reproduces as of <build>".
+/// PII-safe comment posted when production confirms the candidate fixed build.
 pub fn fix_comment(bucket_id: &str, build: Option<&str>) -> String {
     match build {
         Some(b) => format!(
-            "reproit confirmed bucket `{bucket_id}` no longer reproduces as of `{b}`. \
-             Closing automatically."
+            "reproit confirmed in production that bucket `{bucket_id}` stays gone after build `{b}`. Closing automatically."
         ),
         None => format!(
-            "reproit confirmed bucket `{bucket_id}` no longer reproduces. Closing automatically."
+            "reproit confirmed in production that bucket `{bucket_id}` stays gone. Closing automatically."
+        ),
+    }
+}
+
+pub fn fix_verified_comment(bucket_id: &str, build: Option<&str>) -> String {
+    match build {
+        Some(build) => format!(
+            "reproit verified the fix for bucket `{bucket_id}` on commit `{build}`. \
+             The issue will close after that build is deployed and production confirms the bug stays gone."
+        ),
+        None => format!(
+            "reproit verified the fix for bucket `{bucket_id}` in CI. The issue will close after deployment and production confirmation."
+        ),
+    }
+}
+
+pub fn regression_comment(bucket_id: &str, build: Option<&str>) -> String {
+    match build {
+        Some(build) => format!(
+            "reproit detected bucket `{bucket_id}` again in production on build `{build}`. The fix has regressed."
+        ),
+        None => format!(
+            "reproit detected bucket `{bucket_id}` again in production. The fix has regressed."
         ),
     }
 }
@@ -438,6 +472,55 @@ pub async fn file_issue_for_bucket(
     Some(url)
 }
 
+pub async fn drain_outbox(store: crate::db::TenantStore) {
+    let work = match store.claim_integration_work(20).await {
+        Ok(work) => work,
+        Err(error) => {
+            tracing::warn!("integration outbox claim failed: {error}");
+            return;
+        }
+    };
+    for item in work {
+        let configured = is_configured_for(&store, &item.app_id).await;
+        if !configured {
+            let _ = store.complete_integration_work(item.id).await;
+            continue;
+        }
+        let endpoints = match store.bucket_endpoints(&item.app_id, &item.bucket_id).await {
+            Ok(Some(endpoints)) => endpoints,
+            Ok(None) => {
+                let _ = store.complete_integration_work(item.id).await;
+                continue;
+            }
+            Err(error) => {
+                tracing::warn!("integration outbox bucket read failed: {error}");
+                continue;
+            }
+        };
+        if crate::ingest::buckets::is_tester_capture(&endpoints.1) {
+            let _ = store.complete_integration_work(item.id).await;
+            continue;
+        }
+        let _ = file_issue_for_bucket(
+            &store,
+            &item.app_id,
+            &item.bucket_id,
+            &endpoints.0,
+            &endpoints.1,
+        )
+        .await;
+        if store
+            .ticket_for_bucket(&item.app_id, &item.bucket_id)
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            let _ = store.complete_integration_work(item.id).await;
+        }
+    }
+}
+
 /// close-on-fix hook: comment the verified-fix proof onto the linked ticket and
 /// close it. No-op if the app is unconfigured or the bucket has no linked ticket
 /// (nothing to close). `build` is the build the fix was confirmed on, for proof.
@@ -475,6 +558,65 @@ pub async fn close_ticket_on_fix(
         tracker.provider(),
         link.external_id
     );
+}
+
+pub async fn comment_ticket_fix_verified(
+    store: &crate::db::TenantStore,
+    app_id: &str,
+    bucket_id: &str,
+    build: Option<&str>,
+) {
+    let Some(tracker) = resolve_for(store, app_id).await else {
+        return;
+    };
+    let link = match store.ticket_for_bucket(app_id, bucket_id).await {
+        Ok(Some(link)) => link,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!("ticket_for_bucket lookup failed for {bucket_id}: {e}");
+            return;
+        }
+    };
+    if let Err(e) = tracker
+        .comment(&link.external_id, &fix_verified_comment(bucket_id, build))
+        .await
+    {
+        tracing::warn!(
+            "fix-verification comment failed on issue {}: {e}",
+            link.external_id
+        );
+    }
+}
+
+pub async fn reopen_ticket_on_regression(
+    store: &crate::db::TenantStore,
+    app_id: &str,
+    bucket_id: &str,
+    build: Option<&str>,
+) {
+    let Some(tracker) = resolve_for(store, app_id).await else {
+        return;
+    };
+    let link = match store.ticket_for_bucket(app_id, bucket_id).await {
+        Ok(Some(link)) => link,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!("ticket_for_bucket lookup failed for {bucket_id}: {e}");
+            return;
+        }
+    };
+    if let Err(e) = tracker
+        .comment(&link.external_id, &regression_comment(bucket_id, build))
+        .await
+    {
+        tracing::warn!(
+            "regression comment failed on issue {}: {e}",
+            link.external_id
+        );
+    }
+    if let Err(e) = tracker.reopen(&link.external_id).await {
+        tracing::warn!("reopen failed on issue {}: {e}", link.external_id);
+    }
 }
 
 // ---- self-serve config surface: GET/PUT /v1/apps/:app/integrations ----------
@@ -817,10 +959,18 @@ mod tests {
         let with = fix_comment("bkt_abc", Some("1.4.5"));
         assert!(with.contains("bkt_abc"));
         assert!(with.contains("1.4.5"));
-        assert!(with.contains("no longer reproduces"));
+        assert!(with.contains("confirmed in production"));
         let without = fix_comment("bkt_abc", None);
         assert!(without.contains("bkt_abc"));
-        assert!(without.contains("no longer reproduces"));
+        assert!(without.contains("confirmed in production"));
+
+        let verified = fix_verified_comment("bkt_abc", Some("deadbeef"));
+        assert!(verified.contains("verified the fix"));
+        assert!(verified.contains("after that build is deployed"));
+
+        let regressed = regression_comment("bkt_abc", Some("badc0de"));
+        assert!(regressed.contains("again in production"));
+        assert!(regressed.contains("regressed"));
     }
 
     #[test]

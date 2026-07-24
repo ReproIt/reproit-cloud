@@ -1,3 +1,5 @@
+//! Triage, ticket linkage, and resolution transition operations.
+
 use super::*;
 
 impl TenantStore {
@@ -63,7 +65,15 @@ impl TenantStore {
              VALUES ($1,$2,$3,$4, now())
              ON CONFLICT (app_id, bucket_id) DO UPDATE
                SET status = EXCLUDED.status,
-                   fixed_in_build = COALESCE(bucket_triage.fixed_in_build, EXCLUDED.fixed_in_build),
+                   fixed_in_build = CASE
+                     WHEN EXISTS (
+                       SELECT 1 FROM bucket_resolution_status r
+                       WHERE r.app_id = EXCLUDED.app_id
+                         AND r.bucket_id = EXCLUDED.bucket_id
+                         AND r.status = 'regressed'
+                     ) THEN EXCLUDED.fixed_in_build
+                     ELSE COALESCE(bucket_triage.fixed_in_build, EXCLUDED.fixed_in_build)
+                   END,
                    updated_at = now()
              WHERE bucket_triage.status <> 'wontfix'",
         )

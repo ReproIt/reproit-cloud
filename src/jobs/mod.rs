@@ -212,4 +212,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&outside);
     }
+
+    #[test]
+    fn job_spec_rejects_unbounded_work() {
+        let valid = |seeds, budget| JobSpec {
+            app_dir: ".".into(),
+            mode: "fuzz".into(),
+            seeds,
+            budget,
+            backend: "web".into(),
+        };
+        assert!(valid(1, 1).validate().is_ok());
+        assert!(valid(MAX_JOB_SEEDS, MAX_JOB_BUDGET).validate().is_ok());
+        assert!(valid(0, 1).validate().is_err());
+        assert!(valid(MAX_JOB_SEEDS + 1, 1).validate().is_err());
+        assert!(valid(1, 0).validate().is_err());
+        assert!(valid(1, MAX_JOB_BUDGET + 1).validate().is_err());
+    }
 }

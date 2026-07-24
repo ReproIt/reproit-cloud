@@ -4,30 +4,6 @@ use super::*;
 
 // ---- buckets: stable, content-addressed error identity --------------------
 
-/// Group capped-scan rows by their STORED bucket id (materialized at insert).
-/// Rows written before materialization carry NULL and fall back to recomputing
-/// with the same pure fn, so the two can never disagree. Preserves first-seen
-/// order like `buckets::group`.
-fn group_stored(occ: &[(i64, String, ErrorRec, Option<String>)]) -> Vec<(String, Vec<usize>)> {
-    let mut order: Vec<String> = Vec::new();
-    let mut by_bucket: std::collections::HashMap<String, Vec<usize>> = Default::default();
-    for (i, (_, _, rec, stored)) in occ.iter().enumerate() {
-        let bid = stored.clone().unwrap_or_else(|| buckets::bucket_id(rec));
-        let entry = by_bucket.entry(bid.clone()).or_default();
-        if entry.is_empty() {
-            order.push(bid);
-        }
-        entry.push(i);
-    }
-    order
-        .into_iter()
-        .map(|bid| {
-            let idxs = by_bucket.remove(&bid).unwrap_or_default();
-            (bid, idxs)
-        })
-        .collect()
-}
-
 /// Resolve stored evidence rows for a set of error ids into serializable records
 /// with fetch urls. Used by bucket evidence/package reads.
 pub(super) async fn resolve_evidence(
@@ -35,17 +11,15 @@ pub(super) async fn resolve_evidence(
     error_ids: &[i64],
 ) -> anyhow::Result<Vec<EvidenceRec>> {
     let mut out = Vec::new();
-    for &id in error_ids {
-        for (kind, key, bytes, ts) in tenant.store.evidence_for(id).await? {
-            let url = tenant.blobs.url_for(&key).await?;
-            out.push(EvidenceRec {
-                kind,
-                key,
-                bytes,
-                ts,
-                url,
-            });
-        }
+    for (kind, key, bytes, ts) in tenant.store.evidence_for_many(error_ids).await? {
+        let url = tenant.blobs.url_for(&key).await?;
+        out.push(EvidenceRec {
+            kind,
+            key,
+            bytes,
+            ts,
+            url,
+        });
     }
     Ok(out)
 }
@@ -93,23 +67,10 @@ pub async fn get_buckets(
 /// resolution cannot drift.
 pub(crate) async fn bucket_list_for_tenant(tenant: &Tenant, app_id: &str) -> anyhow::Result<Value> {
     use crate::triage::resolution;
-    // Bounded grouping scan: cap how many error rows we materialize. When the cap
-    // is hit we LOG how many rows were dropped (never silent truncation); bucket
-    // COUNTS stay exact for every occurrence inside the window, only the newest
-    // tail beyond the cap is excluded.
-    let (occ, dropped) = tenant
-        .store
-        .errors_with_meta_capped(app_id, max_error_scan())
-        .await?;
-    if dropped > 0 {
-        tracing::warn!(
-            "get_buckets: error scan for {app_id} hit the cap; {dropped} most-recent rows excluded \
-             from bucket grouping (raise REPROIT_MAX_ERROR_SCAN to include them)"
-        );
-    }
-    let baseline: Vec<Map<String, Value>> =
-        occ.iter().map(|(_, _, r, _)| r.context.clone()).collect();
-    let groups = group_stored(&occ);
+    let rollups = tenant.store.bucket_rollups(app_id).await?;
+    let baseline_n = rollups.iter().map(|rollup| rollup.count).sum::<u64>() as usize;
+    let (baseline_counts, mut counts_by_bucket) = tenant.store.context_count_maps(app_id).await?;
+    let mut windows_by_bucket = tenant.store.bucket_window_counts(app_id).await?;
 
     // Batch the two per-bucket reads (folds the N+1): ALL replay results and ALL
     // triage rows for this app in ONE round-trip each, then look each bucket up in
@@ -117,26 +78,41 @@ pub(crate) async fn bucket_list_for_tenant(tenant: &Tenant, app_id: &str) -> any
     let results_by_bucket = tenant.store.replay_results_by_bucket(app_id).await?;
     let triage_by_bucket = tenant.store.triage_all_for_app(app_id).await?;
 
-    // App-wide first-seen-by-build map: the build-ordering anchor the resolution
-    // engine segments against. Computed ONCE over the whole stream and reused for
-    // every bucket (the regressed/resolved boost feeds the impact actionability).
-    let app_stream: Vec<resolution::Occurrence> = occ
+    // Accepted SDK batches provide the deployment ordering and production
+    // traffic. Fall back to errors for tenants that predate build traffic.
+    let traffic_rows = tenant.store.build_traffic(app_id).await?;
+    let weighted_traffic: Vec<(resolution::Occurrence, u64)> = traffic_rows
         .iter()
-        .map(|(_, at, rec, _)| resolution::Occurrence {
-            at: at.clone(),
-            build: buckets::build_version(rec),
+        .map(|(build, count, at)| {
+            (
+                resolution::Occurrence {
+                    at: at.clone(),
+                    build: Some(build.clone()),
+                },
+                *count,
+            )
         })
+        .collect();
+    let app_stream: Vec<resolution::Occurrence> = weighted_traffic
+        .iter()
+        .map(|(occurrence, _)| occurrence.clone())
         .collect();
     let first_seen = resolution::first_seen_by_build(&app_stream);
     let now = chrono::Utc::now().to_rfc3339();
 
-    let mut items: Vec<(f64, String, Value)> = Vec::with_capacity(groups.len());
+    let mut items: Vec<(f64, String, Value)> = Vec::with_capacity(rollups.len());
     let mut pending_captures: Vec<(f64, String, Value)> = Vec::new();
-    for (bid, idxs) in &groups {
-        let oldest = &occ[idxs[0]].2;
-        let newest = &occ[*idxs.last().unwrap()].2;
-        let cohort: Vec<Map<String, Value>> =
-            idxs.iter().map(|&i| occ[i].2.context.clone()).collect();
+    for rollup in rollups {
+        let bid = &rollup.bucket_id;
+        let oldest = &rollup.oldest;
+        let newest = &rollup.newest;
+        let cohort_counts = counts_by_bucket.remove(bid).unwrap_or_default();
+        let discriminators = cohorts::discriminators_from_counts(
+            rollup.count as usize,
+            &cohort_counts,
+            baseline_n,
+            &baseline_counts,
+        );
         let results = results_by_bucket.get(bid).cloned().unwrap_or_default();
         let tester_capture = buckets::is_tester_capture(newest);
         let capture_confirmed = buckets::tester_capture_confirmed(&results);
@@ -147,16 +123,17 @@ pub(crate) async fn bucket_list_for_tenant(tenant: &Tenant, app_id: &str) -> any
         // The SAME pure engine the on-read detail path uses (no logic fork). The
         // bug's own occurrence stream is this bucket's; the anchor + traffic come
         // from the app-wide stream.
-        let bug: Vec<resolution::Occurrence> = idxs
+        let window_counts = windows_by_bucket.remove(bid).unwrap_or_default();
+        let bug: Vec<resolution::Occurrence> = window_counts
             .iter()
-            .map(|&i| resolution::Occurrence {
-                at: occ[i].1.clone(),
-                build: buckets::build_version(&occ[i].2),
+            .map(|(at, build, _)| resolution::Occurrence {
+                at: at.clone(),
+                build: build.clone(),
             })
             .collect();
         let traffic = fixed
             .as_deref()
-            .map(|f| resolution::post_fix_traffic(&app_stream, f))
+            .map(|f| resolution::post_fix_build_traffic(&weighted_traffic, f))
             .unwrap_or(0);
         let outcome = resolution::evaluate(
             &bug,
@@ -164,16 +141,12 @@ pub(crate) async fn bucket_list_for_tenant(tenant: &Tenant, app_id: &str) -> any
             fixed.as_deref(),
             traffic,
             &now,
-            resolution::Thresholds::default(),
+            resolution::Thresholds::configured(),
         );
 
         // The occurrence time-series (for trend/velocity + frequency) + last-seen.
-        let series: Vec<(String, Option<String>)> = idxs
-            .iter()
-            .map(|&i| (occ[i].1.clone(), buckets::build_version(&occ[i].2)))
-            .collect();
-        let timeline = buckets::timeline(&series, buckets::DEFAULT_TIMELINE_WINDOW_SECS);
-        let last_seen = idxs.last().map(|&i| occ[i].1.clone());
+        let timeline =
+            buckets::timeline_weighted(&window_counts, buckets::DEFAULT_TIMELINE_WINDOW_SECS);
 
         // Actionability for the impact boost: UNTRIAGED = never touched (no row);
         // REGRESSED = prod contradicts the claimed fix.
@@ -186,29 +159,39 @@ pub(crate) async fn bucket_list_for_tenant(tenant: &Tenant, app_id: &str) -> any
             // occurrence context at ingest). Absent -> impact_score falls back to
             // keyword inference, so this is purely additive.
             oracle: newest.context.get("oracle").and_then(|v| v.as_str()),
-            count: idxs.len() as u64,
+            count: rollup.count,
             timeline: &timeline,
-            last_seen: last_seen.as_deref(),
+            last_seen: Some(&rollup.last_seen),
             action,
         };
         let scored = impact::impact_score(&signals, &now);
 
-        let sample = idxs
+        let sample = [oldest, newest]
             .iter()
-            .all(|&i| sample_kind(&occ[i].2) == Some(NIMBUS_SAMPLE))
+            .all(|record| sample_kind(record) == Some(NIMBUS_SAMPLE))
             .then_some(NIMBUS_SAMPLE);
+        // A later occurrence can be pathless, for example when a browser
+        // reports a crash before its first settled observation. Do not let
+        // that erase an executable reproduction captured by an earlier
+        // occurrence in the same structural bucket.
+        let replay_len = [newest, oldest]
+            .iter()
+            .map(|record| buckets::replay_actions(record).len())
+            .filter(|len| *len > 0)
+            .min()
+            .unwrap_or(0);
         let item = json!({
             "bucketId": bid,
             "bugId": buckets::bug_id(newest),
             "findingIdentity": buckets::finding_identity(newest),
             "sample": sample,
-            "count": idxs.len(),
+            "count": rollup.count,
             "message": newest.message,
             "crashSig": newest.sig,
             "startSig": newest.path.first().map(|s| s.sig.clone()),
-            "replayLen": buckets::replay_actions(newest).len(),
+            "replayLen": replay_len,
             "lineage": buckets::lineage(oldest, newest),
-            "discriminators": discriminators(&cohort, &baseline),
+            "discriminators": discriminators,
             "triage": triage
                 .as_ref()
                 .map(|t| json!({ "status": t.status, "updatedAt": t.updated_at, "fixedInBuild": t.fixed_in_build }))
@@ -263,14 +246,15 @@ pub(super) fn bucket_package(
     bucket: &str,
     newest: &ErrorRec,
     oldest: &ErrorRec,
+    replay_source: &ErrorRec,
     count: usize,
     discriminators: &[Value],
     evidence: Vec<EvidenceRec>,
     results: Vec<ReplayResult>,
 ) -> Value {
-    let actions = buckets::replay_actions(newest);
-    let display_path = buckets::display_path(newest);
-    let fixture = fixture_spec(&newest.context, discriminators);
+    let actions = buckets::replay_actions(replay_source);
+    let display_path = buckets::display_path(replay_source);
+    let fixture = fixture_spec(&replay_source.context, discriminators);
     let visual_evidence = visual_evidence_refs(&evidence);
     json!({
         "appId": app_id,
@@ -281,12 +265,12 @@ pub(super) fn bucket_package(
         "message": newest.message,
         "expectedError": newest.message,
         "crashSig": newest.sig,
-        "startSig": newest.path.first().map(|s| s.sig.clone()),
+        "startSig": replay_source.path.first().map(|s| s.sig.clone()),
         "count": count,
         "replay": actions.clone(),
         "actions": actions,
         "displayPath": display_path,
-        "context": newest.context,
+        "context": replay_source.context,
         "discriminators": discriminators,
         "fixture": fixture.clone(),
         "fixtureSpec": fixture,
@@ -320,6 +304,16 @@ async fn bucket_package_for_tenant(
         base_occ.iter().map(|(_, _, r)| r.context.clone()).collect();
     let oldest = &rows.first().unwrap().2;
     let newest = &rows.last().unwrap().2;
+    // Rows are oldest to newest. Prefer the shortest non-empty reproduction,
+    // which is the most useful artifact for a developer. Reverse iteration
+    // makes equal-length ties prefer the newest occurrence.
+    let replay_source = rows
+        .iter()
+        .rev()
+        .map(|(_, _, record)| record)
+        .filter(|record| !buckets::replay_actions(record).is_empty())
+        .min_by_key(|record| buckets::replay_actions(record).len())
+        .unwrap_or(newest);
     let cohort: Vec<Map<String, Value>> = rows.iter().map(|(_, _, r)| r.context.clone()).collect();
     let discs = discriminators(&cohort, &baseline);
     let error_ids: Vec<i64> = rows.iter().map(|(id, _, _)| *id).collect();
@@ -330,6 +324,7 @@ async fn bucket_package_for_tenant(
         bucket,
         newest,
         oldest,
+        replay_source,
         rows.len(),
         &discs,
         evidence,
@@ -337,6 +332,10 @@ async fn bucket_package_for_tenant(
     )))
 }
 
+/// Resolve a bucket across every project visible to the authenticated account.
+/// Project keys search only their project. An org token searches the org and
+/// returns the owning `appId` with the package, making app selection an internal
+/// authorization concern instead of a CLI argument.
 pub async fn get_bucket_global(
     State(app): State<App>,
     Extension(auth): Extension<crate::AuthCtx>,

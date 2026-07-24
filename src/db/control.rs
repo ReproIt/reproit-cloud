@@ -277,6 +277,15 @@ impl ControlStore {
             .ok_or_else(|| anyhow::anyhow!("tenant row vanished after insert"))
     }
 
+    /// Every tenant still stuck in `provisioning`, for the startup reconciler
+    /// (a signup that died mid-provision converges to active on next boot).
+    pub async fn provisioning_tenants(&self) -> anyhow::Result<Vec<i64>> {
+        let rows = sqlx::query("SELECT org_id FROM tenants WHERE status = 'provisioning'")
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.iter().map(|r| r.get::<i64, _>("org_id")).collect())
+    }
+
     /// Record the provisioned connection string for a tenant (idempotent overwrite).
     /// The conn string is encrypted at rest before storage (no-op passthrough when
     /// REPROIT_CONN_ENC_KEY is unset; see [`encrypt_conn`]).
@@ -472,7 +481,7 @@ impl ControlStore {
                SELECT user_id, active_org_id FROM sessions
                WHERE token = $1 AND (expires_at IS NULL OR expires_at > now())
              )
-             SELECT u.id AS user_id, u.email, o.id, o.name, m.role
+             SELECT u.id AS user_id, u.email, o.id, o.name, o.plan, m.role
              FROM live s
              JOIN users u ON u.id = s.user_id
              JOIN org_members m ON m.user_id = s.user_id
@@ -492,6 +501,7 @@ impl ControlStore {
                 Org {
                     id: r.get("id"),
                     name: r.get("name"),
+                    plan: r.get("plan"),
                     role: r.get("role"),
                 },
             )

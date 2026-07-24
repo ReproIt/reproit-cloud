@@ -93,6 +93,26 @@ impl Provisioner {
         })
     }
 
+    /// Crash-recovery reconciler: finish every tenant still stuck in
+    /// `provisioning`. Run on startup. Each is just a re-`provision` (idempotent),
+    /// so a tenant whose signup died mid-flight converges to active without manual
+    /// intervention. Failures are isolated and logged; one stuck tenant never
+    /// blocks the others.
+    pub async fn reconcile(&self, control: &ControlStore) -> anyhow::Result<()> {
+        let pending = control.provisioning_tenants().await?;
+        if pending.is_empty() {
+            return Ok(());
+        }
+        tracing::info!("reconcile: {} tenant(s) stuck provisioning", pending.len());
+        for org_id in pending {
+            match self.provision(control, org_id).await {
+                Ok(_) => tracing::info!("reconcile: tenant {org_id} now active"),
+                Err(e) => tracing::error!("reconcile: tenant {org_id} still failing: {e}"),
+            }
+        }
+        Ok(())
+    }
+
     /// Offboard a tenant: drop its database via the provider. The control-plane row
     /// and blobs are handled by the caller (GDPR erasure is its own flow); this is
     /// the data-plane teardown.

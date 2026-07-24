@@ -328,7 +328,7 @@ pub async fn post_publishable_key(
 /// Page size for the export's keyset reads: big enough that a large tenant is
 /// a few hundred round-trips, small enough that one page is never a memory
 /// event.
-/// POST /v1/events, ingest one strict protocol batch.
+/// POST /v1/events, ingest a batch from the SDK.
 pub async fn post_events(
     State(app): State<App>,
     Extension(auth): Extension<crate::AuthCtx>,
@@ -336,6 +336,7 @@ pub async fn post_events(
     headers: HeaderMap,
     Json(batch): Json<reproit_protocol::EventBatch>,
 ) -> ApiResult {
+    let ingest_started = std::time::Instant::now();
     batch.validate().map_err(|error| {
         (
             StatusCode::BAD_REQUEST,
@@ -371,23 +372,39 @@ pub async fn post_events(
             ));
         }
     }
-    let app_configured = crate::integrations::is_configured_for(&tenant.store, &app_id).await;
     // Collect the whole batch in memory FIRST, then write it in one transaction.
     // Edges are pre-aggregated by key (the `edges` PK is (app_id, edge_key), so a
     // single multi-row upsert can only touch each row once; duplicate keys within
     // the batch must be summed here and applied as one delta). Errors are gathered
     // in arrival order so the in-batch bucket grouping below sees oldest-first.
+    let aggregation_started = std::time::Instant::now();
     let BatchAgg {
         edge_counts,
         error_recs,
     } = aggregate_events(&batch.frames);
+    metrics::histogram!("ingest_stage_seconds", "stage" => "normalize")
+        .record(aggregation_started.elapsed().as_secs_f64());
     let n_edges = edge_counts.values().map(|c| *c as u64).sum::<u64>();
     let n_errors = error_recs.len() as u64;
+    // The edition policy may reject a batch that crosses its ingest quota
+    // (hosted: the plan's monthly occurrence cap) and uses this pre-persist
+    // point to keep tenant maintenance scheduled.
+    if let Err(denied) = app.policy.check_ingest_quota(tenant.org_id, n_errors).await {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({
+                "error": denied.message,
+                "used": denied.used,
+                "limit": denied.limit,
+            })),
+        ));
+    }
     // ONE atomic transaction for the whole batch: a multi-row edge upsert plus a
     // multi-row error insert, all-or-nothing, instead of up to 5000 awaited
     // auto-commit statements. The edge deltas carry the in-batch sums computed
     // above so a key repeated in the batch lands as a single increment.
     let edges: Vec<(String, i64)> = edge_counts.into_iter().collect();
+    let persistence_started = std::time::Instant::now();
     let deduped = tenant
         .store
         .ingest_batch(
@@ -400,6 +417,8 @@ pub async fn post_events(
         )
         .await
         .map_err(err500)?;
+    metrics::histogram!("ingest_stage_seconds", "stage" => "persist")
+        .record(persistence_started.elapsed().as_secs_f64());
     if deduped {
         metrics::counter!("ingest_batches_deduped_total").increment(1);
         return Ok(Json(json!({ "ok": true, "deduped": true })));
@@ -407,16 +426,7 @@ pub async fn post_events(
     metrics::counter!("ingest_batches_total").increment(1);
     metrics::counter!("ingest_errors_total").increment(n_errors);
     metrics::counter!("ingest_edges_total").increment(n_edges);
-    // file-on-form: for a configured app, file an issue for any bucket this batch
-    // touched that doesn't already have a linked ticket. We derive the touched
-    // buckets and their oldest/newest occurrence from THIS batch's errors (already
-    // in hand), rather than re-reading and re-grouping the app's whole history on
-    // every ingest. Best-effort and PII-safe (the hook builds the body from
-    // derived bucket data only) and never blocks ingest, a tracker outage is
-    // logged and swallowed inside the hook.
-    if app_configured && !error_recs.is_empty() {
-        maybe_file_new_buckets(&tenant, &app_id, &error_recs).await;
-    }
+    app.policy.on_batch_accepted(tenant.org_id, n_errors).await;
     let captures: Vec<String> = error_recs
         .iter()
         .filter(|record| buckets::is_tester_capture(record))
@@ -433,45 +443,11 @@ pub async fn post_events(
     if !captures.is_empty() {
         body["captures"] = json!(captures);
     }
+    let outbox_store = tenant.store.clone();
+    tokio::spawn(async move { crate::integrations::drain_outbox(outbox_store).await });
+    metrics::histogram!("ingest_stage_seconds", "stage" => "total")
+        .record(ingest_started.elapsed().as_secs_f64());
     Ok(Json(body))
-}
-
-/// Resolve each bucket TOUCHED BY THIS BATCH to its oldest/newest occurrence and
-/// hand it to the file-on-form hook. Bounded by construction: it groups only the
-/// errors that just arrived (passed in by the caller), never the app's whole
-/// history, so the per-ingest cost is the size of THIS batch, not the lifetime
-/// error count. The hook itself is the idempotency guard: it skips any bucket
-/// that already has a linked ticket, so a bucket only ever files once even across
-/// many batches (and a bucket seen before this batch, but unfiled, still files
-/// the first time the integration sees it touched). Operates entirely within ONE
-/// tenant's database.
-///
-/// "Oldest/newest" here are the oldest and newest occurrence WITHIN this batch.
-/// The batch arrives in order, so grouping it directly preserves that ordering;
-/// the issue body is built from PII-safe derived bucket data either way, so using
-/// the batch's own endpoints (rather than re-reading full history for an exact
-/// lineage) is correct for the file-once decision.
-async fn maybe_file_new_buckets(tenant: &Tenant, app_id: &str, batch_errors: &[ErrorRec]) {
-    // Group THIS batch's errors by bucket id, keeping first/last in arrival order.
-    let mut by_bucket: std::collections::BTreeMap<String, (ErrorRec, ErrorRec)> =
-        std::collections::BTreeMap::new();
-    for rec in batch_errors {
-        // A tester capture is deliberately not a confirmed bug yet. Filing an
-        // issue here would bypass the replay trust gate. It becomes eligible for
-        // normal workflows only after a reproduced replay result.
-        if buckets::is_tester_capture(rec) {
-            continue;
-        }
-        let bid = buckets::bucket_id(rec);
-        by_bucket
-            .entry(bid)
-            .and_modify(|(_, newest)| *newest = rec.clone())
-            .or_insert_with(|| (rec.clone(), rec.clone()));
-    }
-    for (bid, (oldest, newest)) in by_bucket {
-        crate::integrations::file_issue_for_bucket(&tenant.store, app_id, &bid, &oldest, &newest)
-            .await;
-    }
 }
 
 /// GET /v1/graph/:app, the merged production usage graph.
@@ -503,7 +479,7 @@ pub async fn get_graph(
     ))
 }
 
-/// Return the independently validated immutable proof ledger for one run.
+/// GET /v1/apps/:app/runs/:run/proof, the validated immutable proof ledger.
 pub async fn get_run_proof(
     State(app): State<App>,
     Extension(auth): Extension<crate::AuthCtx>,
