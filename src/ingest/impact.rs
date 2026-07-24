@@ -117,65 +117,54 @@ impl Severity {
     }
 }
 
-/// The cloud's half of the cross-repo oracle contract: EVERY oracle category the
-/// reproit CLI can stamp onto a finding (its `oracle` field), mapped to the
-/// Severity class the cloud weights it as. This is the single place the cloud
-/// acknowledges an oracle id; the CLI's canonical list lives in
-/// `reproit-cli/crates/reproit/oracle-registry.json` and this table MUST cover
-/// every id in it (enforced by `known_oracles_cover_the_cli_registry`). When the
-/// CLI adds an oracle, CI fails there until the id + its Severity are added here.
-/// The Severity assignment is founder-tunable policy (same as the keyword table
-/// in `classify`): crash/hang are outages; leak and wakelock degrade; occlusion/
-/// choice/broken-route/security/divergence and the metamorphic family
-/// (rotation, background-restore, scroll-round-trip,
-/// safe-area, permission-walk, invariant, contract) are real functional/operability
-/// defects; content/flicker/visual/jank are cosmetic.
-pub const KNOWN_ORACLES: &[(&str, Severity)] = &[
-    // Registry/taxonomy drift is diagnostic evidence, never a confirmed bug.
-    ("unclassified", Severity::Unclassified),
-    ("crash", Severity::Crash),
-    ("hang", Severity::Crash),
-    ("leak", Severity::Leak),
-    ("occlusion", Severity::Operability),
-    ("overflow", Severity::Operability),
-    ("detached-indicator", Severity::Operability),
-    ("choice-anomaly", Severity::Operability),
-    ("broken-route", Severity::Operability),
-    ("stuck-keyboard", Severity::Operability),
-    ("duplicate-submit", Severity::Operability),
-    ("focus-loss", Severity::Operability),
-    ("accessibility-state", Severity::Operability),
-    ("blank-screen", Severity::Operability),
-    ("zoom-reflow", Severity::Operability),
-    ("security", Severity::Operability),
-    ("divergence", Severity::Operability),
-    ("invariant", Severity::Operability),
-    ("contract", Severity::Operability),
-    ("rotation", Severity::Operability),
-    ("background-restore", Severity::Operability),
-    ("scroll-round-trip", Severity::Operability),
-    ("safe-area", Severity::Operability),
-    ("permission-walk", Severity::Operability),
-    // Invisible selected/emphasized content: the user cannot read or operate
-    // what is rendered, so it ranks with the operability family.
-    ("zero-contrast", Severity::Operability),
-    // A swallowed input is inoperable UI by definition.
-    ("dead-input", Severity::Operability),
-    ("wakelock", Severity::Leak),
-    ("broken-asset", Severity::Jank),
-    ("jank", Severity::Jank),
-    ("content-bug", Severity::Jank),
-    ("flicker", Severity::Jank),
-    ("visual", Severity::Jank),
-];
+/// The cloud's half of the cross-repo oracle contract: EVERY oracle category
+/// the reproit CLI can stamp onto a finding (its `oracle` field), mapped to
+/// the Severity class the cloud weights it as. The mapping is DERIVED from the
+/// vendored registry's `severity` map (the CLI's canonical contract file,
+/// pinned at `tests/golden/fixtures/oracle-registry.json` by the CLI-contract
+/// sync), so adding an oracle needs no cloud-side code edit: the id, its
+/// confidence tier, and its severity class all land in oracle-registry.json
+/// and arrive here on the next repin. `known_oracles_cover_the_cli_registry`
+/// stays as the P0 alarm that the map covers every registry id.
+const ORACLE_REGISTRY: &str = include_str!("../../tests/golden/fixtures/oracle-registry.json");
+
+fn known_oracles() -> &'static [(String, Severity)] {
+    static TABLE: std::sync::OnceLock<Vec<(String, Severity)>> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        let doc: Value =
+            serde_json::from_str(ORACLE_REGISTRY).expect("vendored oracle-registry.json is JSON");
+        let map = doc["severity"]
+            .as_object()
+            .expect("oracle-registry.json has a `severity` map");
+        let mut table = Vec::new();
+        for (class, ids) in map {
+            let severity = match class.as_str() {
+                "crash" => Severity::Crash,
+                "leak" => Severity::Leak,
+                "operability" => Severity::Operability,
+                "jank" => Severity::Jank,
+                // Registry/taxonomy drift is diagnostic evidence, never a
+                // confirmed bug.
+                "unclassified" => Severity::Unclassified,
+                other => panic!("unknown severity class `{other}` in oracle-registry.json"),
+            };
+            for id in ids.as_array().expect("severity class lists oracle ids") {
+                let id = id.as_str().expect("oracle id is a string");
+                table.push((id.to_string(), severity));
+            }
+        }
+        assert!(!table.is_empty(), "registry severity map must not be empty");
+        table
+    })
+}
 
 /// The Severity for a STRUCTURED oracle id (the finding's `oracle` field), the
 /// authoritative classifier. An unrecognized id remains `Unclassified`, so a newer CLI
 /// never breaks ingestion and prose cannot promote taxonomy drift into a bug claim.
 pub fn severity_for_oracle(id: &str) -> Severity {
-    KNOWN_ORACLES
+    known_oracles()
         .iter()
-        .find(|(k, _)| *k == id)
+        .find(|(k, _)| k == id)
         .map(|(_, s)| *s)
         .unwrap_or(Severity::Unclassified)
 }
@@ -483,9 +472,10 @@ mod tests {
     }
 
     // CROSS-REPO DRIFT GUARD (P0). tests/golden/fixtures/oracle-registry.json is a
-    // pinned copy of reproit-cli's canonical oracle contract. The cloud MUST map
-    // every id in it (via KNOWN_ORACLES) or CI fails HERE until the new id + its
-    // Severity are added. A newer CLI never breaks ingestion (severity_for_oracle
+    // pinned copy of reproit-cli's canonical oracle contract. The severity table
+    // derives from its `severity` map, so this test asserts that map covers every
+    // id in `oracles` exactly once, or CI fails HERE until the registry is fixed
+    // and repinned. A newer CLI never breaks ingestion (severity_for_oracle
     // degrades safely to Unclassified); this test is the alarm to add
     // first-class handling. Mirrors the fixture-spec drift test in cohorts.rs.
     #[test]
@@ -499,16 +489,25 @@ mod tests {
             .iter()
             .map(|v| v.as_str().expect("each oracle id is a string").to_string())
             .collect();
+        let table = known_oracles();
         let missing: Vec<&str> = cli_ids
             .iter()
             .map(|s| s.as_str())
-            .filter(|id| !KNOWN_ORACLES.iter().any(|(k, _)| k == id))
+            .filter(|id| !table.iter().any(|(k, _)| k == id))
             .collect();
         assert!(
             missing.is_empty(),
-            "P0: reproit-cloud does not handle oracle id(s) {missing:?} from the CLI registry. \
-             Add them to impact::KNOWN_ORACLES with a Severity."
+            "P0: the registry `severity` map does not cover oracle id(s) {missing:?}. \
+             Add them to oracle-registry.json's severity map in reproit-cli and repin."
         );
+        // One severity per id: a duplicate would make the lookup order-dependent.
+        for (id, _) in table {
+            assert_eq!(
+                table.iter().filter(|(k, _)| k == id).count(),
+                1,
+                "oracle {id} has two severities in the registry"
+            );
+        }
 
         // When the CLI repo is checked out beside the cloud, the pinned golden must
         // equal the live contract, so it cannot silently rot.

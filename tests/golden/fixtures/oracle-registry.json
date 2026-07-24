@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "note": "Canonical reproit oracle categories. Every finding emitted by the reproit CLI carries an `oracle` field whose value is exactly one of these ids. This file is the cross-repo contract: downstream consumers (reproit-cloud) MUST (1) handle every id listed here and (2) degrade gracefully on an id they do not recognize (never drop a finding). It is the single source of truth, kept in lockstep with the Rust `Oracle` enum by a drift test (crates/reproit/src/domain/boundary_tests.rs::oracle_registry_matches_all). When this list grows, the reproit CLI is not blocked; instead the CLOUD side must fail its own CI (P0) until it adds handling for the new id. See the cloud-side consumer test described in that drift test's comment.",
   "stable_defaults": [
     "crash",
@@ -68,6 +68,51 @@
     "detached-indicator",
     "contract"
   ],
+  "severity_note": "Cloud ranking policy: every oracle id maps to exactly one severity class. reproit-cloud derives its Severity weighting for structured oracle ids from this map (ingest/impact.rs), so adding an oracle needs no cloud-side code edit; cloud CI fails only if an id here is missing from the map. Classes: crash outages; leak degrades over time; operability is a real functional defect; jank is cosmetic; unclassified is taxonomy drift, never a confirmed bug.",
+  "severity": {
+    "crash": [
+      "crash",
+      "hang"
+    ],
+    "leak": [
+      "leak",
+      "wakelock"
+    ],
+    "operability": [
+      "occlusion",
+      "overflow",
+      "detached-indicator",
+      "choice-anomaly",
+      "broken-route",
+      "stuck-keyboard",
+      "duplicate-submit",
+      "focus-loss",
+      "accessibility-state",
+      "blank-screen",
+      "zoom-reflow",
+      "security",
+      "divergence",
+      "invariant",
+      "contract",
+      "rotation",
+      "background-restore",
+      "scroll-round-trip",
+      "safe-area",
+      "permission-walk",
+      "zero-contrast",
+      "dead-input"
+    ],
+    "jank": [
+      "broken-asset",
+      "jank",
+      "content-bug",
+      "flicker",
+      "visual"
+    ],
+    "unclassified": [
+      "unclassified"
+    ]
+  },
   "oracles": [
     "unclassified",
     "crash",
